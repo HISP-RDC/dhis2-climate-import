@@ -1,0 +1,20 @@
+[project]
+name = "dhis2-climate-import"
+version = "0.1.0"
+description = "Reliable climate data import orchestration for DHIS2 Climate App deployments."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dhis2-client @ git+https://github.com/dhis2/dhis2-python-client.git@v0.3.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pyright]
+pythonVersion = "3.12"
+include = ["src", "tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

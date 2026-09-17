@@ -1,0 +1,75 @@
+# Pipeline configuration. Secrets stay in .env.
+
+dhis2:
+  org_unit_level: 3
+  # Optional but recommended: code or UID of the DHIS2 climate data set.
+  # When set, cache-data-elements only stores data elements attached to these data sets.
+  climate_data_set: CCH_CLIMATE_WEATHER
+  climate_data_sets:
+    - CCH_CLIMATE_WEATHER
+  cache_max_age_hours: 168
+  page_size: 500
+  chunk_size: 5000
+  async_threshold: 5000
+  import_strategy: CREATE_AND_UPDATE
+  preheat_cache: true
+  trigger_analytics: false
+
+open_climate_service:
+  aggregate_process_id: aggregate_to_dhis2_json
+  publish: true
+
+imports:
+  - id: temperature_max_weekly_era5_land
+    label: Max air temperature (ERA5-Land)
+    # OCS built-in ERA5-Land templates currently cover mean temperature. Keep this
+    # dataset_id aligned with the custom OCS dataset/workflow that reproduces the
+    # Climate App max-temperature calculation before running an import.
+    dataset_id: era5land_temperature_max_weekly
+    # Use the actual weekly DHIS2 data set code/UID from this instance. The error
+    # trace showed CCH_CLIMATE_WEATHER, so that remains the default until confirmed.
+    data_set: CCH_CLIMATE_WEATHER
+    data_element: ERA5_LAND_TEMPERATURE_MAX
+    period_type: week
+    method: max
+    expected_units: celsius
+    # The org unit level is intentionally runtime-driven. Use --org-unit-level
+    # on review/aggregate/import after caching the matching level.
+    default_start_period: 2026-W09
+    default_end_period: 2026-W31
+
+  - id: precipitation_daily
+    dataset_id: chirps3_precipitation_daily
+    data_element: CCH_PRECIP_CHIRPS_DAILY
+    period_type: day
+    method: mean
+    expected_units: mm
+    default_start: 2024-01-01
+    default_end: 2024-01-31
+
+  - id: temperature_daily
+    dataset_id: era5land_temperature_daily
+    data_element: CCH_TEMP_ERA5_DAILY
+    period_type: day
+    method: mean
+    expected_units: celsius
+    default_start: 2024-01-01
+    default_end: 2024-01-31
+
+  - id: temperature_daily_from_hourly
+    dataset_id: era5land_temperature_daily_from_hourly
+    data_element: CCH_TEMP_ERA5_FROM_HOURLY_DAILY
+    period_type: day
+    method: mean
+    expected_units: celsius
+    default_start: 2024-01-01
+    default_end: 2024-01-31
+
+  - id: temperature_monthly
+    dataset_id: era5land_temperature_monthly
+    data_element: CCH_TEMP_ERA5_MONTHLY
+    period_type: month
+    method: mean
+    expected_units: celsius
+    default_start: 2024-01-01
+    default_end: 2024-12-31

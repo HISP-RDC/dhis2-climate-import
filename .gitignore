@@ -1,0 +1,22 @@
+.env
+.venv/
+.uv-cache/
+.pycache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# Local climate data, generated caches, reports, and run journals.
+data/
+cache/
+reports/
+*.sqlite3
+*.db
+
+# Build artifacts.
+dist/
+build/
+*.egg-info/
