@@ -16,6 +16,24 @@ python3 -m uv sync
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import --help
 ```
 
+Open Climate Service runs as a separate local service. Start it from the official repository,
+then point this pipeline to it:
+
+```sh
+git clone https://github.com/dhis2/open-climate-service.git
+cd open-climate-service
+make sync
+cp climate-service.yaml.example climate-service.yaml
+cp .env.example .env
+make run
+```
+
+The official quick start starts OCS on `http://127.0.0.1:9000`, so this project's `.env` should use:
+
+```env
+CLIMATE_SERVICE_BASE_URL=http://127.0.0.1:9000
+```
+
 Ordre recommande sur une instance DHIS2 non-production :
 
 ```sh
@@ -67,6 +85,20 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import ingest-dataset temperatu
 ends on the latest completed ISO week; a monthly job ends on the previous complete month. Use
 `--as-of YYYY-MM-DD` for reproducible runs, or `--end` / `--end-period` to anchor the relative
 window yourself.
+
+Example matching the Climate App Zone de Sante weekly review:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 3 --refresh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-data-elements --data-set CCH_CLIMATE_WEATHER --refresh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import review-import precipitation_weekly_era5_land --start 2026-03-21 --end 2026-08-21 --org-unit-level 3 --data-set CCH_CLIMATE_WEATHER --expected-org-units 519 --expected-data-values 11937
+```
+
+For a ten-year import at the same level:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import review-import precipitation_weekly_era5_land --years-back 10 --org-unit-level 3 --data-set CCH_CLIMATE_WEATHER
+```
 
 ## Climate App Weekly Review Example
 

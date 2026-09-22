@@ -33,7 +33,56 @@ On DHIS2 versions before 2.38, PAT authentication can be disabled by server conf
 that case, either enable PAT authentication on the server or use Basic Auth for the technical
 account on the test instance.
 
-## 2. Check DHIS2
+## 2. Start Open Climate Service Locally
+
+Open Climate Service is a separate service from DHIS2. Our pipeline expects it at:
+
+```sh
+CLIMATE_SERVICE_BASE_URL=http://127.0.0.1:9000
+```
+
+Fast local setup from the official OCS repository:
+
+```sh
+git clone https://github.com/dhis2/open-climate-service.git
+cd open-climate-service
+make sync
+cp climate-service.yaml.example climate-service.yaml
+cp .env.example .env
+make run
+```
+
+For the DRC, edit `climate-service.yaml` before `make run` and use a DRC extent, for example:
+
+```yaml
+id: cod-climate-service
+name: Democratic Republic of the Congo Climate Service
+
+extent:
+  name: Democratic Republic of the Congo
+  bbox: [12.0, -13.5, 31.5, 5.4]
+  country_code: COD
+
+data_dir: ./data
+```
+
+When the service is running, verify:
+
+```sh
+curl http://127.0.0.1:9000/extent
+```
+
+The web interface is available at:
+
+- `http://127.0.0.1:9000/` landing page
+- `http://127.0.0.1:9000/manage` ingestion and sync
+- `http://127.0.0.1:9000/map` map viewer
+- `http://127.0.0.1:9000/docs` API docs
+
+Start with CHIRPS3 daily precipitation if you only want to test OCS quickly. ERA5-Land can require
+additional data-source credentials depending on the configured source.
+
+## 3. Check DHIS2
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import check-dhis2
@@ -42,7 +91,7 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import check-dhis2
 This checks `/api/system/info` and `/api/me`, then validates that the instance version is at
 least 2.37.
 
-## 3. Cache Organisation Units Level 3
+## 4. Cache Organisation Units Level 3
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 3
@@ -67,7 +116,7 @@ test hierarchy this is expected to be level 2:
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 2 --refresh
 ```
 
-## 4. Cache Data Elements
+## 5. Cache Data Elements
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-data-elements --data-set CCH_CLIMATE_WEATHER
@@ -104,7 +153,7 @@ If one candidate returns DHIS2 JSON with status `200`, set `DHIS2_BASE_URL` to t
 If all candidates return nginx HTML `403`, the block is at the reverse proxy, VPN/IP allow-list,
 or API route policy before DHIS2 can evaluate the user authorities.
 
-## 5. Review Before Import
+## 6. Review Before Import
 
 Use `review-import` to reproduce the Climate App "Review and import" summary before hitting OCS
 or DHIS2 imports:
@@ -142,7 +191,19 @@ configuration. If the real weekly data set in the instance has another UID/code,
 or update that single field before refreshing `cache/data-elements.json`. The pipeline validates
 the cached data set `periodType`; a weekly job requires a DHIS2 `Weekly` data set.
 
-## 6. Validate an Import
+For the screenshot-style Zone de Sante weekly precipitation review, use level 3:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 3 --refresh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-data-elements --data-set CCH_CLIMATE_WEATHER --refresh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import review-import precipitation_weekly_era5_land --start 2026-03-21 --end 2026-08-21 --org-unit-level 3 --data-set CCH_CLIMATE_WEATHER --expected-org-units 519 --expected-data-values 11937
+```
+
+The user-entered weekly date range is expanded to full DHIS2 calendar weeks, so
+`2026-03-21` through `2026-08-21` becomes `2026-W12` through `2026-W34`
+(`2026-03-16` through `2026-08-23`).
+
+## 7. Validate an Import
 
 Start with dry-run:
 
@@ -158,7 +219,7 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import import-dhis2 precipitati
 
 Reports are written to `reports/`. Run history is stored in `cache/import-runs.sqlite3`.
 
-## 7. Verify Analytics
+## 8. Verify Analytics
 
 After a real import and analytics table generation:
 

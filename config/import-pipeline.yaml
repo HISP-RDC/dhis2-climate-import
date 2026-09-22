@@ -47,6 +47,16 @@ imports:
     default_start: 2024-01-01
     default_end: 2024-01-31
 
+  - id: precipitation_weekly_era5_land
+    label: Precipitation (ERA5-Land)
+    # Climate App shows this as weekly data derived from the ERA5-Land precipitation source.
+    dataset_id: era5land_precipitation_daily
+    data_set: CCH_CLIMATE_WEATHER
+    data_element: era5_land_precipitation
+    period_type: week
+    method: mean
+    expected_units: mm
+
   - id: temperature_daily
     dataset_id: era5land_temperature_daily
     data_element: CCH_TEMP_ERA5_DAILY

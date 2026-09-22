@@ -75,6 +75,26 @@ def period_labels_between(start: str, end: str, period_type: str) -> list[str]:
     return [format_period(period, period_type) for period in periods_between(start, end, period_type)]
 
 
+def date_window_period_bounds(start: str, end: str, period_type: str) -> tuple[str, str]:
+    start_date = parse_date(start)
+    end_date = parse_date(end)
+    if end_date < start_date:
+        raise PipelineError("End date must be after or equal to start date.")
+    period_type = period_type.lower()
+    if period_type == "day":
+        return start, end
+    if period_type == "week":
+        return (
+            (start_date - timedelta(days=start_date.isoweekday() - 1)).isoformat(),
+            (end_date + timedelta(days=7 - end_date.isoweekday())).isoformat(),
+        )
+    if period_type == "month":
+        return date(start_date.year, start_date.month, 1).isoformat(), _month_end(end_date).isoformat()
+    if period_type == "year":
+        return date(start_date.year, 1, 1).isoformat(), date(end_date.year, 12, 31).isoformat()
+    raise PipelineError(f"Unsupported period_type: {period_type}")
+
+
 def relative_year_window(
     years_back: int,
     period_type: str,
@@ -141,8 +161,12 @@ def month_bounds(period: str) -> tuple[str, str]:
         parsed = datetime.strptime(normalized, "%Y-%m").date()
     except ValueError as exc:
         raise PipelineError("Monthly period must use YYYY-MM format.") from exc
-    last_day = calendar.monthrange(parsed.year, parsed.month)[1]
-    return parsed.replace(day=1).isoformat(), parsed.replace(day=last_day).isoformat()
+    return parsed.replace(day=1).isoformat(), _month_end(parsed).isoformat()
+
+
+def _month_end(value: date) -> date:
+    last_day = calendar.monthrange(value.year, value.month)[1]
+    return value.replace(day=last_day)
 
 
 def _next_month(value: date) -> date:

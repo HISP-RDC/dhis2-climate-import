@@ -1,6 +1,7 @@
 import unittest
 
 from dhis2_climate_import.periods import (
+    date_window_period_bounds,
     month_bounds,
     period_labels_between,
     period_range_bounds,
@@ -40,6 +41,13 @@ class PeriodTests(unittest.TestCase):
             "2026-W09",
         )
         self.assertEqual(len(periods_between("2026-02-23", "2026-08-02", "week")), 23)
+
+    def test_weekly_date_window_expands_to_full_calendar_weeks(self) -> None:
+        self.assertEqual(
+            date_window_period_bounds("2026-03-21", "2026-08-21", "week"),
+            ("2026-03-16", "2026-08-23"),
+        )
+        self.assertEqual(len(periods_between("2026-03-16", "2026-08-23", "week")), 23)
 
     def test_relative_year_window_uses_latest_complete_period(self) -> None:
         self.assertEqual(

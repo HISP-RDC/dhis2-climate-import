@@ -22,7 +22,7 @@ from .env import load_env_file
 from .errors import PipelineError
 from .http import HttpRequestError
 from .ocs import OCSClient
-from .periods import period_range_bounds, relative_year_window
+from .periods import date_window_period_bounds, period_range_bounds, relative_year_window
 from .pipeline import aggregate_job, import_job, review_import, run_monthly_imports
 from .reports import run_id, write_report
 
@@ -241,9 +241,11 @@ def cmd_cache_data_elements(args: argparse.Namespace) -> None:
         elements = []
         for selector in data_set_selectors:
             data_set = dhis2.resolve_data_set(selector)
-            data_set_payloads.append(_data_set_payload(data_set))
+            data_set_payload = _data_set_payload(data_set)
+            data_set_payloads.append(data_set_payload)
             elements.extend(
-                dhis2.data_elements_for_data_set(
+                _with_data_set_membership(element, data_set_payload)
+                for element in dhis2.data_elements_for_data_set(
                     data_set_id=data_set.id,
                     page_size=config.dhis2.page_size,
                 )
@@ -476,14 +478,52 @@ def _unique_strings(values: list[str | None]) -> list[str]:
 
 def _unique_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
+    by_id: dict[str, dict[str, Any]] = {}
     result: list[dict[str, Any]] = []
     for element in elements:
         uid = element.get("id")
-        if not isinstance(uid, str) or uid in seen:
+        if not isinstance(uid, str):
+            continue
+        if uid in by_id:
+            _merge_data_set_memberships(by_id[uid], element)
             continue
         seen.add(uid)
+        by_id[uid] = element
         result.append(element)
     return result
+
+
+def _with_data_set_membership(element: dict[str, Any], data_set: dict[str, Any]) -> dict[str, Any]:
+    result = {**element}
+    memberships = [
+        item
+        for item in result.get("dataSetMemberships", [])
+        if isinstance(item, dict)
+    ]
+    if not any(_data_set_ref_matches(item, data_set) for item in memberships):
+        memberships.append(data_set)
+    result["dataSetMemberships"] = memberships
+    return result
+
+
+def _merge_data_set_memberships(target: dict[str, Any], source: dict[str, Any]) -> None:
+    memberships = [
+        item
+        for item in target.get("dataSetMemberships", [])
+        if isinstance(item, dict)
+    ]
+    for item in source.get("dataSetMemberships", []):
+        if isinstance(item, dict) and not any(_data_set_ref_matches(item, ref) for ref in memberships):
+            memberships.append(item)
+    if memberships:
+        target["dataSetMemberships"] = memberships
+
+
+def _data_set_ref_matches(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return bool(
+        {left.get("id"), left.get("code"), left.get("name")}
+        & {right.get("id"), right.get("code"), right.get("name")}
+    )
 
 
 def _data_set_payload(data_set: Any) -> dict[str, Any]:
@@ -509,7 +549,11 @@ def _job_date_window(job: Any, args: argparse.Namespace) -> tuple[str | None, st
     if args.as_of:
         raise PipelineError("--as-of can only be used with --years-back.")
     if args.start or args.end:
-        return args.start or job.default_start, args.end or job.default_end
+        start = args.start or job.default_start
+        end = args.end or job.default_end
+        if start and end:
+            return date_window_period_bounds(start, end, job.period_type)
+        return start, end
     start_period = args.start_period or job.default_start_period
     end_period = args.end_period or job.default_end_period
     if start_period and end_period:

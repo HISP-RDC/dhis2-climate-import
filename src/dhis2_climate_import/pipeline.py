@@ -17,6 +17,7 @@ from .errors import PipelineError
 from .journal import ImportFingerprint, RunJournal
 from .ocs import OCSClient
 from .periods import (
+    date_window_period_bounds,
     month_bounds,
     period_labels_between,
     period_range_bounds,
@@ -86,6 +87,11 @@ def resolve_import_context(
     if not isinstance(data_elements, list) or not data_elements:
         raise PipelineError("Data element cache contains no dataElements.")
     data_element = resolve_data_element(data_elements, job.data_element)
+    _validate_data_element_data_set_membership(
+        data_element,
+        payload=data_elements_payload,
+        data_set=resolved_data_set,
+    )
     org_units_geojson, org_units_manifest = load_org_units_cache(
         root_dir=config.root_dir,
         level=resolved_org_unit_level,
@@ -458,7 +464,11 @@ def _resolve_date_window(
     if as_of:
         raise PipelineError("--as-of can only be used with --years-back.")
     if start or end:
-        return start or job.default_start, end or job.default_end
+        resolved_start = start or job.default_start
+        resolved_end = end or job.default_end
+        if resolved_start and resolved_end:
+            return date_window_period_bounds(resolved_start, resolved_end, job.period_type)
+        return resolved_start, resolved_end
 
     resolved_start_period = start_period or job.default_start_period
     resolved_end_period = end_period or job.default_end_period
@@ -529,6 +539,39 @@ def _validate_data_set_cache_scope(
             f"Data set selector '{data_set}' matched multiple cached data sets. Use the UID."
         )
     _validate_data_set_period_type(matches[0], period_type)
+
+
+def _validate_data_element_data_set_membership(
+    data_element: dict[str, Any],
+    *,
+    payload: dict[str, Any],
+    data_set: str | None,
+) -> None:
+    if not data_set:
+        return
+    scope = payload.get("scope")
+    if scope in {None, "all", "legacy"}:
+        return
+    memberships = [
+        item
+        for item in data_element.get("dataSetMemberships", [])
+        if isinstance(item, dict)
+    ]
+    if memberships:
+        if any(_data_set_matches(item, data_set) for item in memberships):
+            return
+        element_name = data_element.get("code") or data_element.get("id") or data_element.get("name")
+        raise PipelineError(
+            f"Data element '{element_name}' is not linked to cached DHIS2 data set '{data_set}'. "
+            "Refresh the data element cache for the selected data set or update the job mapping."
+        )
+
+    if len(_cache_data_sets(payload)) > 1:
+        element_name = data_element.get("code") or data_element.get("id") or data_element.get("name")
+        raise PipelineError(
+            f"Data element '{element_name}' has no cached data set membership metadata. "
+            f"Refresh explicitly: cache-data-elements --data-set {data_set} --refresh"
+        )
 
 
 def _cache_data_sets(payload: dict[str, Any]) -> list[dict[str, Any]]:

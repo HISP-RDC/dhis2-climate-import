@@ -10,6 +10,80 @@ from dhis2_climate_import.pipeline import review_import
 
 
 class PipelineReviewTests(unittest.TestCase):
+    def test_review_matches_climate_app_zone_de_sante_weekly_example(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config" / "import-pipeline.yaml"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                """
+dhis2:
+  org_unit_level: 3
+  cache_max_age_hours: 168
+open_climate_service:
+  aggregate_process_id: aggregate_to_dhis2_json
+imports:
+  - id: precipitation_weekly_era5_land
+    label: Precipitation (ERA5-Land)
+    dataset_id: era5land_precipitation_weekly
+    data_set: CCH_WEEKLY
+    data_element: ERA5_LAND_PRECIPITATION
+    period_type: week
+    method: sum
+    expected_units: mm
+""",
+                encoding="utf-8",
+            )
+            write_data_elements_cache(
+                root_dir=root,
+                source_base_url="https://dhis2.example.org",
+                data_elements=[
+                    {
+                        "id": "Precip00001",
+                        "code": "ERA5_LAND_PRECIPITATION",
+                        "name": "CCH - Precipitations (ERA5-Land)",
+                        "dataSetMemberships": [
+                            {"id": "WeeklyDataSet", "code": "CCH_WEEKLY", "periodType": "Weekly"}
+                        ],
+                    }
+                ],
+                data_sets=[{"id": "WeeklyDataSet", "code": "CCH_WEEKLY", "periodType": "Weekly"}],
+            )
+            write_org_units_cache(
+                root_dir=root,
+                level=3,
+                source_base_url="https://dhis2.example.org",
+                organisation_units=[
+                    {
+                        "id": f"Zone{i:08d}",
+                        "level": 3,
+                        "name": f"Zone de Sante {i}",
+                        "path": f"/RDC/Zone{i:08d}",
+                        "geometry": {"type": "Point", "coordinates": [20.0, -2.0]},
+                    }
+                    for i in range(519)
+                ],
+            )
+
+            review = review_import(
+                load_pipeline_config(config_path),
+                job_id="precipitation_weekly_era5_land",
+                start="2026-03-21",
+                end="2026-08-21",
+                org_unit_level=3,
+                data_set="CCH_WEEKLY",
+                expected_org_units=519,
+                expected_data_values=11937,
+            )
+
+        self.assertEqual(review["dateStart"], "2026-03-16")
+        self.assertEqual(review["dateEnd"], "2026-08-23")
+        self.assertEqual(review["periodStart"], "2026-W12")
+        self.assertEqual(review["periodEnd"], "2026-W34")
+        self.assertEqual(review["orgUnitLevel"], 3)
+        self.assertEqual(review["orgUnitsWithGeometry"], 519)
+        self.assertEqual(review["computedDataValues"], 11937)
+
     def test_reviews_weekly_climate_app_style_import(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -190,6 +264,59 @@ imports:
                 review_import(
                     load_pipeline_config(config_path),
                     job_id="temperature_max_weekly_era5_land",
+                )
+
+    def test_review_rejects_data_element_from_another_cached_data_set(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config" / "import-pipeline.yaml"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                """
+dhis2:
+  org_unit_level: 3
+  cache_max_age_hours: 168
+open_climate_service:
+  aggregate_process_id: aggregate_to_dhis2_json
+imports:
+  - id: weekly_precipitation
+    label: Precipitation
+    dataset_id: era5land_precipitation_weekly
+    data_set: CCH_WEEKLY
+    data_element: DAILY_PRECIP
+    period_type: week
+    method: sum
+    expected_units: mm
+    default_start_period: 2026-W12
+    default_end_period: 2026-W34
+""",
+                encoding="utf-8",
+            )
+            write_data_elements_cache(
+                root_dir=root,
+                source_base_url="https://dhis2.example.org",
+                data_elements=[
+                    {
+                        "id": "DailyPrecip",
+                        "code": "DAILY_PRECIP",
+                        "name": "Daily precipitation",
+                        "dataSetMemberships": [
+                            {"id": "DailyDataSet", "code": "CCH_DAILY", "periodType": "Daily"}
+                        ],
+                    }
+                ],
+                data_sets=[
+                    {"id": "WeeklyDataSet", "code": "CCH_WEEKLY", "periodType": "Weekly"},
+                    {"id": "DailyDataSet", "code": "CCH_DAILY", "periodType": "Daily"},
+                ],
+            )
+
+            with self.assertRaisesRegex(PipelineError, "not linked to cached DHIS2 data set"):
+                review_import(
+                    load_pipeline_config(config_path),
+                    job_id="weekly_precipitation",
+                    org_unit_level=3,
+                    data_set="CCH_WEEKLY",
                 )
 
     def test_review_can_use_years_back_without_configured_default_period(self) -> None:

@@ -13,7 +13,7 @@ class OCSClient:
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "OCSClient":
-        base_url = env.get("CLIMATE_SERVICE_BASE_URL", "http://127.0.0.1:8000")
+        base_url = env.get("CLIMATE_SERVICE_BASE_URL", "http://127.0.0.1:9000")
         return cls(base_url)
 
     def extent(self) -> dict[str, Any]:
