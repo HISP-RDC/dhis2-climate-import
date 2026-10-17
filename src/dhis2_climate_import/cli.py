@@ -634,8 +634,11 @@ def cmd_transfer_run_window(args: argparse.Namespace) -> None:
             "scenario": result["scenario"],
             "job": result["job"],
             "dryRun": result["dryRun"],
+            "status": result["status"],
             "sourceDataValueCount": result["sourceDataValueCount"],
+            "targetDataValueCount": result["targetDataValueCount"],
             "counts": result["counts"],
+            "timelinessQuarantine": result["timelinessQuarantine"],
             "dataValidationPendingMetadataCommit": result[
                 "dataValidationPendingMetadataCommit"
             ],

@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +19,60 @@ from dhis2_climate_import.http import HttpRequestError
 
 
 class CliErrorFormattingTests(unittest.TestCase):
+    def test_run_window_forwards_timeliness_quarantine_to_parent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = SimpleNamespace(
+                job_state_dir=lambda _job_id: Path(tmp),
+            )
+            args = SimpleNamespace(
+                job_id="hospital_service",
+                apply=True,
+                keep_payload=False,
+                start="2017-01-01",
+                end="2017-01-31",
+                parent_run_id="parent-1",
+                window_id="window-1",
+            )
+            result = {
+                "runId": "child-1",
+                "scenario": "x-to-y",
+                "job": "hospital_service",
+                "dryRun": False,
+                "status": "success_with_quarantine",
+                "sourceDataValueCount": 120374,
+                "targetDataValueCount": 105374,
+                "counts": {"updated": 105374},
+                "timelinessQuarantine": {
+                    "errorCode": "E8031",
+                    "quarantinedDataValueCount": 15000,
+                    "artifact": "e8031.json",
+                },
+                "dataValidationPendingMetadataCommit": False,
+                "dataValidationPendingHistoricalMetadataCommit": False,
+                "historicalDataElements": {},
+                "reportPath": "child-report.json",
+            }
+            with (
+                patch(
+                    "dhis2_climate_import.cli._transfer_runtime",
+                    return_value=({}, scenario, SimpleNamespace(), SimpleNamespace()),
+                ),
+                patch(
+                    "dhis2_climate_import.cli.run_transfer",
+                    return_value=result,
+                ),
+                patch("dhis2_climate_import.cli._print_json") as print_json,
+            ):
+                cmd_transfer_run_window(args)
+
+            payload = print_json.call_args.args[0]
+            self.assertEqual(payload["status"], "success_with_quarantine")
+            self.assertEqual(payload["targetDataValueCount"], 105374)
+            self.assertEqual(
+                payload["timelinessQuarantine"]["quarantinedDataValueCount"],
+                15000,
+            )
+
     def test_retries_transient_transfer_connection_check(self) -> None:
         class Client:
             def __init__(self) -> None:
