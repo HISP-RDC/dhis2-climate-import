@@ -230,3 +230,113 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import verify-analytics precipi
 If `trigger_analytics` is true in `config/import-pipeline.yaml`, the pipeline attempts to call
 the analytics maintenance endpoint after successful imports. Otherwise, keep this as an explicit
 operations step handled by the DHIS2 administrator.
+
+## 9. Transfer a Data Set Between DHIS2 Instances
+
+Copy the examples and configure `.env` with the referenced variables:
+
+```sh
+cp config/instances.yaml.example config/instances.yaml
+cp config/scenarios/dhis2-x-to-y.yaml.example config/scenarios/dhis2-x-to-y.yaml
+```
+
+The source account needs metadata/data read access. The target account needs data import access and,
+when `create_if_missing` is enabled, permission to import the Data Set metadata package.
+
+The review also verifies that every source organisation unit involved in the transfer exists on the
+target using `organisation_units.mapping_strategy` (`uid` or `code`). A missing or ambiguous match
+blocks the transfer before metadata or data mutation. Extra organisation units on the target do not
+block it.
+
+Always review first:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  review weekly_climate
+```
+
+Validate without mutation:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  run weekly_climate --dry-run
+```
+
+If the target Data Set is missing, this validates the metadata package but reports that data-value
+validation is pending the metadata commit. Apply only after reviewing the generated report:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  run weekly_climate --apply
+```
+
+The apply workflow creates missing metadata atomically, refreshes the target cache, dry-runs every
+data-value chunk, and writes the values only if no conflicts were reported. Generated state is kept in
+`state/<target-profile>/<scenario>/` and is ignored by Git.
+
+For large Data Sets, source export is two-dimensional: organisation-unit batches and DHIS2-period
+batches. A monthly job defaults to one month per request. You can make the setting explicit per job:
+
+```yaml
+jobs:
+  - id: hospital_service
+    # ...
+    transfer:
+      source_period_batch_size: 1
+```
+
+Every source request is logged to stderr with its date window, organisation-unit count, duration,
+and cumulative value count. If DHIS2, nginx, or Cloudflare returns a timeout/gateway error, the
+pipeline automatically halves the period range and then the organisation-unit batch. A failure at
+the minimum size (one DHIS2 period and one organisation unit) is reported with a concise diagnostic;
+in that case inspect source performance or increase `DHIS2_TIMEOUT_SECONDS` in `.env`.
+
+With metadata strategy `CREATE`, dependencies reported by DHIS2 as already existing (`E5000`) are
+removed from the commit package and reused by UID. They are never updated implicitly. The full source
+package is retained as `*.metadata.source.json`; the validated minimal package is retained as
+`*.metadata.json`. Any discarded stale category references are summarized in the run report.
+
+### Repair partial target metadata
+
+Do not bypass a CategoryCombo compatibility error with a global `CREATE_AND_UPDATE`. When the audit
+shows that the target has the same Data Element UIDs and labels but incomplete CategoryCombos, opt
+in explicitly in the scenario:
+
+```yaml
+target:
+  metadata:
+    reconcile_existing: true
+```
+
+Validate the repair plan without mutation:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  repair-metadata hospital_service --dry-run
+```
+
+The command blocks unless all affected Data Elements have matching identity fields, have no target
+Data Set memberships, and have no raw or deleted values in the 1900–2100 audit window under the
+target account's organisation-unit roots. It also requires Categories and CategoryOptions to match
+by UID, label, and membership. Review the generated report and rollback-evidence artifact before
+applying:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  repair-metadata hospital_service --apply
+```
+
+DHIS2 validates CategoryOptionCombos against the committed CategoryCombo structure, so apply runs
+two atomic stages. If the second-stage validation fails, no Data Element assignment is changed; the
+first-stage CategoryCombo repair remains recorded in the report. After a successful repair, rerun
+the ordinary transfer with `--dry-run`, then review its report before using `--apply`.

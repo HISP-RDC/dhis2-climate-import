@@ -79,18 +79,158 @@ class DHIS2Client:
             },
         )
 
+    def organisation_units(self, *, page_size: int = 1000) -> list[dict[str, Any]]:
+        return self._paged(
+            "/api/organisationUnits",
+            root_key="organisationUnits",
+            page_size=page_size,
+            params={
+                "fields": "id,code,name,path,level",
+                "paging": "true",
+            },
+        )
+
     def data_elements(self, *, page_size: int) -> list[dict[str, Any]]:
         return self._paged(
             "/api/dataElements",
             root_key="dataElements",
             page_size=page_size,
             params={
-                "fields": "id,code,name,displayName,valueType,domainType,aggregationType,periodType",
+                "fields": (
+                    "id,code,name,shortName,displayName,valueType,domainType,aggregationType,"
+                    "periodType,categoryCombo[id,code,name],optionSet[id,code,name],"
+                    "dataSetElements[dataSet[id,code,name]]"
+                ),
                 "paging": "true",
             },
         )
 
+    def metadata_objects_by_ids(
+        self,
+        *,
+        resource: str,
+        root_key: str,
+        object_ids: list[str],
+        fields: str,
+        batch_size: int = 40,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded set of metadata objects without scanning the whole collection."""
+        objects: list[dict[str, Any]] = []
+        for offset in range(0, len(object_ids), batch_size):
+            batch = object_ids[offset : offset + batch_size]
+            if not batch:
+                continue
+            response = self.http.request_json(
+                "GET",
+                f"/api/{resource}",
+                params={
+                    "filter": f"id:in:[{','.join(batch)}]",
+                    "fields": fields,
+                    "paging": "false",
+                },
+            )
+            items = response.get(root_key)
+            if not isinstance(items, list):
+                raise PipelineError(
+                    f"DHIS2 response did not contain a '{root_key}' list."
+                )
+            objects.extend(item for item in items if isinstance(item, dict))
+        return _unique_by_id(objects)
+
+    def category_option_combos_for_category_combos(
+        self, category_combo_ids: list[str], *, page_size: int = 500
+    ) -> list[dict[str, Any]]:
+        if not category_combo_ids:
+            return []
+        return self._paged(
+            "/api/categoryOptionCombos",
+            root_key="categoryOptionCombos",
+            page_size=page_size,
+            params={
+                "filter": f"categoryCombo.id:in:[{','.join(category_combo_ids)}]",
+                "fields": "id,code,name,categoryCombo[id],categoryOptions[id]",
+                "paging": "true",
+            },
+        )
+
+    def user_organisation_unit_roots(self) -> list[dict[str, Any]]:
+        me = self.http.request_json(
+            "GET",
+            "/api/me",
+            params={
+                "fields": (
+                    "organisationUnits[id,name,path,level],"
+                    "dataViewOrganisationUnits[id,name,path,level]"
+                )
+            },
+        )
+        data_view = me.get("dataViewOrganisationUnits")
+        assigned = me.get("organisationUnits")
+        candidates = data_view if isinstance(data_view, list) and data_view else assigned
+        if not isinstance(candidates, list):
+            return []
+        units = _unique_by_id([item for item in candidates if isinstance(item, dict)])
+        unit_ids = {str(item["id"]) for item in units if item.get("id")}
+        roots: list[dict[str, Any]] = []
+        for item in units:
+            path = str(item.get("path") or "")
+            ancestors = {part for part in path.split("/") if part}
+            if (ancestors - {str(item.get("id"))}) & unit_ids:
+                continue
+            roots.append(item)
+        return roots
+
+    def find_data_values(
+        self,
+        *,
+        data_element_ids: list[str],
+        organisation_unit_ids: list[str],
+        start: str,
+        end: str,
+        include_deleted: bool = True,
+        limit: int = 1,
+        batch_size: int = 40,
+    ) -> list[dict[str, Any]]:
+        """Return at most ``limit`` raw aggregate values matching the supplied IDs."""
+        if not data_element_ids or not organisation_unit_ids or limit <= 0:
+            return []
+        values: list[dict[str, Any]] = []
+        for offset in range(0, len(data_element_ids), batch_size):
+            batch = data_element_ids[offset : offset + batch_size]
+            payload = self.http.request_json(
+                "GET",
+                "/api/dataValueSets.json",
+                params={
+                    "dataElement": batch,
+                    "startDate": start,
+                    "endDate": end,
+                    "orgUnit": organisation_unit_ids,
+                    "children": True,
+                    "includeDeleted": include_deleted,
+                    "limit": limit - len(values),
+                    "dataElementIdScheme": "UID",
+                    "orgUnitIdScheme": "UID",
+                    "categoryOptionComboIdScheme": "UID",
+                    "attributeOptionComboIdScheme": "UID",
+                },
+            )
+            batch_values = payload.get("dataValues")
+            if not isinstance(batch_values, list):
+                raise PipelineError(
+                    "DHIS2 raw data audit did not return a dataValues list."
+                )
+            values.extend(item for item in batch_values if isinstance(item, dict))
+            if len(values) >= limit:
+                break
+        return values[:limit]
+
     def resolve_data_set(self, selector: str) -> DataSetRef:
+        data_set = self.find_data_set(selector)
+        if data_set is None:
+            raise PipelineError(f"DHIS2 data set '{selector}' was not found by UID or code.")
+        return data_set
+
+    def find_data_set(self, selector: str) -> DataSetRef | None:
         if _looks_like_uid(selector):
             try:
                 return self._data_set_ref_from_id(selector)
@@ -113,7 +253,7 @@ class DHIS2Client:
         if not isinstance(data_sets, list):
             raise PipelineError("DHIS2 response did not contain a 'dataSets' list.")
         if not data_sets:
-            raise PipelineError(f"DHIS2 data set '{selector}' was not found by UID or code.")
+            return None
         if len(data_sets) > 1:
             raise PipelineError(
                 f"DHIS2 data set selector '{selector}' matched more than one data set."
@@ -126,6 +266,65 @@ class DHIS2Client:
             period_type=data_set.get("periodType"),
         )
 
+    def data_set_details(self, data_set_id: str) -> dict[str, Any]:
+        return self.http.request_json(
+            "GET",
+            f"/api/dataSets/{data_set_id}",
+            params={
+                "fields": (
+                    "id,code,name,displayName,periodType,categoryCombo[id,code,name],"
+                    "dataSetElements[dataElement[id,code,name,displayName,valueType,domainType,"
+                    "aggregationType,periodType,categoryCombo[id,code,name],"
+                    "optionSet[id,code,name]]],"
+                    "organisationUnits[id,code,name,path,level]"
+                )
+            },
+        )
+
+    def organisation_units_for_data_set(self, data_set_id: str) -> list[dict[str, Any]]:
+        details = self.data_set_details(data_set_id)
+        organisation_units = details.get("organisationUnits")
+        if not isinstance(organisation_units, list):
+            return []
+        return _unique_by_id(
+            [item for item in organisation_units if isinstance(item, dict)]
+        )
+
+    def resolve_organisation_unit(self, selector: str) -> dict[str, Any]:
+        if _looks_like_uid(selector):
+            try:
+                return self.http.request_json(
+                    "GET",
+                    f"/api/organisationUnits/{selector}",
+                    params={"fields": "id,code,name,path,level"},
+                )
+            except HttpRequestError as exc:
+                if exc.status_code != 404:
+                    raise
+        response = self.http.request_json(
+            "GET",
+            "/api/organisationUnits",
+            params={
+                "filter": [f"id:eq:{selector}", f"code:eq:{selector}"],
+                "rootJunction": "OR",
+                "fields": "id,code,name,path,level",
+                "pageSize": 2,
+                "paging": "true",
+            },
+        )
+        units = response.get("organisationUnits")
+        if not isinstance(units, list):
+            raise PipelineError("DHIS2 response did not contain an 'organisationUnits' list.")
+        if not units:
+            raise PipelineError(
+                f"DHIS2 organisation unit '{selector}' was not found by UID or code."
+            )
+        if len(units) > 1:
+            raise PipelineError(
+                f"DHIS2 organisation unit selector '{selector}' matched more than one unit."
+            )
+        return units[0]
+
     def data_elements_for_data_set(
         self, *, data_set_id: str, page_size: int
     ) -> list[dict[str, Any]]:
@@ -136,7 +335,8 @@ class DHIS2Client:
                 "fields": (
                     "id,code,name,periodType,"
                     "dataSetElements[dataElement[id,code,name,displayName,valueType,domainType,"
-                    "aggregationType,periodType]]"
+                    "aggregationType,periodType,categoryCombo[id,code,name],"
+                    "optionSet[id,code,name]]]"
                 )
             },
         )
@@ -155,7 +355,10 @@ class DHIS2Client:
             page_size=page_size,
             params={
                 "filter": f"dataSetElements.dataSet.id:eq:{data_set_id}",
-                "fields": "id,code,name,displayName,valueType,domainType,aggregationType,periodType",
+                "fields": (
+                    "id,code,name,displayName,valueType,domainType,aggregationType,periodType,"
+                    "categoryCombo[id,code,name],optionSet[id,code,name]"
+                ),
                 "paging": "true",
             },
         )
@@ -168,18 +371,86 @@ class DHIS2Client:
         import_strategy: str,
         preheat_cache: bool,
         async_mode: bool,
+        id_schemes: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "dryRun": dry_run,
+            "importStrategy": import_strategy,
+            "preheatCache": preheat_cache,
+            "async": async_mode,
+        }
+        if id_schemes:
+            params.update(id_schemes)
         return self.http.request_json(
             "POST",
             "/api/dataValueSets",
+            params=params,
+            json_body=payload,
+        )
+
+    def export_data_set_metadata(
+        self, data_set_id: str, *, skip_sharing: bool = True
+    ) -> dict[str, Any]:
+        payload = self.http.request_json(
+            "GET",
+            f"/api/dataSets/{data_set_id}/metadata.json",
+            params={"skipSharing": skip_sharing},
+        )
+        if not isinstance(payload, dict):
+            raise PipelineError("DHIS2 metadata export did not return a JSON object.")
+        return payload
+
+    def import_metadata(
+        self,
+        payload: dict[str, Any],
+        *,
+        commit: bool,
+        import_strategy: str,
+        atomic_mode: str,
+        identifier: str = "UID",
+        skip_sharing: bool = True,
+    ) -> dict[str, Any]:
+        response = self.http.request_json(
+            "POST",
+            "/api/metadata",
             params={
-                "dryRun": dry_run,
+                "importMode": "COMMIT" if commit else "VALIDATE",
                 "importStrategy": import_strategy,
-                "preheatCache": preheat_cache,
-                "async": async_mode,
+                "atomicMode": atomic_mode,
+                "identifier": identifier,
+                "skipSharing": skip_sharing,
+                "importReportMode": "FULL",
             },
             json_body=payload,
         )
+        if not isinstance(response, dict):
+            raise PipelineError("DHIS2 metadata import did not return a JSON object.")
+        return response
+
+    def export_data_values(
+        self,
+        *,
+        data_set_id: str,
+        start: str,
+        end: str,
+        organisation_unit_ids: list[str],
+        include_children: bool,
+        include_deleted: bool,
+        id_schemes: dict[str, str],
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "dataSet": data_set_id,
+            "startDate": start,
+            "endDate": end,
+            "orgUnit": organisation_unit_ids,
+            "children": include_children,
+            "includeDeleted": include_deleted,
+            **id_schemes,
+        }
+        payload = self.http.request_json("GET", "/api/dataValueSets.json", params=params)
+        if not isinstance(payload, dict) or not isinstance(payload.get("dataValues"), list):
+            raise PipelineError("DHIS2 data value export did not return a dataValues list.")
+        return payload
 
     def task_status(self, task_id_or_path: str) -> Any:
         path = task_id_or_path

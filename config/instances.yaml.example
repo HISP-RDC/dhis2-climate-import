@@ -1,0 +1,18 @@
+# Copy to config/instances.yaml. Secrets remain in .env.
+schema_version: 2
+
+instances:
+  x:
+    type: dhis2
+    base_url_env: DHIS2_X_BASE_URL
+    auth:
+      method: basic
+      username_env: DHIS2_X_USERNAME
+      password_env: DHIS2_X_PASSWORD
+
+  y:
+    type: dhis2
+    base_url_env: DHIS2_Y_BASE_URL
+    auth:
+      method: pat
+      token_env: DHIS2_Y_PAT

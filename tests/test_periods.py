@@ -3,6 +3,7 @@ import unittest
 from dhis2_climate_import.periods import (
     date_window_period_bounds,
     month_bounds,
+    period_date_windows,
     period_labels_between,
     period_range_bounds,
     periods_between,
@@ -22,6 +23,21 @@ class PeriodTests(unittest.TestCase):
         self.assertEqual(
             periods_between("2024-01-15", "2024-03-01", "month"),
             ["202401", "202402", "202403"],
+        )
+
+    def test_monthly_export_windows_split_on_period_boundaries(self) -> None:
+        self.assertEqual(
+            period_date_windows(
+                "2026-01-01",
+                "2026-05-31",
+                "month",
+                batch_size=2,
+            ),
+            [
+                ("2026-01-01", "2026-02-28"),
+                ("2026-03-01", "2026-04-30"),
+                ("2026-05-01", "2026-05-31"),
+            ],
         )
 
     def test_month_bounds(self) -> None:

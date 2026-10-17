@@ -74,11 +74,7 @@ class PipelineConfig:
 
 def load_pipeline_config(path: str | Path, env: dict[str, str] | None = None) -> PipelineConfig:
     config_path = Path(path)
-    if not config_path.exists():
-        raise PipelineError(f"Pipeline configuration not found: {config_path}")
-
-    raw_data = _load_structured_text(config_path.read_text(encoding="utf-8"))
-    data = _interpolate(raw_data, env or os.environ)
+    data = load_structured_config(config_path, env=env)
     if not isinstance(data, dict):
         raise PipelineError("Pipeline configuration must be a mapping/object.")
 
@@ -115,6 +111,24 @@ def load_pipeline_config(path: str | Path, env: dict[str, str] | None = None) ->
         ),
         imports=imports,
     )
+
+
+def load_structured_config(
+    path: str | Path, *, env: dict[str, str] | None = None, interpolate: bool = True
+) -> Any:
+    """Load the small JSON/YAML subset supported by this project.
+
+    Transfer profile files use names of secret environment variables instead of embedding
+    their values, so callers can disable interpolation for those files.
+    """
+
+    config_path = Path(path)
+    if not config_path.exists():
+        raise PipelineError(f"Configuration not found: {config_path}")
+    raw_data = _load_structured_text(config_path.read_text(encoding="utf-8"))
+    if not interpolate:
+        return raw_data
+    return _interpolate(raw_data, env or os.environ)
 
 
 def _parse_import_job(item: Any) -> ImportJobConfig:

@@ -1,0 +1,83 @@
+schema_version: 2
+id: dhis2-x-to-y
+
+source:
+  instance: x
+
+target:
+  instance: y
+  metadata:
+    # If the target Data Set is absent, validate and import the official
+    # DHIS2 dependency package before importing data values.
+    mode: create_if_missing
+    identity_strategy: preserve_uid
+    # Allows the explicit repair-metadata command to reconcile incomplete
+    # existing objects. The normal transfer command never repairs them implicitly.
+    reconcile_existing: true
+    skip_sharing: true
+    import:
+      strategy: CREATE
+      atomic: true
+
+  organisation_units:
+    # Uses the organisation units assigned to the source Data Set. Use
+    # configured_roots/source_roots when a hierarchy root is more appropriate.
+    discovery: linked_to_dataset
+    mapping_strategy: uid
+    include_children: false
+    batch_size: 40
+
+mapping:
+  data_elements: uid
+  organisation_units: uid
+  category_option_combos: uid
+  attribute_option_combos: uid
+  data_sets: uid
+
+transfer:
+  import_strategy: CREATE_AND_UPDATE
+  chunk_size: 5000
+  preheat_cache: true
+  include_deleted: false
+  preserve_comments: true
+
+state:
+  directory: state
+
+jobs:
+  - id: weekly_climate
+    source_data_set: CCH_CLIMATE_WEATHER
+    target_data_set: CCH_CLIMATE_WEATHER
+    period_type: week
+    default_start_period: 2026-W01
+    default_end_period: 2026-W40
+    data_elements:
+      discovery: linked_to_dataset
+  - id: sigl_fosa
+    source_data_set: oTgCLoG5OkY
+    target_data_set: oTgCLoG5OkY
+    period_type: month
+    default_start_period: 2017-01
+    default_end_period: 2026-10
+    data_elements:
+      discovery: linked_to_dataset
+  - id: hospital_service
+    source_data_set: OeWrFwkFMvf
+    target_data_set: OeWrFwkFMvf
+    period_type: month
+    default_start_period: 2026-01
+    default_end_period: 2026-10
+    data_elements:
+      discovery: linked_to_dataset
+    transfer:
+      # Export one DHIS2 month per source request; timeout responses are then
+      # subdivided automatically by organisation unit.
+      source_period_batch_size: 1
+  - id: population_as
+    source_data_set: mV0r6yDCZy3
+    target_data_set: mV0r6yDCZy3
+    period_type: month
+    default_start_period: 2017-01
+    default_end_period: 2026-10
+    data_elements:
+      discovery: linked_to_dataset

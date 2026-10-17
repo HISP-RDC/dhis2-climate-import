@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from .cache import (
     data_elements_cache_path,
@@ -25,6 +26,8 @@ from .ocs import OCSClient
 from .periods import date_window_period_bounds, period_range_bounds, relative_year_window
 from .pipeline import aggregate_job, import_job, review_import, run_monthly_imports
 from .reports import run_id, write_report
+from .transfer import repair_target_metadata, review_transfer, run_transfer
+from .transfer_config import load_instance_registry, load_transfer_scenario
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -133,6 +136,46 @@ def build_parser() -> argparse.ArgumentParser:
     monthly_mode.add_argument("--apply", action="store_true")
     monthly.add_argument("--force", action="store_true")
     monthly.set_defaults(func=cmd_run_monthly)
+
+    transfer = subparsers.add_parser(
+        "transfer", help="Transfer aggregate Data Set values between two DHIS2 instances."
+    )
+    transfer.add_argument("--instances", default="config/instances.yaml")
+    transfer.add_argument("--scenario", required=True)
+    transfer_commands = transfer.add_subparsers(dest="transfer_command", required=True)
+
+    transfer_review = transfer_commands.add_parser(
+        "review", help="Review source/target metadata and the transfer window."
+    )
+    transfer_review.add_argument("job_id")
+    _add_window_args(transfer_review)
+    transfer_review.set_defaults(func=cmd_transfer_review)
+
+    transfer_repair = transfer_commands.add_parser(
+        "repair-metadata",
+        help=(
+            "Safely reconcile incomplete target CategoryCombos and Data Elements before "
+            "creating a missing Data Set."
+        ),
+    )
+    transfer_repair.add_argument("job_id")
+    _add_window_args(transfer_repair)
+    repair_mode = transfer_repair.add_mutually_exclusive_group(required=True)
+    repair_mode.add_argument("--dry-run", action="store_true")
+    repair_mode.add_argument("--apply", action="store_true")
+    transfer_repair.set_defaults(func=cmd_transfer_repair_metadata)
+
+    transfer_run = transfer_commands.add_parser(
+        "run", help="Validate or apply a DHIS2-to-DHIS2 transfer."
+    )
+    transfer_run.add_argument("job_id")
+    _add_window_args(transfer_run)
+    transfer_mode = transfer_run.add_mutually_exclusive_group(required=True)
+    transfer_mode.add_argument("--dry-run", action="store_true")
+    transfer_mode.add_argument("--apply", action="store_true")
+    transfer_run.add_argument("--force", action="store_true")
+    transfer_run.add_argument("--keep-payload", action="store_true")
+    transfer_run.set_defaults(func=cmd_transfer_run)
 
     return parser
 
@@ -446,11 +489,145 @@ def cmd_run_monthly(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_transfer_review(args: argparse.Namespace) -> None:
+    _env, scenario, source, target = _transfer_runtime(args)
+    result = review_transfer(
+        scenario,
+        source,
+        target,
+        job_id=args.job_id,
+        start=args.start,
+        end=args.end,
+        start_period=args.start_period,
+        end_period=args.end_period,
+        years_back=args.years_back,
+        as_of=args.as_of,
+    )
+    _print_json(result)
+
+
+def cmd_transfer_run(args: argparse.Namespace) -> None:
+    _transfer_progress("instances.check.start", {})
+    _env, scenario, source, target = _transfer_runtime(
+        args, progress=_transfer_progress
+    )
+    _transfer_progress(
+        "instances.check.done",
+        {"source": source.base_url, "target": target.base_url},
+    )
+    result = run_transfer(
+        scenario,
+        source,
+        target,
+        job_id=args.job_id,
+        apply=args.apply,
+        force=args.force,
+        keep_payload=args.keep_payload,
+        start=args.start,
+        end=args.end,
+        start_period=args.start_period,
+        end_period=args.end_period,
+        years_back=args.years_back,
+        as_of=args.as_of,
+        progress=_transfer_progress,
+    )
+    _print_json(
+        {
+            "runId": result["runId"],
+            "scenario": result["scenario"],
+            "job": result["job"],
+            "dryRun": result["dryRun"],
+            "sourceDataValueCount": result["sourceDataValueCount"],
+            "metadata": {
+                "required": result["metadata"]["required"],
+                "validated": result["metadata"]["validated"],
+                "committed": result["metadata"]["committed"],
+            },
+            "dataValidationPendingMetadataCommit": result[
+                "dataValidationPendingMetadataCommit"
+            ],
+            "counts": result["counts"],
+            "reportPath": result["reportPath"],
+        }
+    )
+
+
+def cmd_transfer_repair_metadata(args: argparse.Namespace) -> None:
+    _env, scenario, source, target = _transfer_runtime(args)
+    result = repair_target_metadata(
+        scenario,
+        source,
+        target,
+        job_id=args.job_id,
+        apply=args.apply,
+        start=args.start,
+        end=args.end,
+        start_period=args.start_period,
+        end_period=args.end_period,
+        years_back=args.years_back,
+        as_of=args.as_of,
+    )
+    if result["status"] == "not_required":
+        _print_json(result)
+        return
+    _print_json(
+        {
+            "runId": result["runId"],
+            "scenario": result["scenario"],
+            "job": result["job"],
+            "dryRun": result["dryRun"],
+            "status": result["status"],
+            "repair": result["repair"],
+            "structure": {
+                "validated": result["structure"]["validated"],
+                "committed": result["structure"]["committed"],
+            },
+            "assignments": {
+                "validationPendingStructureCommit": result["assignments"][
+                    "validationPendingStructureCommit"
+                ],
+                "validated": result["assignments"]["validated"],
+                "committed": result["assignments"]["committed"],
+            },
+            "nextStep": result["nextStep"],
+            "reportPath": result["reportPath"],
+        }
+    )
+
+
 def _runtime(args: argparse.Namespace) -> tuple[dict[str, str], PipelineConfig]:
     file_env = load_env_file(args.env_file)
     env = {**file_env, **os.environ}
     config = load_pipeline_config(args.config, env=env)
     return env, config
+
+
+def _transfer_runtime(
+    args: argparse.Namespace,
+    *,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
+) -> tuple[
+    dict[str, str], Any, DHIS2Client, DHIS2Client
+]:
+    file_env = load_env_file(args.env_file)
+    env = {**file_env, **os.environ}
+    registry = load_instance_registry(args.instances)
+    scenario = load_transfer_scenario(args.scenario)
+    source_profile = registry.get(scenario.source_instance)
+    target_profile = registry.get(scenario.target_instance)
+    source = DHIS2Client.from_env(source_profile.client_env(env))
+    target = DHIS2Client.from_env(target_profile.client_env(env))
+    if source.base_url == target.base_url:
+        raise PipelineError(
+            "Source and target instance profiles resolve to the same DHIS2 base URL."
+        )
+    source.check(min_version=(2, 37))
+    if progress is not None:
+        progress("instances.source.done", {"source": source.base_url})
+    target.check(min_version=(2, 37))
+    if progress is not None:
+        progress("instances.target.done", {"target": target.base_url})
+    return env, scenario, source, target
 
 
 def _data_set_selectors(cli_selector: str | None, config: PipelineConfig) -> list[str]:
@@ -578,6 +755,50 @@ def _print_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def _transfer_progress(event: str, details: dict[str, Any]) -> None:
+    labels = {
+        "instances.check.start": "Vérification des connexions X et Y",
+        "instances.source.done": "Connexion source X validée",
+        "instances.target.done": "Connexion cible Y validée",
+        "instances.check.done": "Connexions X et Y validées",
+        "transfer.start": "Démarrage du transfert",
+        "context.resolve.start": "Lecture et comparaison des métadonnées",
+        "context.resolve.done": "Métadonnées compatibles",
+        "cache.metadata.written": "Cache local actualisé",
+        "metadata.source_export.start": "Export des métadonnées source",
+        "metadata.source_export.done": "Métadonnées source exportées",
+        "metadata.validation.start": "Validation des métadonnées cible",
+        "metadata.validation.done": "Métadonnées cible validées",
+        "metadata.commit.start": "Création des métadonnées cible",
+        "metadata.commit.done": "Métadonnées cible créées",
+        "source.export.start": "Début de l’export des valeurs source",
+        "source.export.request.start": "Requête source en cours",
+        "source.export.request.done": "Requête source terminée",
+        "source.export.request.split": "Timeout détecté, subdivision automatique",
+        "source.export.done": "Export des valeurs source terminé",
+        "target.dry_run.start": "Début de la validation des valeurs cible",
+        "target.dry_run.chunk.start": "Validation d’un lot cible",
+        "target.dry_run.chunk.done": "Lot cible validé",
+        "target.dry_run.done": "Validation des valeurs cible terminée",
+        "target.import.start": "Début de l’import réel des valeurs",
+        "target.import.chunk.start": "Import d’un lot cible",
+        "target.import.chunk.done": "Lot cible importé",
+        "target.import.done": "Import réel terminé",
+        "transfer.done": "Transfert terminé",
+        "transfer.failed": "Transfert interrompu",
+    }
+    rendered_details = " | ".join(
+        f"{key}={value}" for key, value in details.items()
+    )
+    suffix = f" | {rendered_details}" if rendered_details else ""
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(
+        f"[{timestamp}] {labels.get(event, event)}{suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _format_http_error(exc: HttpRequestError) -> str:
     message = str(exc)
     if exc.status_code == 403 and "nginx" in exc.body.lower():
@@ -598,4 +819,36 @@ def _format_http_error(exc: HttpRequestError) -> str:
             "Check DHIS2_PAT or DHIS2_USERNAME/DHIS2_PASSWORD and the user's metadata/data "
             "authorities."
         )
+    if exc.status_code == 409:
+        conflicts = _dhis2_error_details(exc.body)
+        if conflicts:
+            return f"{message}\nDHIS2 conflict details:\n" + "\n".join(
+                f"- {item}" for item in conflicts[:20]
+            )
     return message
+
+
+def _dhis2_error_details(body: str) -> list[str]:
+    try:
+        payload = json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+    details: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            error_code = value.get("errorCode")
+            error_message = value.get("message")
+            if isinstance(error_message, str) and error_code:
+                detail = f"{error_code}: {error_message}"
+                if detail not in details:
+                    details.append(detail)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return details

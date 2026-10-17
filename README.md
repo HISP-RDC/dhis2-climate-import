@@ -56,6 +56,94 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import import-dhis2 precipitati
 - Un import deja reussi avec le meme dataset, la meme periode, le meme data element et le meme
   hash de cache org units n'est pas relance sans `--force`.
 
+## DHIS2-to-DHIS2 Data Set Transfer
+
+The transfer workflow discovers every Data Element linked to a configured source Data Set. It can
+validate an existing target Data Set or bootstrap a missing target from the official DHIS2 metadata
+dependency export before importing the data values.
+
+Every source organisation unit involved in the transfer must already exist on the target according
+to the configured `uid` or `code` mapping. Missing or ambiguous matches block the transfer before
+metadata creation; additional organisation units on the target are allowed. Target units are read
+in paginated batches and compared locally instead of issuing one API request per unit.
+
+Prepare profiles and a scenario:
+
+```sh
+cp config/instances.yaml.example config/instances.yaml
+cp config/scenarios/dhis2-x-to-y.yaml.example config/scenarios/dhis2-x-to-y.yaml
+```
+
+The instance file references environment variable names only. Each profile supports `pat`, `basic`,
+or `auto` authentication; passwords and tokens stay in `.env`.
+
+Review, validate, then apply:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  review weekly_climate
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  run weekly_climate --dry-run
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  run weekly_climate --apply
+```
+
+With `target.metadata.mode: create_if_missing`, `--dry-run` exports the Data Set dependency package
+from X and validates it against Y without writing metadata. `--apply` performs metadata
+`VALIDATE`, metadata `COMMIT`, a data-value dry-run, and finally the real data import. Caches,
+artifacts, reports, and the SQLite journal are isolated under
+`state/<target-profile>/<scenario>/`.
+
+When `import.strategy: CREATE` finds dependencies that already exist on the target with the same
+UID, the transfer reuses them instead of updating them. The original source package and the final
+minimal package are both kept as artifacts. Invalid stale category-option-combo references and
+incompatible compulsory operands are removed from the import package and recorded in the report.
+
+If a target contains partial copies of the source metadata (same Data Element UIDs and labels, but
+the default CategoryCombo instead of the source CategoryCombo), enable
+`target.metadata.reconcile_existing` only after a read-only audit. Reconciliation is an explicit,
+separate operation and is never performed implicitly by `transfer run`:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  repair-metadata hospital_service --dry-run
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  repair-metadata hospital_service --apply
+```
+
+The repair accepts only matching UIDs and identity fields, empty target CategoryCombos, Data
+Elements with no target Data Set membership, and no raw or deleted target values between 1900 and
+2100 under the target account's organisation-unit roots. It first updates CategoryCombo structure,
+then validates and commits CategoryOptionCombos and Data Element assignments. A dry-run validates
+the first stage without mutation; the second stage necessarily remains pending until the first
+stage has been committed. Source, structure, assignment, rollback-evidence, and report artifacts
+are retained under the scenario state directory.
+
+With `identity_strategy: preserve_uid`, target discovery first uses `target_data_set`, then falls
+back to the source Data Set UID. This prevents an existing target object without a code from being
+mistaken for missing metadata.
+
+Long source exports are split on DHIS2 period boundaries before calling `dataValueSets`. Defaults
+are 31 daily periods, 13 weekly periods, one monthly period, or one yearly period per request. Set
+`transfer.source_period_batch_size` globally or on one job to override this. Organisation units are
+still batched with `organisation_units.batch_size`; a timeout or gateway response automatically
+subdivides the failing period/organisation-unit batch until it succeeds or reaches one period and
+one unit. `transfer run` prints timestamped progress to stderr before and after each request, while
+keeping the final JSON result on stdout.
+
 ## Commands
 
 ```sh

@@ -1,0 +1,58 @@
+schema_version: 2
+id: dhis2-x-to-y
+
+source:
+  instance: x
+
+target:
+  instance: y
+  metadata:
+    # If the target Data Set is absent, validate and import the official
+    # DHIS2 dependency package before importing data values.
+    mode: create_if_missing
+    identity_strategy: preserve_uid
+    # Enable only after a read-only audit of partial metadata on the target.
+    # Repairs remain an explicit repair-metadata --apply operation.
+    reconcile_existing: false
+    skip_sharing: true
+    import:
+      strategy: CREATE
+      atomic: true
+
+  organisation_units:
+    # Uses the organisation units assigned to the source Data Set. Use
+    # configured_roots/source_roots when a hierarchy root is more appropriate.
+    discovery: linked_to_dataset
+    mapping_strategy: uid
+    include_children: false
+    batch_size: 40
+
+mapping:
+  data_elements: uid
+  organisation_units: uid
+  category_option_combos: uid
+  attribute_option_combos: uid
+  data_sets: uid
+
+transfer:
+  import_strategy: CREATE_AND_UPDATE
+  chunk_size: 5000
+  # Number of DHIS2 periods per source request. Defaults are 31 daily,
+  # 13 weekly, 1 monthly, and 1 yearly period when omitted.
+  source_period_batch_size: 13
+  preheat_cache: true
+  include_deleted: false
+  preserve_comments: true
+
+state:
+  directory: state
+
+jobs:
+  - id: weekly_climate
+    source_data_set: CCH_CLIMATE_WEATHER
+    target_data_set: CCH_CLIMATE_WEATHER
+    period_type: week
+    default_start_period: 2026-W01
+    default_end_period: 2026-W40
+    data_elements:
+      discovery: linked_to_dataset

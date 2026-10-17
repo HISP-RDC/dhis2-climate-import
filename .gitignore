@@ -13,6 +13,7 @@ __pycache__/
 data/
 cache/
 reports/
+state/
 *.sqlite3
 *.db
 

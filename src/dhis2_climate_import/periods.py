@@ -75,6 +75,25 @@ def period_labels_between(start: str, end: str, period_type: str) -> list[str]:
     return [format_period(period, period_type) for period in periods_between(start, end, period_type)]
 
 
+def period_date_windows(
+    start: str,
+    end: str,
+    period_type: str,
+    batch_size: int,
+) -> list[tuple[str, str]]:
+    if batch_size <= 0:
+        raise PipelineError("Period batch size must be greater than zero.")
+    periods = periods_between(start, end, period_type)
+    return [
+        period_range_bounds(
+            periods[offset],
+            periods[min(offset + batch_size, len(periods)) - 1],
+            period_type,
+        )
+        for offset in range(0, len(periods), batch_size)
+    ]
+
+
 def date_window_period_bounds(start: str, end: str, period_type: str) -> tuple[str, str]:
     start_date = parse_date(start)
     end_date = parse_date(end)

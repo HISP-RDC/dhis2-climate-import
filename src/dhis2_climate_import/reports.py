@@ -70,9 +70,15 @@ def _find_import_count(payload: Any) -> dict[str, Any]:
         value = payload.get("importCount")
         if isinstance(value, dict):
             return value
+        value = payload.get("dataValueCount")
+        if isinstance(value, dict):
+            return value
         response = payload.get("response")
         if isinstance(response, dict):
             value = response.get("importCount")
+            if isinstance(value, dict):
+                return value
+            value = response.get("dataValueCount")
             if isinstance(value, dict):
                 return value
         for child in payload.values():
