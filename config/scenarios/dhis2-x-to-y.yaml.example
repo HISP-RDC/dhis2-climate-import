@@ -48,7 +48,8 @@ target:
       # Once the manual dry-run has been approved, this can guard every transfer.
       run_before_transfer: false
       # block is the safe default. With exclude, detected identity/parent conflicts
-      # quarantine only their selected source subtrees and remain fully audited.
+      # quarantine their selected source subtrees. E8031 values outside an OU's
+      # active dates are also quarantined after validation. All remain audited.
       # exclude requires enabled=true, run_before_transfer=true and UID mapping.
       conflict_policy: block
       create_missing: true

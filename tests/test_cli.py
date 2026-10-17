@@ -120,6 +120,24 @@ class CliErrorFormattingTests(unittest.TestCase):
         self.assertIn("HistoricC01", formatted)
         self.assertNotIn("4999", formatted)
 
+    def test_explains_e8031_when_server_omits_its_message(self) -> None:
+        body = json.dumps(
+            {
+                "response": {
+                    "conflicts": [
+                        {"errorCode": "E8031", "indexes": [0, 1, 2]}
+                    ]
+                }
+            }
+        )
+        error = HttpRequestError("POST", "https://example.org/api/dataValueSets", 409, body)
+
+        formatted = _format_http_error(error)
+
+        self.assertIn("E8031", formatted)
+        self.assertIn("openingDate/closedDate", formatted)
+        self.assertIn("affectedValues=3", formatted)
+
     def test_parses_reconcile_and_internal_window_commands(self) -> None:
         reconcile = build_parser().parse_args(
             [

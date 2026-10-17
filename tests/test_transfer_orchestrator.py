@@ -280,6 +280,70 @@ class TransferOrchestratorTests(unittest.TestCase):
             self.assertEqual(result["completedWindows"], 0)
             self.assertEqual(result["sourceDataValueCount"], 9)
 
+    def test_parent_summary_aggregates_e8031_quarantine(self) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = _monthly_scenario(Path(tmp))
+            context = SimpleNamespace(
+                job=scenario.get_job("hospital"),
+                source_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="HOSPITAL",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                start="2017-01-01",
+                end="2017-03-31",
+            )
+            source = SimpleNamespace(base_url="https://x.example.org")
+            target = SimpleNamespace(base_url="https://y.example.org")
+
+            def quarantined(*_args):
+                return {
+                    "status": "success_with_quarantine",
+                    "sourceDataValueCount": 10,
+                    "counts": {"imported": 7},
+                    "timelinessQuarantine": {
+                        "errorCode": "E8031",
+                        "quarantinedDataValueCount": 3,
+                        "organisationUnitCount": 1,
+                        "periodCount": 2,
+                        "groups": [],
+                        "artifact": "e8031.json",
+                    },
+                    "reportPath": "window.json",
+                }
+
+            with (
+                patch(
+                    "dhis2_climate_import.transfer_orchestrator.reconcile_target_metadata",
+                    return_value={"requiresChanges": False, "committed": True},
+                ),
+                patch(
+                    "dhis2_climate_import.transfer_orchestrator.resolve_transfer_context",
+                    return_value=context,
+                ),
+            ):
+                result = orchestrate_transfer(
+                    scenario,
+                    source,
+                    target,
+                    job_id="hospital",
+                    apply=True,
+                    window_runner=quarantined,
+                )
+
+            self.assertEqual(result["status"], "success_with_quarantine")
+            self.assertEqual(result["sourceDataValueCount"], 10)
+            self.assertEqual(result["targetDataValueCount"], 7)
+            self.assertEqual(
+                result["timelinessQuarantine"]["quarantinedDataValueCount"],
+                3,
+            )
+            self.assertEqual(
+                result["windows"][0]["status"],
+                "success_with_quarantine",
+            )
+
 
 def _monthly_scenario(
     root: Path,

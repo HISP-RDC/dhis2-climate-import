@@ -225,6 +225,11 @@ and included in the checkpoint fingerprint. Structural errors and a quarantine t
 complete source selection still block execution. `jobs[].organisation_units.exclude` remains
 available for an explicit manual quarantine with a mandatory reason.
 
+With `exclude`, target validation also quarantines only values rejected with DHIS2 `E8031`
+(organisation unit inactive for that period), revalidates the remaining values, and records the
+exact `OU + period` rows under `runs/<transfer-run>/data-value-quarantine/e8031.json`. It does not
+alter target opening/closing dates, and any mixed conflict remains blocking.
+
 Prepare profiles and a scenario:
 
 ```sh

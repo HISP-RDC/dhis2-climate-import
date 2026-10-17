@@ -894,6 +894,18 @@ def run_transfer(
 
         dry_run_responses: list[dict[str, Any]] = []
         apply_responses: list[dict[str, Any]] = []
+        timeliness_quarantine_report: dict[str, Any] = {
+            "enabled": (
+                context.job.organisation_units.synchronization.conflict_policy
+                == "exclude"
+            ),
+            "errorCode": "E8031",
+            "quarantinedDataValueCount": 0,
+            "organisationUnitCount": 0,
+            "periodCount": 0,
+            "groups": [],
+            "artifact": None,
+        }
         if context.target_data_set is not None and not historical_pending:
             _validate_target_data_set_organisation_units(
                 target,
@@ -909,51 +921,27 @@ def run_transfer(
             )
             target_payload = _target_payload(context, source_values)
             chunks = _chunk_payload(target_payload, context.job.transfer.chunk_size)
-            _emit_progress(
-                progress,
-                "target.dry_run.start",
-                chunks=len(chunks),
-                dataValues=len(source_values),
+            (
+                dry_run_responses,
+                chunks,
+                timeliness_quarantine_report,
+            ) = _validate_target_chunks(
+                target,
+                chunks,
+                context=context,
+                state_dir=state_dir,
+                current_run_id=current_run_id,
+                progress=progress,
             )
-            for index, chunk in enumerate(chunks, start=1):
-                chunk_started = time.monotonic()
-                _emit_progress(
-                    progress,
-                    "target.dry_run.chunk.start",
-                    chunk=f"{index}/{len(chunks)}",
-                    dataValues=len(chunk["dataValues"]),
-                )
-                response = target.import_data_value_set(
-                    chunk,
-                    dry_run=True,
-                    import_strategy=context.job.transfer.import_strategy,
-                    preheat_cache=context.job.transfer.preheat_cache,
-                    async_mode=False,
-                    id_schemes=context.job.id_schemes.api_params(),
-                )
-                _assert_success_response(
-                    response, f"Target data dry-run chunk {index}", allow_warning=True
-                )
-                conflicts = extract_conflicts(response)
-                if conflicts:
-                    raise PipelineError(
-                        f"Target data dry-run chunk {index} reported conflicts: "
-                        f"{json.dumps(conflicts, sort_keys=True)[:1000]}"
-                    )
-                dry_run_responses.append({"chunk": index, "response": response})
-                _emit_progress(
-                    progress,
-                    "target.dry_run.chunk.done",
-                    chunk=f"{index}/{len(chunks)}",
-                    durationSeconds=round(time.monotonic() - chunk_started, 2),
-                )
-            _emit_progress(progress, "target.dry_run.done", chunks=len(chunks))
             if apply:
+                target_value_count = sum(
+                    len(chunk["dataValues"]) for chunk in chunks
+                )
                 _emit_progress(
                     progress,
                     "target.import.start",
                     chunks=len(chunks),
-                    dataValues=len(source_values),
+                    dataValues=target_value_count,
                 )
                 for index, chunk in enumerate(chunks, start=1):
                     chunk_started = time.monotonic()
@@ -992,11 +980,21 @@ def run_transfer(
             raise PipelineError("Target Data Set is unavailable after metadata bootstrap.")
 
         counts = import_counts(apply_responses if apply else dry_run_responses)
+        quarantined_data_value_count = int(
+            timeliness_quarantine_report.get("quarantinedDataValueCount") or 0
+        )
+        status = (
+            "success_with_quarantine"
+            if context.detected_organisation_unit_conflicts
+            or quarantined_data_value_count
+            else "success"
+        )
         report = {
             "runId": current_run_id,
             "scenario": scenario.id,
             "job": context.job.id,
             "dryRun": not apply,
+            "status": status,
             "sourceInstance": {
                 "profile": scenario.source_instance,
                 "baseUrl": source.base_url,
@@ -1012,12 +1010,14 @@ def run_transfer(
             "start": context.start,
             "end": context.end,
             "sourceDataValueCount": source_count,
+            "targetDataValueCount": source_count - quarantined_data_value_count,
             "chunkCount": math.ceil(source_count / context.job.transfer.chunk_size)
             if source_count
             else 0,
             "metadata": metadata_report,
             "historicalDataElements": historical_data_element_report,
             "categoryOptionCombos": category_option_combo_report,
+            "timelinessQuarantine": timeliness_quarantine_report,
             "organisationUnitExclusions": _organisation_unit_exclusion_payload(
                 context.job
             ),
@@ -4353,6 +4353,239 @@ def _validate_target_category_option_combos(
         "target.category_option_combos.audit.done",
         categoryOptionCombinations=len(target_by_identifier),
     )
+
+
+def _validate_target_chunks(
+    target: DHIS2Client,
+    chunks: list[dict[str, Any]],
+    *,
+    context: TransferContext,
+    state_dir: Path,
+    current_run_id: str,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Dry-run value chunks and quarantine only DHIS2 E8031 indexes when opted in.
+
+    E8031 is returned when an organisation unit is not active for the supplied
+    period.  DHIS2 is authoritative here: using the indexes from its validation
+    response avoids reimplementing version-specific opening/closing date rules.
+    """
+    exclusion_enabled = (
+        context.job.organisation_units.synchronization.conflict_policy == "exclude"
+    )
+    responses: list[dict[str, Any]] = []
+    accepted_chunks: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
+    original_chunk_count = len(chunks)
+    original_value_count = sum(
+        len(chunk.get("dataValues", []))
+        for chunk in chunks
+        if isinstance(chunk.get("dataValues"), list)
+    )
+    _emit_progress(
+        progress,
+        "target.dry_run.start",
+        chunks=original_chunk_count,
+        dataValues=original_value_count,
+    )
+
+    for index, original_chunk in enumerate(chunks, start=1):
+        chunk_started = time.monotonic()
+        original_values = original_chunk.get("dataValues")
+        if not isinstance(original_values, list):
+            raise PipelineError(f"Target data dry-run chunk {index} has no dataValues list.")
+        values = list(original_values)
+        original_indexes = list(range(len(values)))
+        quarantined_in_chunk = 0
+        _emit_progress(
+            progress,
+            "target.dry_run.chunk.start",
+            chunk=f"{index}/{original_chunk_count}",
+            dataValues=len(values),
+        )
+
+        while values:
+            candidate = {**original_chunk, "dataValues": values}
+            try:
+                response = target.import_data_value_set(
+                    candidate,
+                    dry_run=True,
+                    import_strategy=context.job.transfer.import_strategy,
+                    preheat_cache=context.job.transfer.preheat_cache,
+                    async_mode=False,
+                    id_schemes=context.job.id_schemes.api_params(),
+                )
+            except HttpRequestError as exc:
+                rejected_indexes = _exclusive_e8031_indexes(
+                    exc.body,
+                    value_count=len(values),
+                )
+                if (
+                    not exclusion_enabled
+                    or exc.status_code != 409
+                    or rejected_indexes is None
+                ):
+                    raise
+                rejected = set(rejected_indexes)
+                for candidate_index in rejected_indexes:
+                    value = values[candidate_index]
+                    quarantined.append(
+                        {
+                            "chunk": index,
+                            "index": original_indexes[candidate_index],
+                            "reason": (
+                                "Target organisation unit is not active for the "
+                                "data value period"
+                            ),
+                            "dataValue": value,
+                        }
+                    )
+                quarantined_in_chunk += len(rejected_indexes)
+                values = [
+                    value
+                    for candidate_index, value in enumerate(values)
+                    if candidate_index not in rejected
+                ]
+                original_indexes = [
+                    value
+                    for candidate_index, value in enumerate(original_indexes)
+                    if candidate_index not in rejected
+                ]
+                _emit_progress(
+                    progress,
+                    "target.timeliness.quarantine",
+                    chunk=f"{index}/{original_chunk_count}",
+                    errorCode="E8031",
+                    quarantinedDataValues=len(rejected_indexes),
+                    remainingDataValues=len(values),
+                )
+                continue
+
+            _assert_success_response(
+                response, f"Target data dry-run chunk {index}", allow_warning=True
+            )
+            conflicts = extract_conflicts(response)
+            if conflicts:
+                raise PipelineError(
+                    f"Target data dry-run chunk {index} reported conflicts: "
+                    f"{json.dumps(conflicts, sort_keys=True)[:1000]}"
+                )
+            responses.append({"chunk": index, "response": response})
+            accepted_chunks.append(candidate)
+            break
+
+        _emit_progress(
+            progress,
+            "target.dry_run.chunk.done",
+            chunk=f"{index}/{original_chunk_count}",
+            acceptedDataValues=len(values),
+            quarantinedDataValues=quarantined_in_chunk,
+            durationSeconds=round(time.monotonic() - chunk_started, 2),
+        )
+
+    report = _timeliness_quarantine_report(
+        quarantined,
+        enabled=exclusion_enabled,
+        state_dir=state_dir,
+        current_run_id=current_run_id,
+        source_data_value_count=original_value_count,
+    )
+    if (
+        original_value_count
+        and int(report["quarantinedDataValueCount"]) == original_value_count
+    ):
+        raise PipelineError(
+            "E8031 quarantine would remove every source data value in this execution "
+            f"window. Transfer blocked. Audit: {report['artifact']}"
+        )
+    _emit_progress(
+        progress,
+        "target.dry_run.done",
+        chunks=original_chunk_count,
+        acceptedChunks=len(accepted_chunks),
+        acceptedDataValues=original_value_count
+        - int(report["quarantinedDataValueCount"]),
+        quarantinedDataValues=report["quarantinedDataValueCount"],
+    )
+    return responses, accepted_chunks, report
+
+
+def _exclusive_e8031_indexes(body: str, *, value_count: int) -> list[int] | None:
+    """Return safe E8031 indexes only when no other DHIS2 conflict is present."""
+    try:
+        payload = json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    conflicts = extract_conflicts(payload)
+    if not conflicts or any(item.get("errorCode") != "E8031" for item in conflicts):
+        return None
+    indexes: set[int] = set()
+    for conflict in conflicts:
+        raw_indexes = conflict.get("indexes")
+        if not isinstance(raw_indexes, list) or not raw_indexes:
+            return None
+        for raw_index in raw_indexes:
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                return None
+            if raw_index < 0 or raw_index >= value_count:
+                return None
+            indexes.add(raw_index)
+    return sorted(indexes) or None
+
+
+def _timeliness_quarantine_report(
+    quarantined: list[dict[str, Any]],
+    *,
+    enabled: bool,
+    state_dir: Path,
+    current_run_id: str,
+    source_data_value_count: int,
+) -> dict[str, Any]:
+    grouped: Counter[tuple[str, str]] = Counter()
+    for item in quarantined:
+        value = item.get("dataValue")
+        if not isinstance(value, dict):
+            continue
+        grouped[
+            (
+                str(value.get("orgUnit") or "<missing>"),
+                str(value.get("period") or "<missing>"),
+            )
+        ] += 1
+    groups = [
+        {"organisationUnit": unit, "period": period, "dataValues": count}
+        for (unit, period), count in sorted(grouped.items())
+    ]
+    artifact: str | None = None
+    if quarantined:
+        artifact_path = _write_json(
+            state_dir
+            / "runs"
+            / current_run_id
+            / "data-value-quarantine"
+            / "e8031.json",
+            {
+                "runId": current_run_id,
+                "errorCode": "E8031",
+                "reason": (
+                    "Target organisation unit is not active for the data value period"
+                ),
+                "sourceDataValueCount": source_data_value_count,
+                "quarantinedDataValueCount": len(quarantined),
+                "groups": groups,
+                "values": quarantined,
+            },
+        )
+        artifact = str(artifact_path)
+    return {
+        "enabled": enabled,
+        "errorCode": "E8031",
+        "quarantinedDataValueCount": len(quarantined),
+        "organisationUnitCount": len({item[0] for item in grouped}),
+        "periodCount": len({item[1] for item in grouped}),
+        "groups": groups,
+        "artifact": artifact,
+    }
 
 
 def _chunk_payload(payload: dict[str, Any], chunk_size: int) -> list[dict[str, Any]]:

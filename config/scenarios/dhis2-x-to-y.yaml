@@ -48,7 +48,9 @@ target:
       enabled: true
       run_before_transfer: true
       # Detect blocking identity/parent conflicts for every job and quarantine
-      # only their affected source subtrees. Every exclusion remains audited.
+      # only their affected source subtrees. During value validation, the same
+      # policy quarantines E8031 values whose OU is inactive for that period.
+      # Every exclusion remains audited; target OU dates are never modified.
       conflict_policy: exclude
       create_missing: true
       # UID and parent remain authoritative. Y intentionally uses prefixed OU

@@ -1116,6 +1116,9 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "target.dry_run.start": "Début de la validation des valeurs cible",
         "target.dry_run.chunk.start": "Validation d’un lot cible",
         "target.dry_run.chunk.done": "Lot cible validé",
+        "target.timeliness.quarantine": (
+            "Valeurs hors période d’activité mises en quarantaine"
+        ),
         "target.dry_run.done": "Validation des valeurs cible terminée",
         "target.import.start": "Début de l’import réel des valeurs",
         "target.import.chunk.start": "Import d’un lot cible",
@@ -1211,6 +1214,10 @@ def _dhis2_error_details(body: str) -> list[str]:
         "E8024": (
             "Data Set + Data Element is not usable with the supplied "
             "CategoryOptionCombo"
+        ),
+        "E8031": (
+            "Organisation unit is not active for one or more supplied periods "
+            "(check openingDate/closedDate)"
         ),
     }
 

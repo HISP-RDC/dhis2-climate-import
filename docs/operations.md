@@ -313,6 +313,16 @@ differences, and code collisions. It refreshes the quarantine before every paren
 makes isolated windows consume the same manifest. Structural hierarchy errors and a quarantine
 that would remove the complete source selection remain blocking.
 
+The same `exclude` policy also handles data-value conflict `E8031`. DHIS2 returns this code when an
+organisation unit is not active for one or more supplied periods because of its opening or closing
+date. The pipeline uses the exact indexes returned by DHIS2, quarantines only those `OU + period`
+values, revalidates the remainder, and never changes the organisation-unit dates on Y. Mixed
+conflicts still block the transfer so another metadata error cannot be hidden. Each affected window
+writes `runs/<transfer-run>/data-value-quarantine/e8031.json`; the child and parent reports expose
+`timelinessQuarantine` and finish with `success_with_quarantine`.
+If E8031 would remove every value in an execution window, that window remains blocked instead of
+being checkpointed as a successful empty transfer.
+
 An explicit per-job quarantine can complement automatic detection:
 
 ```yaml

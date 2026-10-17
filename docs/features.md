@@ -434,6 +434,16 @@ de la quarantaine change l’empreinte d’exécution afin que les fenêtres con
 ignorées à tort par le mécanisme de reprise. Une exécution terminée avec des exclusions dynamiques
 porte le statut explicite `success_with_quarantine`.
 
+Cette politique couvre également `E8031` pendant le dry-run des valeurs. Ce code signifie que
+l’unité d’organisation cible n’est pas active pour la période concernée, selon ses dates
+`openingDate` et `closedDate`. Le pipeline ne modifie jamais ces dates : il utilise les index exacts
+retournés par DHIS2, isole seulement les valeurs `OU + période` refusées, puis revalide le reste du
+lot. L’audit complet se trouve dans
+`runs/<transfer-run>/data-value-quarantine/e8031.json` et son résumé dans
+`timelinessQuarantine`. Si DHIS2 retourne simultanément un autre code de conflit, le lot reste
+bloqué afin de ne masquer aucune incompatibilité. Une fenêtre dont 100 % des valeurs seraient
+retirées reste également bloquée, car elle ne constituerait pas un transfert réussi.
+
 La création automatique d’objets absents peut être autorisée par le YAML. Les mises à jour d’objets
 existants restent soumises aux critères `safe_repair`. Un objet contenant des valeurs ou utilisé
 ailleurs n’est jamais modifié automatiquement.

@@ -1,6 +1,7 @@
+import json
 from pathlib import Path
-from types import SimpleNamespace
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 
 from dhis2_climate_import.dhis2 import DataSetRef
@@ -13,6 +14,7 @@ from dhis2_climate_import.transfer import (
     _prepare_metadata_package,
     _remove_existing_metadata_objects,
     _restrict_data_set_organisation_units,
+    _validate_target_chunks,
     _validate_target_category_option_combos,
     _validate_metadata_package,
     _version_unmappable_historical_values,
@@ -203,6 +205,187 @@ class FakeTransferClient:
 
 
 class TransferTests(unittest.TestCase):
+    def test_e8031_values_are_quarantined_and_remaining_values_are_revalidated(
+        self,
+    ) -> None:
+        class TimelinessTarget:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            def import_data_value_set(self, payload, **kwargs):
+                units = [item["orgUnit"] for item in payload["dataValues"]]
+                self.calls.append(units)
+                rejected = [
+                    index
+                    for index, item in enumerate(payload["dataValues"])
+                    if item["orgUnit"] == "ClosedOu001"
+                ]
+                if rejected:
+                    raise HttpRequestError(
+                        "POST",
+                        "https://y.example.org/api/dataValueSets",
+                        409,
+                        json.dumps(
+                            {
+                                "response": {
+                                    "conflicts": [
+                                        {"errorCode": "E8031", "indexes": rejected}
+                                    ]
+                                }
+                            }
+                        ),
+                    )
+                return {
+                    "status": "SUCCESS",
+                    "importCount": {"imported": len(payload["dataValues"])},
+                }
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+                organisation_unit_run_before_transfer=True,
+                organisation_unit_conflict_policy="exclude",
+            )
+            context = SimpleNamespace(job=scenario.get_job("weekly_climate"))
+            target = TimelinessTarget()
+            chunks = [
+                {
+                    "dataSet": "DataSet0001",
+                    "dataValues": [
+                        {
+                            "dataElement": "DataEl00001",
+                            "period": "201701",
+                            "orgUnit": "ClosedOu001",
+                            "value": "1",
+                        },
+                        {
+                            "dataElement": "DataEl00001",
+                            "period": "201701",
+                            "orgUnit": "OpenOrg0001",
+                            "value": "2",
+                        },
+                        {
+                            "dataElement": "DataEl00002",
+                            "period": "201702",
+                            "orgUnit": "ClosedOu001",
+                            "value": "3",
+                        },
+                    ],
+                }
+            ]
+
+            responses, accepted, report = _validate_target_chunks(
+                target,
+                chunks,
+                context=context,
+                state_dir=scenario.job_state_dir("weekly_climate"),
+                current_run_id="transfer-test",
+            )
+
+            self.assertEqual(
+                target.calls,
+                [
+                    ["ClosedOu001", "OpenOrg0001", "ClosedOu001"],
+                    ["OpenOrg0001"],
+                ],
+            )
+            self.assertEqual(len(responses), 1)
+            self.assertEqual(
+                [item["orgUnit"] for item in accepted[0]["dataValues"]],
+                ["OpenOrg0001"],
+            )
+            self.assertEqual(report["quarantinedDataValueCount"], 2)
+            self.assertEqual(report["organisationUnitCount"], 1)
+            self.assertEqual(report["periodCount"], 2)
+            artifact = Path(report["artifact"])
+            self.assertTrue(artifact.exists())
+            artifact_payload = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual(len(artifact_payload["values"]), 2)
+
+    def test_e8031_is_not_silently_quarantined_with_another_conflict(self) -> None:
+        class MixedConflictTarget:
+            def import_data_value_set(self, payload, **kwargs):
+                raise HttpRequestError(
+                    "POST",
+                    "https://y.example.org/api/dataValueSets",
+                    409,
+                    json.dumps(
+                        {
+                            "response": {
+                                "conflicts": [
+                                    {"errorCode": "E8031", "indexes": [0]},
+                                    {"errorCode": "E8024", "indexes": [0]},
+                                ]
+                            }
+                        }
+                    ),
+                )
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+                organisation_unit_run_before_transfer=True,
+                organisation_unit_conflict_policy="exclude",
+            )
+            context = SimpleNamespace(job=scenario.get_job("weekly_climate"))
+            with self.assertRaises(HttpRequestError):
+                _validate_target_chunks(
+                    MixedConflictTarget(),
+                    [{"dataValues": [{"orgUnit": "ClosedOu001"}]}],
+                    context=context,
+                    state_dir=scenario.job_state_dir("weekly_climate"),
+                    current_run_id="transfer-test",
+                )
+
+    def test_e8031_quarantine_blocks_an_empty_execution_window(self) -> None:
+        class ClosedTarget:
+            def import_data_value_set(self, payload, **kwargs):
+                raise HttpRequestError(
+                    "POST",
+                    "https://y.example.org/api/dataValueSets",
+                    409,
+                    json.dumps(
+                        {
+                            "response": {
+                                "conflicts": [
+                                    {"errorCode": "E8031", "indexes": [0]}
+                                ]
+                            }
+                        }
+                    ),
+                )
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+                organisation_unit_run_before_transfer=True,
+                organisation_unit_conflict_policy="exclude",
+            )
+            context = SimpleNamespace(job=scenario.get_job("weekly_climate"))
+            with self.assertRaisesRegex(PipelineError, "remove every source data value"):
+                _validate_target_chunks(
+                    ClosedTarget(),
+                    [
+                        {
+                            "dataValues": [
+                                {
+                                    "orgUnit": "ClosedOu001",
+                                    "period": "201701",
+                                }
+                            ]
+                        }
+                    ],
+                    context=context,
+                    state_dir=scenario.job_state_dir("weekly_climate"),
+                    current_run_id="transfer-test",
+                )
+
     def test_metadata_bootstrap_keeps_only_effective_org_unit_selection(self) -> None:
         package = {
             "dataSets": [
