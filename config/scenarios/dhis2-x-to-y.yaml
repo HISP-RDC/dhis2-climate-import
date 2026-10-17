@@ -30,6 +30,9 @@ target:
       historical_data_elements:
         enabled: true
         strategy: versioned
+        # Never overwrite an incompatible historical UID already present on Y.
+        # Clone its complete category graph and rewrite only the transferred values.
+        uid_collision_strategy: clone
         name_suffix: " — Historique"
 
   organisation_units:

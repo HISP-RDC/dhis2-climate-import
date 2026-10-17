@@ -394,3 +394,26 @@ DHIS2 validates CategoryOptionCombos against the committed CategoryCombo structu
 two atomic stages. If the second-stage validation fails, no Data Element assignment is changed; the
 first-stage CategoryCombo repair remains recorded in the report. After a successful repair, rerun
 the ordinary transfer with `--dry-run`, then review its report before using `--apply`.
+
+### Historical UID collisions
+
+An old source CategoryOptionCombo can reference a CategoryCombo UID that already exists on Y with
+a different structure. Do not overwrite that target object. Enable isolated cloning instead:
+
+```yaml
+target:
+  metadata:
+    synchronization:
+      historical_data_elements:
+        enabled: true
+        strategy: versioned
+        uid_collision_strategy: clone
+        name_suffix: " — Historique"
+```
+
+The pipeline clones the complete historical category graph under deterministic UIDs, validates it
+with `importMode=VALIDATE`, and commits it only during `--apply`. It then creates or reuses the
+versioned historical Data Element and rewrites both `dataElement` and `categoryOptionCombo` in the
+affected values. The incompatible object that was already on Y remains untouched. The source and
+target UID mappings, detected conflicts, validation response and commit response are retained in
+the window's `historical-metadata` artifacts.

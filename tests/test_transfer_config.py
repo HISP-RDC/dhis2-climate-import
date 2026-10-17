@@ -114,6 +114,9 @@ target:
     import:
       strategy: CREATE
       atomic: true
+    synchronization:
+      historical_data_elements:
+        uid_collision_strategy: clone
   organisation_units:
     discovery: linked_to_dataset
     mapping_strategy: uid
@@ -145,6 +148,10 @@ jobs:
         self.assertEqual(scenario.max_parallel_jobs, 1)
         self.assertTrue(
             scenario.metadata.synchronization.historical_data_elements.enabled
+        )
+        self.assertEqual(
+            scenario.metadata.synchronization.historical_data_elements.uid_collision_strategy,
+            "clone",
         )
         self.assertEqual(scenario.project_root, path.parents[2])
 

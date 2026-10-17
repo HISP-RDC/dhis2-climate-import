@@ -287,7 +287,11 @@ Historical source values whose old CategoryOptionCombo has an exact equivalent a
 their complete CategoryOption UID set. When no lossless equivalent exists, the optional
 `historical_data_elements.strategy: versioned` policy creates a deterministic historical Data
 Element on Y, preserves the old CategoryCombo semantics and attaches that version to the target
-Data Set. UID/code collisions or incompatible existing objects always block the transfer.
+Data Set. With `uid_collision_strategy: clone`, an incompatible historical UID already present on
+Y is never overwritten: the complete historical CategoryOption/Category/CategoryCombo graph is
+cloned under deterministic UIDs and the transferred historical values are rewritten to the cloned
+CategoryOptionCombos. Current Data Element collisions and incompatible deterministic clone UIDs
+still block the transfer.
 
 ### systemd multi-jobs
 

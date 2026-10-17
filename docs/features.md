@@ -61,6 +61,7 @@ Le pipeline sait :
 - retenter les erreurs transitoires avec backoff exponentiel ;
 - synchroniser les objets absents et rattacher les Data Elements compatibles avant l’export ;
 - conserver les anciennes sémantiques de catégories dans des Data Elements historiques versionnés ;
+- isoler une collision d’UID historique dans un graphe cloné sans modifier l’objet existant sur Y ;
 - sérialiser les jobs, les changements de métadonnées et la concurrence globale ;
 - isoler le cache, le journal, les rapports et les artefacts par job.
 
@@ -68,7 +69,9 @@ Le pipeline sait :
 
 Les protections restent volontairement strictes :
 
-- une collision UID/code, une différence de type ou une ambiguïté sémantique bloque toujours ;
+- une collision UID/code courante, une différence de type ou une ambiguïté sémantique bloque ;
+- seule une collision du graphe de catégories strictement historique peut être isolée par clonage
+  lorsque `uid_collision_strategy: clone` est explicitement configuré ;
 - une réparation risquée n’est jamais forcée par `CREATE_AND_UPDATE` ;
 - un dry-run qui découvre des métadonnées absentes s’arrête avant l’export massif jusqu’au commit ;
 - les payloads complets ne sont conservés que si `--keep-payload` est demandé ;
@@ -238,7 +241,7 @@ Les erreurs suivantes ne doivent pas être retentées aveuglément :
 
 - authentification 401 ou autorisation 403 ;
 - configuration invalide ;
-- collision d’UID ou de code ;
+- collision d’UID ou de code hors stratégie de clonage historique explicite ;
 - incompatibilité de `valueType`, `domainType` ou CategoryCombo ;
 - conflit de métadonnées nécessitant une décision humaine ;
 - Data Element cible contenant déjà des valeurs incompatibles.
@@ -276,6 +279,12 @@ target:
         require_no_data_values: true
         require_no_other_dataset_memberships: true
         require_same_identity: true
+
+      historical_data_elements:
+        enabled: true
+        strategy: versioned
+        uid_collision_strategy: clone
+        name_suffix: " — Historique"
 ```
 
 ### 8.2 Classification obligatoire
@@ -288,6 +297,7 @@ target:
 | Même code mais UID différent | Bloquer et demander un mapping explicite |
 | `valueType` ou `domainType` différent | Bloquer |
 | CategoryCombo différent avec valeurs existantes | Bloquer |
+| UID d’un graphe strictement historique déjà incompatible sur Y | Cloner tout le graphe sous de nouveaux UID si la stratégie vaut `clone` |
 | Data Element utilisé par un autre Data Set | Bloquer ou exiger un plan de migration |
 | Identité ou sémantique ambiguë | Bloquer |
 
@@ -511,7 +521,9 @@ rapport global success/partial/failed
 
 - un Data Element absent est créé avec ses dépendances minimales ;
 - un Data Element compatible est rattaché sans être écrasé ;
-- une collision de code/UID bloque l’exécution ;
+- une collision de code/UID courante bloque l’exécution ;
+- une collision historique configurée en `clone` laisse l’objet Y intact, crée un graphe isolé et
+  réécrit le Data Element et le CategoryOptionCombo de chaque valeur concernée ;
 - une différence de type bloque l’exécution ;
 - une réparation est refusée si des valeurs existent ;
 - les métadonnées sont relues et revalidées après le commit ;

@@ -2453,10 +2453,101 @@ def _version_unmappable_historical_values(
         str(item["id"]): item for item in full_elements if item.get("id")
     }
 
+    categories_by_id = {
+        str(item["id"]): item for item in categories if item.get("id")
+    }
+    options_by_id = {
+        str(item["id"]): item for item in category_options if item.get("id")
+    }
+    combinations_by_parent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for combination in all_parent_combinations:
+        parent_id = _reference_uid(combination.get("categoryCombo"))
+        if parent_id:
+            combinations_by_parent[parent_id].append(combination)
+
+    effective_collections: dict[str, list[dict[str, Any]]] = {
+        "categoryOptions": [],
+        "categories": [],
+        "categoryCombos": [],
+        "categoryOptionCombos": [],
+    }
+    effective_parent_ids: dict[str, str] = {}
+    effective_combination_ids: dict[tuple[str, str], str] = {}
+    cloned_graphs: list[dict[str, Any]] = []
+    for parent_id in parent_ids:
+        source_parent = parents_by_id[parent_id]
+        graph_category_ids = _reference_ids(source_parent.get("categories"))
+        graph_categories = [
+            categories_by_id[item]
+            for item in sorted(graph_category_ids)
+            if item in categories_by_id
+        ]
+        graph_combinations = combinations_by_parent.get(parent_id, [])
+        graph_option_ids = {
+            item
+            for category in graph_categories
+            for item in _reference_ids(category.get("categoryOptions"))
+        } | {
+            item
+            for combination in graph_combinations
+            for item in _reference_ids(combination.get("categoryOptions"))
+        }
+        graph: dict[str, list[dict[str, Any]]] = {
+            "categoryOptions": [
+                options_by_id[item]
+                for item in sorted(graph_option_ids)
+                if item in options_by_id
+            ],
+            "categories": graph_categories,
+            "categoryCombos": [source_parent],
+            "categoryOptionCombos": graph_combinations,
+        }
+        conflicts = _historical_target_conflicts(target, graph)
+        if conflicts and policy.uid_collision_strategy == "block":
+            raise PipelineError(
+                "Historical metadata synchronization blocked by incompatible objects on Y: "
+                + "; ".join(conflicts[:10])
+            )
+        if conflicts:
+            graph, clone_report = _clone_historical_category_graph(
+                graph,
+                source_parent_id=parent_id,
+                name_suffix=policy.name_suffix,
+            )
+            clone_report["conflicts"] = conflicts
+            cloned_graphs.append(clone_report)
+            effective_parent_ids[parent_id] = str(
+                graph["categoryCombos"][0]["id"]
+            )
+            _emit_progress(
+                progress,
+                "historical_data_elements.uid_collision.clone",
+                sourceCategoryCombo=parent_id,
+                targetCategoryCombo=effective_parent_ids[parent_id],
+                conflicts=len(conflicts),
+            )
+            cloned_combination_ids = clone_report["uidMappings"][
+                "categoryOptionCombos"
+            ]
+            for source_id, target_id in cloned_combination_ids.items():
+                effective_combination_ids[(parent_id, source_id)] = target_id
+        else:
+            effective_parent_ids[parent_id] = parent_id
+            for item in graph_combinations:
+                if item.get("id"):
+                    item_id = str(item["id"])
+                    effective_combination_ids[(parent_id, item_id)] = item_id
+        for collection, items in graph.items():
+            effective_collections[collection].extend(items)
+
+    for collection, items in effective_collections.items():
+        effective_collections[collection] = _unique_metadata_items(items)
+
     version_definitions: list[dict[str, Any]] = []
     for (element_id, parent_id), count in sorted(version_usage.items()):
         source_element = full_elements_by_id.get(element_id) or source_elements[element_id]
         parent = parents_by_id[parent_id]
+        target_parent_id = effective_parent_ids[parent_id]
         target_id = _stable_dhis2_uid("historical-data-element", element_id, parent_id)
         parent_label = str(parent.get("name") or parent_id)
         base_name = str(source_element.get("name") or element_id)
@@ -2471,6 +2562,7 @@ def _version_unmappable_historical_values(
             {
                 "sourceDataElement": element_id,
                 "historicalCategoryCombo": parent_id,
+                "targetCategoryCombo": target_parent_id,
                 "targetDataElement": target_id,
                 "dataValues": count,
                 "name": name,
@@ -2481,16 +2573,13 @@ def _version_unmappable_historical_values(
                     target_code=code,
                     target_name=name,
                     target_short_name=short_name,
-                    category_combo_id=parent_id,
+                    category_combo_id=target_parent_id,
                 ),
             }
         )
 
     collections: dict[str, list[dict[str, Any]]] = {
-        "categoryOptions": category_options,
-        "categories": categories,
-        "categoryCombos": parent_combos,
-        "categoryOptionCombos": all_parent_combinations,
+        **effective_collections,
         "dataElements": [item["metadata"] for item in version_definitions],
     }
     _assert_historical_target_compatibility(target, collections)
@@ -2521,6 +2610,8 @@ def _version_unmappable_historical_values(
             key: len(value) for key, value in package.items() if value
         },
         "dataSetMembershipsToAdd": sorted(missing_memberships),
+        "uidCollisionStrategy": policy.uid_collision_strategy,
+        "clonedHistoricalGraphs": cloned_graphs,
     }
     _write_json(artifact_dir / "plan.json", plan)
     validations: list[dict[str, Any]] = []
@@ -2603,6 +2694,7 @@ def _version_unmappable_historical_values(
         report.update(
             {
                 "mappings": plan["versions"],
+                "clonedHistoricalGraphs": cloned_graphs,
                 "validationPendingMetadataCommit": True,
                 "planArtifact": str(artifact_dir / "plan.json"),
             }
@@ -2634,6 +2726,10 @@ def _version_unmappable_historical_values(
         target_id = target_for_pair.get((element_id, parent_id or ""))
         if target_id:
             value["dataElement"] = target_id
+            value["categoryOptionCombo"] = effective_combination_ids.get(
+                (parent_id or "", combo_id),
+                combo_id,
+            )
             rewritten += 1
 
     report.update(
@@ -2641,6 +2737,7 @@ def _version_unmappable_historical_values(
             "created": bool(commits),
             "rewrittenValueCount": rewritten,
             "mappings": plan["versions"],
+            "clonedHistoricalGraphs": cloned_graphs,
             "validationPendingMetadataCommit": False,
             "planArtifact": str(artifact_dir / "plan.json"),
             "validationArtifact": str(artifact_dir / "validation.json"),
@@ -2701,10 +2798,199 @@ def _limited_text(value: str, maximum: int) -> str:
     return value if len(value) <= maximum else value[: maximum - 1].rstrip() + "…"
 
 
-def _assert_historical_target_compatibility(
+def _unique_metadata_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in items:
+        uid = str(item.get("id") or "")
+        if not uid:
+            continue
+        existing = by_id.get(uid)
+        if existing is not None and existing != item:
+            raise PipelineError(
+                f"Historical metadata contains conflicting definitions for UID {uid}."
+            )
+        by_id[uid] = item
+    return [by_id[uid] for uid in sorted(by_id)]
+
+
+def _clone_historical_category_graph(
+    graph: dict[str, list[dict[str, Any]]],
+    *,
+    source_parent_id: str,
+    name_suffix: str,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Clone one historical category graph into an isolated deterministic namespace."""
+    parent_items = [
+        item
+        for item in graph.get("categoryCombos", [])
+        if str(item.get("id") or "") == source_parent_id
+    ]
+    if len(parent_items) != 1:
+        raise PipelineError(
+            f"Historical CategoryCombo graph {source_parent_id} is incomplete or ambiguous."
+        )
+
+    mappings: dict[str, dict[str, str]] = {
+        "categoryOptions": {
+            str(item["id"]): _stable_dhis2_uid(
+                "historical-category-option-clone",
+                source_parent_id,
+                str(item["id"]),
+            )
+            for item in graph.get("categoryOptions", [])
+            if item.get("id")
+        },
+        "categories": {
+            str(item["id"]): _stable_dhis2_uid(
+                "historical-category-clone",
+                source_parent_id,
+                str(item["id"]),
+            )
+            for item in graph.get("categories", [])
+            if item.get("id")
+        },
+        "categoryCombos": {
+            source_parent_id: _stable_dhis2_uid(
+                "historical-category-combo-clone",
+                source_parent_id,
+            )
+        },
+        "categoryOptionCombos": {
+            str(item["id"]): _stable_dhis2_uid(
+                "historical-category-option-combo-clone",
+                source_parent_id,
+                str(item["id"]),
+            )
+            for item in graph.get("categoryOptionCombos", [])
+            if item.get("id")
+        },
+    }
+    label_suffix = (
+        name_suffix
+        + " "
+        + hashlib.sha256(source_parent_id.encode("utf-8")).hexdigest()[:8]
+    )
+
+    def clone_identity(
+        source: dict[str, Any],
+        *,
+        target_id: str,
+    ) -> dict[str, Any]:
+        result = deepcopy(source)
+        result["id"] = target_id
+        code = source.get("code")
+        if code:
+            suffix = (
+                "_H_"
+                + hashlib.sha256(target_id.encode("utf-8")).hexdigest()[:8]
+            )
+            result["code"] = str(code)[: 50 - len(suffix)] + suffix
+        name = source.get("name")
+        if name:
+            result["name"] = _limited_text(str(name) + label_suffix, 230)
+        short_name = source.get("shortName")
+        if short_name:
+            result["shortName"] = _limited_text(
+                str(short_name) + label_suffix,
+                50,
+            )
+        return result
+
+    def mapped_references(
+        value: Any,
+        mapping: dict[str, str],
+        *,
+        label: str,
+    ) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        result: list[dict[str, str]] = []
+        missing: list[str] = []
+        for reference in value:
+            source_id = _reference_uid(reference)
+            if not source_id:
+                continue
+            target_id = mapping.get(source_id)
+            if target_id is None:
+                missing.append(source_id)
+            else:
+                result.append({"id": target_id})
+        if missing:
+            raise PipelineError(
+                f"Historical clone {source_parent_id} is missing {label}: "
+                + ", ".join(sorted(missing)[:10])
+            )
+        return result
+
+    cloned_options = [
+        clone_identity(
+            item,
+            target_id=mappings["categoryOptions"][str(item["id"])],
+        )
+        for item in graph.get("categoryOptions", [])
+        if item.get("id")
+    ]
+    cloned_categories: list[dict[str, Any]] = []
+    for item in graph.get("categories", []):
+        if not item.get("id"):
+            continue
+        cloned = clone_identity(
+            item,
+            target_id=mappings["categories"][str(item["id"])],
+        )
+        cloned["categoryOptions"] = mapped_references(
+            item.get("categoryOptions"),
+            mappings["categoryOptions"],
+            label="CategoryOptions",
+        )
+        cloned_categories.append(cloned)
+
+    source_parent = parent_items[0]
+    cloned_parent = clone_identity(
+        source_parent,
+        target_id=mappings["categoryCombos"][source_parent_id],
+    )
+    cloned_parent["categories"] = mapped_references(
+        source_parent.get("categories"),
+        mappings["categories"],
+        label="Categories",
+    )
+
+    cloned_combinations: list[dict[str, Any]] = []
+    for item in graph.get("categoryOptionCombos", []):
+        if not item.get("id"):
+            continue
+        cloned = clone_identity(
+            item,
+            target_id=mappings["categoryOptionCombos"][str(item["id"])],
+        )
+        cloned["categoryCombo"] = {"id": cloned_parent["id"]}
+        cloned["categoryOptions"] = mapped_references(
+            item.get("categoryOptions"),
+            mappings["categoryOptions"],
+            label="CategoryOptions",
+        )
+        cloned_combinations.append(cloned)
+
+    return (
+        {
+            "categoryOptions": cloned_options,
+            "categories": cloned_categories,
+            "categoryCombos": [cloned_parent],
+            "categoryOptionCombos": cloned_combinations,
+        },
+        {
+            "sourceCategoryCombo": source_parent_id,
+            "targetCategoryCombo": str(cloned_parent["id"]),
+            "uidMappings": mappings,
+        },
+    )
+
+
+def _historical_target_conflicts(
     target: DHIS2Client,
     collections: dict[str, list[dict[str, Any]]],
-) -> None:
+) -> list[str]:
     endpoints = {
         "categoryOptions": "categoryOptions",
         "categories": "categories",
@@ -2724,7 +3010,11 @@ def _assert_historical_target_compatibility(
     }
     conflicts: list[str] = []
     for collection, source_items in collections.items():
+        if collection not in endpoints:
+            continue
         ids = [str(item["id"]) for item in source_items if item.get("id")]
+        if not ids:
+            continue
         existing = target.metadata_objects_by_ids(
             resource=endpoints[collection],
             root_key=collection,
@@ -2740,11 +3030,7 @@ def _assert_historical_target_compatibility(
             if expected is None:
                 continue
             if collection in {"categories", "categoryOptionCombos"}:
-                relation = (
-                    "categoryOptions"
-                    if collection in {"categories", "categoryOptionCombos"}
-                    else ""
-                )
+                relation = "categoryOptions"
                 if _reference_ids(expected.get(relation)) != _reference_ids(
                     item.get(relation)
                 ):
@@ -2764,13 +3050,29 @@ def _assert_historical_target_compatibility(
                         expected, item, category_scheme="uid"
                     )
                 )
-            for field in ("code", "name"):
+            # DHIS2 derives CategoryOptionCombo names from their option set. The
+            # parent and complete option UID set above are the semantic identity;
+            # comparing a generated label would create false conflicts across versions.
+            identity_fields = (
+                ("code",)
+                if collection == "categoryOptionCombos"
+                else ("code", "name")
+            )
+            for field in identity_fields:
                 left = expected.get(field)
                 right = item.get(field)
                 if left and right and left != right:
                     conflicts.append(
                         f"{collection} {uid} {field}: source={left!r}, target={right!r}"
                     )
+    return conflicts
+
+
+def _assert_historical_target_compatibility(
+    target: DHIS2Client,
+    collections: dict[str, list[dict[str, Any]]],
+) -> None:
+    conflicts = _historical_target_conflicts(target, collections)
     if conflicts:
         raise PipelineError(
             "Historical metadata synchronization blocked by incompatible objects on Y: "

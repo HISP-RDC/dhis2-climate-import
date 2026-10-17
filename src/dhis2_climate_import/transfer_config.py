@@ -104,6 +104,7 @@ class InstanceRegistry:
 class HistoricalDataElementPolicy:
     enabled: bool = True
     strategy: str = "versioned"
+    uid_collision_strategy: str = "block"
     name_suffix: str = " — Historique"
 
 
@@ -328,6 +329,14 @@ def load_transfer_scenario(path: str | Path) -> TransferScenario:
         raise PipelineError(
             "Only historical_data_elements.strategy=versioned is supported."
         )
+    historical_uid_collision_strategy = str(
+        historical_raw.get("uid_collision_strategy", "block")
+    ).lower()
+    if historical_uid_collision_strategy not in {"block", "clone"}:
+        raise PipelineError(
+            "target.metadata.synchronization.historical_data_elements."
+            "uid_collision_strategy must be block or clone."
+        )
     metadata = MetadataPolicy(
         mode=metadata_mode,
         identity_strategy=identity_strategy,
@@ -356,6 +365,7 @@ def load_transfer_scenario(path: str | Path) -> TransferScenario:
             historical_data_elements=HistoricalDataElementPolicy(
                 enabled=_boolean(historical_raw.get("enabled", True)),
                 strategy=historical_strategy,
+                uid_collision_strategy=historical_uid_collision_strategy,
                 name_suffix=str(
                     historical_raw.get("name_suffix", " — Historique")
                 ),

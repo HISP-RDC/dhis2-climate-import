@@ -1021,6 +1021,9 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "historical_data_elements.metadata.validate.start": (
             "Validation des métadonnées historiques"
         ),
+        "historical_data_elements.uid_collision.clone": (
+            "Collision d’UID historique isolée par clonage"
+        ),
         "historical_data_elements.audit.done": (
             "Traitement des Data Elements historiques terminé"
         ),

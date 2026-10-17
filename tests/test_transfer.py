@@ -358,6 +358,125 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(report["rewrittenValueCount"], 1)
             self.assertIn(historical_id, {item["id"] for item in target.linked})
 
+    def test_clones_historical_category_graph_when_target_uid_is_incompatible(self) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                period_type="month",
+                default_start_period="2026-01",
+                default_end_period="2026-01",
+                historical_uid_collision_strategy="clone",
+            )
+            source = _HistoricalSource()
+            target = _HistoricalTarget()
+            canonical = {
+                "id": "DataEl00001",
+                "code": "HOSP_ADM",
+                "name": "Admissions",
+                "valueType": "INTEGER",
+                "domainType": "AGGREGATE",
+                "aggregationType": "SUM",
+                "categoryCombo": {"id": "CurrentCC01"},
+            }
+            context = TransferContext(
+                job=scenario.get_job("weekly_climate"),
+                source_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                target_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                source_data_elements=(canonical,),
+                target_data_elements=(canonical,),
+                source_organisation_units=(),
+                target_organisation_units=(),
+                start="2026-01-01",
+                end="2026-01-31",
+                metadata_bootstrap_required=False,
+            )
+            target.linked = [canonical]
+            target.objects["categoryCombos"]["HistoricCC1"] = {
+                "id": "HistoricCC1",
+                "code": "HIST_CC",
+                "name": "Old speciality",
+                "dataDimensionType": "DISAGGREGATION",
+                "categories": [],
+            }
+            values = [
+                {
+                    "dataElement": "DataEl00001",
+                    "period": "202601",
+                    "orgUnit": "OrgUnit00001",
+                    "categoryOptionCombo": "HistoricC01",
+                    "value": "7",
+                }
+            ]
+
+            blocking_scenario = _scenario(
+                Path(tmp) / "blocking",
+                chunk_size=5000,
+                period_type="month",
+                default_start_period="2026-01",
+                default_end_period="2026-01",
+            )
+            with self.assertRaisesRegex(
+                PipelineError,
+                "categoryCombos HistoricCC1 categories differ",
+            ):
+                _version_unmappable_historical_values(
+                    source,
+                    target,
+                    blocking_scenario,
+                    context,
+                    [dict(values[0])],
+                    apply=True,
+                )
+
+            rewritten, report = _version_unmappable_historical_values(
+                source,
+                target,
+                scenario,
+                context,
+                values,
+                apply=True,
+            )
+
+            clone = report["clonedHistoricalGraphs"][0]
+            cloned_parent = clone["targetCategoryCombo"]
+            cloned_combination = clone["uidMappings"]["categoryOptionCombos"][
+                "HistoricC01"
+            ]
+            historical_element = report["mappings"][0]["targetDataElement"]
+            self.assertNotEqual(cloned_parent, "HistoricCC1")
+            self.assertNotEqual(cloned_combination, "HistoricC01")
+            self.assertEqual(rewritten[0]["dataElement"], historical_element)
+            self.assertEqual(
+                rewritten[0]["categoryOptionCombo"], cloned_combination
+            )
+            self.assertEqual(
+                target.objects["categoryCombos"]["HistoricCC1"]["categories"],
+                [],
+            )
+            self.assertEqual(
+                target.objects["dataElements"][historical_element]["categoryCombo"],
+                {"id": cloned_parent},
+            )
+            self.assertEqual(
+                target.objects["categoryOptionCombos"][cloned_combination][
+                    "categoryCombo"
+                ],
+                {"id": cloned_parent},
+            )
+            self.assertNotIn("HistoricCat", target.objects["categories"])
+            self.assertNotIn("HistoricOp1", target.objects["categoryOptions"])
+
     def test_remaps_historical_category_option_combo_by_exact_options(self) -> None:
         client = _CategoryOptionComboClient(
             current=[
@@ -1071,6 +1190,7 @@ def _scenario(
     default_start_period: str = "2026-W01",
     default_end_period: str = "2026-W02",
     source_period_batch_size: int | None = None,
+    historical_uid_collision_strategy: str = "block",
 ):
     path = root / "config" / "scenarios" / "x-to-y.yaml"
     path.parent.mkdir(parents=True)
@@ -1090,6 +1210,9 @@ target:
     import:
       strategy: CREATE
       atomic: true
+    synchronization:
+      historical_data_elements:
+        uid_collision_strategy: {historical_uid_collision_strategy}
   organisation_units:
     discovery: linked_to_dataset
     mapping_strategy: {organisation_unit_mapping}
