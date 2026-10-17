@@ -7,17 +7,125 @@ Le projet garde Open Climate Service comme moteur climat/geospatial et utilise
 cache des unites d'organisation niveau 3, cache des elements de donnees, agregation, import
 `dataValueSets`, verification analytics, journal SQLite et rapports.
 
-## Quick Start
+## Installation sur un serveur Linux
+
+Le projet exige Python 3.12 ou une version plus recente. Les dependances sont verrouillees dans
+`uv.lock`; sur un serveur, utilisez ce fichier sans le regenerer.
+
+Les commandes suivantes conviennent a Ubuntu 24.04 et aux distributions Debian recentes. Elles
+sont a executer avec un utilisateur Linux dedie au pipeline, pas avec `root` :
 
 ```sh
-cp .env.example .env
-cp climate-service.yaml.example climate-service.yaml
-python3 -m uv sync
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import --help
+sudo apt update
+sudo apt install -y git curl ca-certificates make
 ```
 
-Open Climate Service runs as a separate local service. Start it from the official repository,
-then point this pipeline to it:
+Installez ensuite `uv` avec l'installateur officiel et rendez la commande accessible dans le shell
+courant :
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+Depuis la racine du depot clone, installez Python 3.12 et toutes les dependances verrouillees. `uv`
+cree automatiquement l'environnement virtuel local `.venv` :
+
+```sh
+cd /chemin/vers/dhis2-climate-import
+uv python install 3.12
+make install
+```
+
+La commande equivalente, sans `make`, est :
+
+```sh
+uv sync --locked --python 3.12
+```
+
+Verifiez ensuite l'installation locale, sans contacter ni modifier DHIS2 :
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import --help
+make test
+```
+
+### Configuration des instances DHIS2
+
+Le fichier `.env` contient les URL et les identifiants. Il est ignore par Git et doit rester
+lisible uniquement par l'utilisateur qui execute le pipeline :
+
+```sh
+test -f .env || cp .env.example .env
+chmod 600 .env
+nano .env
+```
+
+Pour un transfert X vers Y, renseignez au minimum les variables du mode d'authentification utilise :
+
+```env
+DHIS2_X_BASE_URL=https://source.example.org
+DHIS2_X_USERNAME=
+DHIS2_X_PASSWORD=
+DHIS2_X_PAT=
+
+DHIS2_Y_BASE_URL=https://target.example.org
+DHIS2_Y_USERNAME=
+DHIS2_Y_PASSWORD=
+DHIS2_Y_PAT=
+```
+
+`config/instances.yaml` indique, pour chaque profil, si l'authentification utilise `basic`, `pat`
+ou `auto`. Ce YAML ne doit contenir que les noms des variables d'environnement, jamais les mots de
+passe ou les tokens. Si les fichiers de configuration ne sont pas deja presents dans votre clone :
+
+```sh
+test -f config/instances.yaml || \
+  cp config/instances.yaml.example config/instances.yaml
+test -f config/scenarios/dhis2-x-to-y.yaml || \
+  cp config/scenarios/dhis2-x-to-y.yaml.example config/scenarios/dhis2-x-to-y.yaml
+```
+
+La premiere verification X vers Y est en lecture seule :
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  review hospital_service
+```
+
+Validez toujours les donnees avant le premier import reel :
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  run hospital_service --dry-run
+```
+
+`--apply` est reserve a l'import confirme vers l'instance cible.
+
+### Mise a jour apres un `git pull`
+
+Apres chaque mise a jour du code, resynchronisez les dependances verrouillees puis executez les
+tests locaux :
+
+```sh
+git pull --ff-only
+make install
+make test
+```
+
+N'utilisez pas `uv lock` sur le serveur : cette commande est reservee au developpement lorsque les
+dependances du projet doivent volontairement etre mises a jour.
+
+### Open Climate Service (optionnel)
+
+Open Climate Service n'est pas necessaire pour un simple transfert DHIS2 X vers Y. Il est requis
+uniquement pour les workflows qui calculent ou recuperent des donnees climat avant de les importer.
+Il s'execute comme un service separe, depuis son depot officiel :
 
 ```sh
 git clone https://github.com/dhis2/open-climate-service.git
