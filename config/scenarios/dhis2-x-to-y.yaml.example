@@ -47,6 +47,10 @@ target:
       enabled: false
       # Once the manual dry-run has been approved, this can guard every transfer.
       run_before_transfer: false
+      # block is the safe default. With exclude, detected identity/parent conflicts
+      # quarantine only their selected source subtrees and remain fully audited.
+      # exclude requires enabled=true, run_before_transfer=true and UID mapping.
+      conflict_policy: block
       create_missing: true
       require_same_name: true
       # Set false only when Y intentionally uses a different code convention.
@@ -98,3 +102,9 @@ jobs:
     default_end_period: 2026-W40
     data_elements:
       discovery: linked_to_dataset
+    # Optional manual per-job quarantine in addition to conflict_policy. Each UID
+    # must be a selected source OU or one of its ancestors.
+    # organisation_units:
+    #   exclude:
+    #     - uid: BlockedOu01
+    #       reason: "Temporary review: source and target parents differ"

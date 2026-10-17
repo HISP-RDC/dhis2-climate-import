@@ -215,6 +215,16 @@ first hierarchy dry-run to execute the same guarded reconciliation before every 
 It also restores missing DataSet–organisation-unit assignments before values are exported. A final
 preflight blocks the import locally if DHIS2 would reject it with `E8022`.
 
+`target.organisation_units.synchronization.conflict_policy` controls hierarchy conflicts for every
+job. Its default, `block`, preserves strict fail-fast behavior. `exclude` dynamically detects
+conflicting source UIDs (required name/code differences, parent differences and code collisions),
+quarantines only the selected source subtrees that contain them, and continues with the remaining
+units. It requires synchronization, automatic pre-transfer reconciliation and UID mapping. The
+quarantine is refreshed before each parent transfer, reused by isolated windows, recorded in JSON,
+and included in the checkpoint fingerprint. Structural errors and a quarantine that would empty the
+complete source selection still block execution. `jobs[].organisation_units.exclude` remains
+available for an explicit manual quarantine with a mandatory reason.
+
 Prepare profiles and a scenario:
 
 ```sh

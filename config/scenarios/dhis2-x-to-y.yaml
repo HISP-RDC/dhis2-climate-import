@@ -47,6 +47,9 @@ target:
       # Existing units are never moved or overwritten.
       enabled: true
       run_before_transfer: true
+      # Detect blocking identity/parent conflicts for every job and quarantine
+      # only their affected source subtrees. Every exclusion remains audited.
+      conflict_policy: exclude
       create_missing: true
       # UID and parent remain authoritative. Y intentionally uses prefixed OU
       # codes, while labels must stay identical to X.

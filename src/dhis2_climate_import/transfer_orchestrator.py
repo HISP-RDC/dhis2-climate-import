@@ -112,7 +112,27 @@ def _orchestrate_locked(
             purpose=f"target metadata for {scenario.id}/{job_id}",
             transient_when_busy=True,
         ):
-            if metadata_enabled:
+            if (
+                reconcile_organisation_units
+                and organisation_unit_policy.conflict_policy == "exclude"
+            ):
+                # Refresh the dynamic quarantine before metadata resolution or any
+                # isolated value window can consume it.
+                organisation_units = reconcile_target_organisation_units(
+                    scenario,
+                    source,
+                    target,
+                    job_id=job_id,
+                    apply=apply,
+                    progress=progress,
+                )
+            organisation_units_pending = bool(
+                not apply
+                and reconcile_organisation_units
+                and organisation_unit_policy.conflict_policy == "exclude"
+                and organisation_units.get("requiresChanges")
+            )
+            if metadata_enabled and not organisation_units_pending:
                 metadata = reconcile_target_metadata(
                     scenario,
                     source,
@@ -127,6 +147,17 @@ def _orchestrate_locked(
                     as_of=as_of,
                     progress=progress,
                 )
+            elif metadata_enabled:
+                metadata = {
+                    "enabled": True,
+                    "requiresChanges": False,
+                    "committed": False,
+                    "status": "pending_organisation_units",
+                    "nextStep": (
+                        "Apply the validated organisation-unit plan before metadata "
+                        "validation."
+                    ),
+                }
             else:
                 metadata = {
                     "enabled": False,
@@ -134,7 +165,10 @@ def _orchestrate_locked(
                     "committed": False,
                     "status": "disabled",
                 }
-            if reconcile_organisation_units:
+            if (
+                reconcile_organisation_units
+                and organisation_unit_policy.conflict_policy != "exclude"
+            ):
                 organisation_units = reconcile_target_organisation_units(
                     scenario,
                     source,
@@ -143,7 +177,7 @@ def _orchestrate_locked(
                     apply=apply,
                     progress=progress,
                 )
-            else:
+            elif not reconcile_organisation_units:
                 organisation_units = {
                     "enabled": organisation_unit_policy.enabled,
                     "automatic": False,
@@ -178,6 +212,15 @@ def _orchestrate_locked(
             "status": "metadata_changes_required",
             "metadata": metadata,
             "organisationUnits": organisation_units,
+            "organisationUnitExclusions": [
+                asdict(item) for item in job.organisation_units.exclusions
+            ],
+            "organisationUnitConflictPolicy": (
+                job.organisation_units.synchronization.conflict_policy
+            ),
+            "detectedOrganisationUnitConflicts": organisation_units.get(
+                "detectedOrganisationUnitConflicts", []
+            ),
             "windowCount": 0,
             "completedWindows": 0,
             "skippedWindows": 0,
@@ -201,6 +244,9 @@ def _orchestrate_locked(
         years_back=years_back,
         as_of=as_of,
     )
+    excluded_source_organisation_units = tuple(
+        getattr(context, "excluded_source_organisation_units", ())
+    )
     job = context.job
     windows = period_date_windows(
         context.start,
@@ -209,6 +255,21 @@ def _orchestrate_locked(
         job.transfer.execution.period_batch_size,
     )
     config_hash = _sha256_file(scenario.path)
+    quarantine_hash: str | None = None
+    quarantine_artifact = organisation_units.get(
+        "organisationUnitQuarantineArtifact"
+    )
+    if quarantine_artifact:
+        quarantine_path = Path(str(quarantine_artifact))
+        if quarantine_path.exists():
+            quarantine_hash = _sha256_file(quarantine_path)
+    execution_hash = (
+        hashlib.sha256(
+            f"{config_hash}:{quarantine_hash}".encode("utf-8")
+        ).hexdigest()
+        if quarantine_hash
+        else config_hash
+    )
     parent_fingerprint = _fingerprint(
         scenario,
         source,
@@ -217,7 +278,7 @@ def _orchestrate_locked(
         job.target_data_set,
         context.start,
         context.end,
-        config_hash,
+        execution_hash,
         job_id,
     )
     parent_run_id = run_id(f"transfer-parent-{scenario.id}-{job_id}")
@@ -229,6 +290,7 @@ def _orchestrate_locked(
         {
             "scenarioPath": str(scenario.path),
             "scenarioHash": config_hash,
+            "organisationUnitQuarantineHash": quarantine_hash,
             "scenario": asdict(scenario),
             "resolvedWindow": {"start": context.start, "end": context.end},
             "apply": apply,
@@ -291,7 +353,7 @@ def _orchestrate_locked(
                 job.target_data_set,
                 window_start,
                 window_end,
-                config_hash,
+                execution_hash,
                 job_id,
             )
             if (
@@ -519,7 +581,11 @@ def _orchestrate_locked(
             else (
                 "metadata_changes_required"
                 if metadata_pending_windows
-                else "success"
+                else (
+                    "success_with_quarantine"
+                    if getattr(context, "detected_organisation_unit_conflicts", ())
+                    else "success"
+                )
             )
         )
         summary = {
@@ -547,6 +613,29 @@ def _orchestrate_locked(
             "counts": aggregate_counts,
             "metadata": metadata,
             "organisationUnits": organisation_units,
+            "organisationUnitExclusions": [
+                asdict(item) for item in job.organisation_units.exclusions
+            ],
+            "organisationUnitConflictPolicy": (
+                job.organisation_units.synchronization.conflict_policy
+            ),
+            "detectedOrganisationUnitConflicts": list(
+                getattr(context, "detected_organisation_unit_conflicts", ())
+            ),
+            "organisationUnitQuarantineActive": bool(
+                getattr(context, "detected_organisation_unit_conflicts", ())
+            ),
+            "excludedSourceOrganisationUnitCount": len(
+                excluded_source_organisation_units
+            ),
+            "excludedSourceOrganisationUnits": [
+                {
+                    field: unit[field]
+                    for field in ("id", "code", "name", "path", "level")
+                    if unit.get(field) is not None
+                }
+                for unit in excluded_source_organisation_units
+            ],
             "windows": window_results,
             "configurationSnapshot": str(snapshot_path),
         }

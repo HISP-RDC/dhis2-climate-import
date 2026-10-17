@@ -12,6 +12,7 @@ from dhis2_climate_import.transfer import (
     _normalise_source_category_option_combos,
     _prepare_metadata_package,
     _remove_existing_metadata_objects,
+    _restrict_data_set_organisation_units,
     _validate_target_category_option_combos,
     _validate_metadata_package,
     _version_unmappable_historical_values,
@@ -202,6 +203,38 @@ class FakeTransferClient:
 
 
 class TransferTests(unittest.TestCase):
+    def test_metadata_bootstrap_keeps_only_effective_org_unit_selection(self) -> None:
+        package = {
+            "dataSets": [
+                {
+                    "id": "DataSet0001",
+                    "organisationUnits": [
+                        {"id": "IncludedOu1"},
+                        {"id": "BlockedOu01"},
+                    ],
+                },
+                {
+                    "id": "OtherData01",
+                    "organisationUnits": [{"id": "BlockedOu01"}],
+                },
+            ]
+        }
+
+        _restrict_data_set_organisation_units(
+            package,
+            data_set_id="DataSet0001",
+            allowed_uids={"IncludedOu1"},
+        )
+
+        self.assertEqual(
+            package["dataSets"][0]["organisationUnits"],
+            [{"id": "IncludedOu1"}],
+        )
+        self.assertEqual(
+            package["dataSets"][1]["organisationUnits"],
+            [{"id": "BlockedOu01"}],
+        )
+
     def test_reconcile_org_units_creates_missing_hierarchy_parent_first(self) -> None:
         root = {
             "id": "RootUnit001",
@@ -423,6 +456,126 @@ class TransferTests(unittest.TestCase):
                     scenario,
                     Source("https://x.example.org"),
                     Target(),
+                    job_id="weekly_climate",
+                    apply=False,
+                )
+
+    def test_dynamic_conflict_policy_quarantines_only_the_affected_subtree(self) -> None:
+        root = {
+            "id": "RootUnit001",
+            "code": "ROOT",
+            "name": "Country",
+            "path": "/RootUnit001",
+            "level": 1,
+        }
+        blocked_source = {
+            "id": "BlockedOu01",
+            "code": "BLOCKED",
+            "name": "Source facility name",
+            "path": "/RootUnit001/BlockedOu01",
+            "level": 2,
+            "parent": {"id": "RootUnit001"},
+        }
+        included = {
+            "id": "IncludedOu1",
+            "code": "INCLUDED",
+            "name": "Included facility",
+            "path": "/RootUnit001/IncludedOu1",
+            "level": 2,
+            "parent": {"id": "RootUnit001"},
+        }
+
+        class Source(FakeTransferClient):
+            def organisation_units_for_data_set(self, data_set_id):
+                return [blocked_source, included]
+
+            def metadata_objects_by_ids(self, **kwargs):
+                wanted = set(kwargs["object_ids"])
+                return [
+                    item
+                    for item in (root, blocked_source, included)
+                    if item["id"] in wanted
+                ]
+
+        class Target(FakeTransferClient):
+            def __init__(self):
+                target_blocked = {
+                    **blocked_source,
+                    "name": "Different target facility",
+                }
+                super().__init__(
+                    "https://y.example.org",
+                    target_has_dataset=True,
+                    target_units=[root, target_blocked, included],
+                )
+
+            def metadata_objects_by_ids(self, **kwargs):
+                wanted = set(kwargs["object_ids"])
+                return [
+                    item for item in self.target_units if item["id"] in wanted
+                ]
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+                organisation_unit_run_before_transfer=True,
+                organisation_unit_conflict_policy="exclude",
+            )
+            source = Source("https://x.example.org")
+            target = Target()
+
+            result = reconcile_target_organisation_units(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+                apply=False,
+            )
+
+            self.assertEqual(result["status"], "already_aligned_with_quarantine")
+            self.assertTrue(result["detectedOrganisationUnitConflicts"])
+            self.assertEqual(result["blocked"], [])
+            self.assertEqual(result["organisationUnitConflictPolicy"], "exclude")
+            self.assertEqual(
+                result["detectedOrganisationUnitConflicts"][0]["uid"],
+                "BlockedOu01",
+            )
+            self.assertEqual(result["excludedSourceOrganisationUnitCount"], 1)
+            self.assertEqual(
+                result["excludedSourceOrganisationUnits"][0]["id"],
+                "BlockedOu01",
+            )
+            self.assertTrue(
+                Path(result["organisationUnitQuarantineArtifact"]).exists()
+            )
+
+            review = review_transfer(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+            )
+            self.assertEqual(review["sourceOrganisationUnitCount"], 1)
+            self.assertEqual(review["excludedSourceOrganisationUnitCount"], 1)
+            self.assertEqual(
+                review["detectedOrganisationUnitConflicts"][0]["uid"],
+                "BlockedOu01",
+            )
+
+            class OnlyBlockedSource(Source):
+                def organisation_units_for_data_set(self, data_set_id):
+                    return [blocked_source]
+
+            with self.assertRaisesRegex(
+                PipelineError,
+                "would exclude the complete source selection",
+            ):
+                reconcile_target_organisation_units(
+                    scenario,
+                    OnlyBlockedSource("https://x.example.org"),
+                    target,
                     job_id="weekly_climate",
                     apply=False,
                 )
@@ -1011,6 +1164,109 @@ class TransferTests(unittest.TestCase):
                 ).exists()
             )
 
+    def test_review_excludes_an_org_unit_subtree_and_reports_affected_units(self) -> None:
+        class SourceWithExcludedSubtree(FakeTransferClient):
+            def organisation_units_for_data_set(self, data_set_id):
+                return [
+                    {
+                        "id": "OrgUnit00001",
+                        "code": "OU-1",
+                        "name": "Included facility",
+                        "path": "/RootUnit001/IncludedPar/OrgUnit00001",
+                        "level": 3,
+                    },
+                    {
+                        "id": "OrgUnit00002",
+                        "code": "OU-2",
+                        "name": "Quarantined facility",
+                        "path": "/RootUnit001/BlockedOu01/OrgUnit00002",
+                        "level": 3,
+                    },
+                ]
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_exclusions=(
+                    ("BlockedOu01", "Temporary hierarchy review"),
+                ),
+            )
+            source = SourceWithExcludedSubtree("https://x.example.org")
+            target = FakeTransferClient(
+                "https://y.example.org",
+                target_has_dataset=True,
+                target_units=[
+                    {
+                        "id": "OrgUnit00001",
+                        "code": "OU-1",
+                        "name": "Included facility",
+                    }
+                ],
+            )
+
+            review = review_transfer(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+            )
+
+            self.assertEqual(review["sourceOrganisationUnitCount"], 1)
+            self.assertEqual(review["targetMatchedOrganisationUnitCount"], 1)
+            self.assertEqual(review["excludedSourceOrganisationUnitCount"], 1)
+            self.assertEqual(
+                review["excludedSourceOrganisationUnits"][0]["id"],
+                "OrgUnit00002",
+            )
+            self.assertEqual(
+                review["organisationUnitExclusions"],
+                [
+                    {
+                        "uid": "BlockedOu01",
+                        "reason": "Temporary hierarchy review",
+                    }
+                ],
+            )
+
+            report = run_transfer(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+                apply=False,
+            )
+
+            self.assertTrue(source.export_calls)
+            self.assertTrue(
+                all(
+                    call["organisation_unit_ids"] == ["OrgUnit00001"]
+                    for call in source.export_calls
+                )
+            )
+            self.assertEqual(report["excludedSourceOrganisationUnitCount"], 1)
+
+    def test_review_rejects_an_exclusion_outside_the_source_selection(self) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_exclusions=(
+                    ("UnknownOu01", "Temporary hierarchy review"),
+                ),
+            )
+
+            with self.assertRaisesRegex(
+                PipelineError,
+                "neither selected source units nor ancestors",
+            ):
+                review_transfer(
+                    scenario,
+                    FakeTransferClient("https://x.example.org"),
+                    FakeTransferClient("https://y.example.org"),
+                    job_id="weekly_climate",
+                )
+
     def test_dry_run_validates_missing_metadata_without_committing(self) -> None:
         with TemporaryDirectory() as tmp:
             scenario = _scenario(Path(tmp), chunk_size=1)
@@ -1587,10 +1843,24 @@ def _scenario(
     source_period_batch_size: int | None = None,
     historical_uid_collision_strategy: str = "block",
     organisation_unit_synchronization: bool = False,
+    organisation_unit_run_before_transfer: bool = False,
+    organisation_unit_conflict_policy: str = "block",
     organisation_unit_require_same_code: bool = True,
+    organisation_unit_exclusions: tuple[tuple[str, str], ...] = (),
 ):
     path = root / "config" / "scenarios" / "x-to-y.yaml"
     path.parent.mkdir(parents=True)
+    exclusion_config = ""
+    if organisation_unit_exclusions:
+        lines = ["    organisation_units:", "      exclude:"]
+        for uid, reason in organisation_unit_exclusions:
+            lines.extend(
+                (
+                    f"        - uid: {uid}",
+                    f'          reason: "{reason}"',
+                )
+            )
+        exclusion_config = "\n" + "\n".join(lines)
     path.write_text(
         f"""
 schema_version: 2
@@ -1615,6 +1885,8 @@ target:
     mapping_strategy: {organisation_unit_mapping}
     synchronization:
       enabled: {str(organisation_unit_synchronization).lower()}
+      run_before_transfer: {str(organisation_unit_run_before_transfer).lower()}
+      conflict_policy: {organisation_unit_conflict_policy}
       require_same_code: {str(organisation_unit_require_same_code).lower()}
 mapping:
   data_elements: uid
@@ -1635,7 +1907,7 @@ jobs:
     target_data_set: CCH_WEEKLY
     period_type: {period_type}
     default_start_period: {default_start_period}
-    default_end_period: {default_end_period}
+    default_end_period: {default_end_period}{exclusion_config}
 """,
         encoding="utf-8",
     )

@@ -137,6 +137,7 @@ class MetadataPolicy:
 class OrganisationUnitSynchronizationPolicy:
     enabled: bool = False
     run_before_transfer: bool = False
+    conflict_policy: str = "block"
     create_missing: bool = True
     require_same_name: bool = True
     require_same_code: bool = True
@@ -146,9 +147,16 @@ class OrganisationUnitSynchronizationPolicy:
 
 
 @dataclass(frozen=True)
+class OrganisationUnitExclusion:
+    uid: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class OrganisationUnitPolicy:
     discovery: str = "linked_to_dataset"
     source_roots: tuple[str, ...] = ()
+    exclusions: tuple[OrganisationUnitExclusion, ...] = ()
     include_children: bool = False
     mapping_strategy: str = "uid"
     batch_size: int = 40
@@ -580,11 +588,20 @@ def _parse_job(
             "CREATE_AND_UPDATE."
         )
 
+    organisation_unit_conflict_policy = str(
+        ou_synchronization_raw.get("conflict_policy", "block")
+    ).lower()
+    if organisation_unit_conflict_policy not in {"block", "exclude"}:
+        raise PipelineError(
+            f"jobs.{job_id}.organisation_units.synchronization.conflict_policy "
+            "must be block or exclude."
+        )
     organisation_unit_synchronization = OrganisationUnitSynchronizationPolicy(
         enabled=_boolean(ou_synchronization_raw.get("enabled", False)),
         run_before_transfer=_boolean(
             ou_synchronization_raw.get("run_before_transfer", False)
         ),
+        conflict_policy=organisation_unit_conflict_policy,
         create_missing=_boolean(
             ou_synchronization_raw.get("create_missing", True)
         ),
@@ -618,6 +635,22 @@ def _parse_job(
             f"jobs.{job_id}.organisation_units.synchronization.run_before_transfer "
             "requires synchronization.enabled: true."
         )
+    if organisation_unit_synchronization.conflict_policy == "exclude":
+        if not organisation_unit_synchronization.enabled:
+            raise PipelineError(
+                f"jobs.{job_id}.organisation_units.synchronization.conflict_policy=exclude "
+                "requires synchronization.enabled: true."
+            )
+        if not organisation_unit_synchronization.run_before_transfer:
+            raise PipelineError(
+                f"jobs.{job_id}.organisation_units.synchronization.conflict_policy=exclude "
+                "requires run_before_transfer: true so every transfer refreshes its quarantine."
+            )
+        if id_schemes.organisation_units != "uid":
+            raise PipelineError(
+                f"jobs.{job_id}.organisation_units.synchronization.conflict_policy=exclude "
+                "requires UID organisation-unit mapping."
+            )
 
     return TransferJobConfig(
         id=job_id,
@@ -631,6 +664,10 @@ def _parse_job(
         organisation_units=OrganisationUnitPolicy(
             discovery=discovery,
             source_roots=source_roots,
+            exclusions=_organisation_unit_exclusions(
+                ou_raw.get("exclude", []),
+                f"jobs.{job_id}.organisation_units.exclude",
+            ),
             include_children=_boolean(ou_raw.get("include_children", bool(source_roots))),
             mapping_strategy=id_schemes.organisation_units,
             batch_size=_positive_int(ou_raw.get("batch_size", 40), "batch_size"),
@@ -650,7 +687,7 @@ def _mapping(value: Any, label: str) -> dict[str, Any]:
 
 
 def _required_string(value: Any, label: str) -> str:
-    if value in {None, ""}:
+    if value is None or value == "":
         raise PipelineError(f"Configuration field '{label}' is required.")
     return str(value)
 
@@ -667,6 +704,28 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     if isinstance(value, (list, tuple)):
         return tuple(str(item) for item in value if item not in {None, ""})
     raise PipelineError("Expected a string or list of strings.")
+
+
+def _organisation_unit_exclusions(
+    value: Any,
+    label: str,
+) -> tuple[OrganisationUnitExclusion, ...]:
+    if value is None or value == "":
+        return ()
+    if not isinstance(value, list):
+        raise PipelineError(f"Configuration field '{label}' must be a list.")
+    exclusions: list[OrganisationUnitExclusion] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        raw = _mapping(item, f"{label}[{index}]")
+        uid = _required_string(raw.get("uid"), f"{label}[{index}].uid")
+        _validate_safe_id(uid, "organisation unit exclusion")
+        if uid in seen:
+            raise PipelineError(f"Duplicate organisation unit exclusion UID '{uid}'.")
+        reason = _required_string(raw.get("reason"), f"{label}[{index}].reason")
+        exclusions.append(OrganisationUnitExclusion(uid=uid, reason=reason))
+        seen.add(uid)
+    return tuple(exclusions)
 
 
 def _boolean(value: Any) -> bool:

@@ -295,6 +295,43 @@ For a target that intentionally prefixes OU codes, keep `require_same_name: true
 `require_same_code: false`. The value import also performs a final DataSet assignment audit and
 stops before DHIS2 can return `E8022`.
 
+To continue with all safe OUs while dynamically quarantining conflicting subtrees for every job,
+configure the inherited synchronization policy:
+
+```yaml
+target:
+  organisation_units:
+    mapping_strategy: uid
+    synchronization:
+      enabled: true
+      run_before_transfer: true
+      conflict_policy: exclude
+```
+
+The default remains `block`. Dynamic exclusion handles required identity differences, parent
+differences, and code collisions. It refreshes the quarantine before every parent transfer and
+makes isolated windows consume the same manifest. Structural hierarchy errors and a quarantine
+that would remove the complete source selection remain blocking.
+
+An explicit per-job quarantine can complement automatic detection:
+
+```yaml
+jobs:
+  - id: hospital_service
+    organisation_units:
+      exclude:
+        - uid: cKCv828onjo
+          reason: "Temporary review: source and target parents differ"
+```
+
+The UID may be a directly selected OU or one of its ancestors. Ancestor exclusion removes every
+selected descendant from source requests, target matching, reconciliation, new DataSet assignments,
+and value payloads; it never deletes existing target assignments. Verify
+`detectedOrganisationUnitConflicts`, `excludedSourceOrganisationUnitCount` and
+`excludedSourceOrganisationUnits` in `review` and run reports before applying. An unknown manual
+UID is a configuration error. A completed run with dynamic exclusions reports
+`success_with_quarantine`. Remove a manual rule only after the X/Y discrepancy has been resolved.
+
 Validate without mutation:
 
 ```sh

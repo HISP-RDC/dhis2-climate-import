@@ -388,6 +388,52 @@ métadonnées avant la première tranche. Le pipeline vérifie ensuite que chaqu
 présente dans les valeurs est affectée au DataSet cible et bloque localement avant un rejet DHIS2
 `E8022`.
 
+### 8.6 Quarantaine dynamique d’unités bloquantes
+
+La politique est configurable globalement et héritée par tous les jobs :
+
+```yaml
+target:
+  organisation_units:
+    mapping_strategy: uid
+    synchronization:
+      enabled: true
+      run_before_transfer: true
+      conflict_policy: exclude
+```
+
+`block` reste la valeur par défaut. Avec `exclude`, chaque précontrôle recherche les différences de
+nom ou de code déclarées obligatoires, les parents divergents et les collisions de code. L’UID en
+conflit devient la racine d’une quarantaine calculée : toutes les unités directement sélectionnées
+dont le `path` contient cet UID sont retirées, puis le plan de synchronisation est recalculé sur les
+unités restantes. La même quarantaine est enregistrée dans le cache du job et consommée par chaque
+sous-processus d’import.
+
+Une exclusion manuelle et justifiée peut toujours compléter la détection pour un job particulier :
+
+```yaml
+jobs:
+  - id: hospital_service
+    organisation_units:
+      exclude:
+        - uid: cKCv828onjo
+          reason: "Temporary review: source and target parents differ"
+```
+
+Une unité en quarantaine n’est ni demandée à X, ni comparée ou créée sur Y, ni ajoutée aux nouvelles
+affectations du DataSet, ni envoyée dans un lot de valeurs. Les affectations déjà présentes sur Y ne
+sont jamais supprimées. Un UID manuel absent de toute la sélection et de tous ses chemins bloque
+l’exécution afin de détecter une faute de configuration.
+
+Les rapports contiennent `organisationUnitConflictPolicy`,
+`detectedOrganisationUnitConflicts`, `organisationUnitExclusions`,
+`excludedSourceOrganisationUnitCount` et `excludedSourceOrganisationUnits`. Les erreurs
+structurelles qui ne permettent pas d’identifier sûrement un sous-arbre restent bloquantes. Le
+pipeline bloque aussi si la quarantaine devait retirer 100 % de la sélection source. Une modification
+de la quarantaine change l’empreinte d’exécution afin que les fenêtres concernées ne soient pas
+ignorées à tort par le mécanisme de reprise. Une exécution terminée avec des exclusions dynamiques
+porte le statut explicite `success_with_quarantine`.
+
 La création automatique d’objets absents peut être autorisée par le YAML. Les mises à jour d’objets
 existants restent soumises aux critères `safe_repair`. Un objet contenant des valeurs ou utilisé
 ailleurs n’est jamais modifié automatiquement.

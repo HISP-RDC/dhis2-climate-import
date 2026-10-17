@@ -40,6 +40,8 @@ class TransferContext:
     end: str
     metadata_bootstrap_required: bool
     category_combo_repairs: tuple[dict[str, Any], ...] = ()
+    excluded_source_organisation_units: tuple[dict[str, Any], ...] = ()
+    detected_organisation_unit_conflicts: tuple[dict[str, Any], ...] = ()
 
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
@@ -58,6 +60,15 @@ def review_transfer(
     years_back: int | None = None,
     as_of: str | None = None,
 ) -> dict[str, Any]:
+    job = scenario.get_job(job_id)
+    if job.organisation_units.synchronization.conflict_policy == "exclude":
+        reconcile_target_organisation_units(
+            scenario,
+            source,
+            target,
+            job_id=job_id,
+            apply=False,
+        )
     context = resolve_transfer_context(
         scenario,
         source,
@@ -82,6 +93,8 @@ def reconcile_target_organisation_units(
     job_id: str,
     apply: bool,
     progress: ProgressCallback | None = None,
+    _dynamic_conflicts: dict[str, tuple[str, ...]] | None = None,
+    _quarantine_artifact: str | None = None,
 ) -> dict[str, Any]:
     """Create a missing source OU hierarchy on the target without moving existing OUs."""
     job = scenario.get_job(job_id)
@@ -104,7 +117,13 @@ def reconcile_target_organisation_units(
         apply=apply,
     )
     source_data_set = source.resolve_data_set(job.source_data_set)
-    direct_source_units = tuple(_resolve_source_units(source, source_data_set, job))
+    selected_source_units, excluded_source_units = _resolve_source_unit_selection(
+        source,
+        source_data_set,
+        job,
+        additional_excluded_ids=set(_dynamic_conflicts or {}),
+    )
+    direct_source_units = tuple(selected_source_units)
     if not direct_source_units:
         raise PipelineError(
             f"Source Data Set '{job.source_data_set}' has no organisation units to reconcile."
@@ -200,6 +219,10 @@ def reconcile_target_organisation_units(
         {
             "dataSet": asdict(source_data_set),
             "directOrganisationUnitIds": sorted(direct_source_ids),
+            "organisationUnitExclusions": _organisation_unit_exclusion_payload(job),
+            "excludedSourceOrganisationUnits": _organisation_unit_summary_payload(
+                excluded_source_units
+            ),
             "hierarchy": source_hierarchy,
         },
     )
@@ -214,6 +237,14 @@ def reconcile_target_organisation_units(
 
     blocked: list[str] = []
     warnings: list[str] = []
+    quarantinable_conflicts: dict[str, list[str]] = defaultdict(list)
+
+    def record_unit_conflict(uid: str, message: str) -> None:
+        if policy.conflict_policy == "exclude":
+            quarantinable_conflicts[uid].append(message)
+        else:
+            blocked.append(message)
+
     if duplicate_target_uids:
         blocked.append(
             "duplicate target UIDs: " + ", ".join(sorted(duplicate_target_uids)[:10])
@@ -225,10 +256,14 @@ def reconcile_target_organisation_units(
     }
     relevant_duplicate_codes = sorted(source_codes & duplicate_target_codes)
     if relevant_duplicate_codes:
-        blocked.append(
-            "duplicate target codes used by source hierarchy: "
-            + ", ".join(relevant_duplicate_codes[:10])
-        )
+        for source_unit in source_hierarchy:
+            source_uid = str(source_unit.get("id") or "")
+            source_code = str(source_unit.get("code") or "")
+            if source_uid and source_code in duplicate_target_codes:
+                record_unit_conflict(
+                    source_uid,
+                    f"source OU {source_uid} code {source_code!r} is duplicated on target",
+                )
 
     ordered_source_ids = sorted(
         hierarchy_ids,
@@ -261,21 +296,24 @@ def reconcile_target_organisation_units(
         if source_code:
             code_match = target_by_code.get(source_code)
             if code_match and str(code_match.get("id") or "") != uid:
-                blocked.append(
+                record_unit_conflict(
+                    uid,
                     f"source OU {uid} code {source_code!r} is already used on target by "
-                    f"UID {code_match.get('id')}"
+                    f"UID {code_match.get('id')}",
                 )
         if target_unit is None:
             if expected_parent is None:
                 if not policy.allow_root_creation:
-                    blocked.append(
+                    record_unit_conflict(
+                        uid,
                         f"source root OU {uid} is missing on target while "
-                        "allow_root_creation=false"
+                        "allow_root_creation=false",
                     )
                 elif target_root_ids:
-                    blocked.append(
+                    record_unit_conflict(
+                        uid,
                         f"source root OU {uid} cannot be created because target already has "
-                        f"root(s): {', '.join(sorted(target_root_ids)[:10])}"
+                        f"root(s): {', '.join(sorted(target_root_ids)[:10])}",
                     )
             continue
 
@@ -292,19 +330,104 @@ def reconcile_target_organisation_units(
                     f"target={target_value!r}"
                 )
                 if required:
-                    blocked.append(message)
+                    record_unit_conflict(uid, message)
                 else:
                     warnings.append(message)
         target_parent = _organisation_unit_parent_uid(target_unit)
         if target_parent != expected_parent:
-            blocked.append(
-                f"OU {uid} parent: source={expected_parent}, target={target_parent}"
+            record_unit_conflict(
+                uid,
+                f"OU {uid} parent: source={expected_parent}, target={target_parent}",
             )
 
     missing_ids = [uid for uid in ordered_source_ids if uid not in target_by_uid]
     if missing_ids and not policy.create_missing:
-        blocked.append(
-            f"{len(missing_ids)} organisation units are missing while create_missing=false"
+        for uid in missing_ids:
+            record_unit_conflict(
+                uid,
+                f"OU {uid} is missing while create_missing=false",
+            )
+
+    quarantine_path: Path | None = (
+        Path(_quarantine_artifact) if _quarantine_artifact else None
+    )
+    if policy.conflict_policy == "exclude" and quarantinable_conflicts:
+        conflict_ids = set(quarantinable_conflicts)
+        affected_units = [
+            unit
+            for unit in direct_source_units
+            if conflict_ids
+            & (set(_organisation_unit_path_ids(unit)) | {str(unit.get("id") or "")})
+        ]
+        if not affected_units:
+            blocked.append(
+                "Detected organisation-unit conflicts could not be mapped to any "
+                "selected source subtree: "
+                + ", ".join(sorted(conflict_ids)[:10])
+            )
+        elif len(affected_units) == len(direct_source_units):
+            blocked.append(
+                "Dynamic organisation-unit quarantine would exclude the complete "
+                f"source selection ({len(affected_units)} units); transfer blocked"
+            )
+        elif not blocked:
+            merged_conflicts: dict[str, tuple[str, ...]] = {
+                uid: tuple(reasons)
+                for uid, reasons in (_dynamic_conflicts or {}).items()
+            }
+            for uid, reasons in quarantinable_conflicts.items():
+                merged_conflicts[uid] = tuple(
+                    dict.fromkeys((*merged_conflicts.get(uid, ()), *reasons))
+                )
+            all_excluded_units = [*excluded_source_units, *affected_units]
+            quarantine_path = _write_organisation_unit_quarantine(
+                scenario,
+                source,
+                target,
+                job,
+                source_data_set,
+                conflicts=merged_conflicts,
+                excluded_source_units=all_excluded_units,
+            )
+            _write_json(
+                artifact_dir / "quarantine.json",
+                {
+                    "conflictPolicy": policy.conflict_policy,
+                    "detectedConflicts": _organisation_unit_conflict_payload(
+                        merged_conflicts
+                    ),
+                    "excludedSourceOrganisationUnits": (
+                        _organisation_unit_summary_payload(all_excluded_units)
+                    ),
+                    "manifest": str(quarantine_path),
+                },
+            )
+            _emit_progress(
+                progress,
+                "organisation_units.reconcile.quarantine",
+                conflicts=len(merged_conflicts),
+                excluded=len(all_excluded_units),
+                manifest=str(quarantine_path),
+            )
+            return reconcile_target_organisation_units(
+                scenario,
+                source,
+                target,
+                job_id=job_id,
+                apply=apply,
+                progress=progress,
+                _dynamic_conflicts=merged_conflicts,
+                _quarantine_artifact=str(quarantine_path),
+            )
+    elif policy.conflict_policy == "exclude" and _dynamic_conflicts is None:
+        quarantine_path = _write_organisation_unit_quarantine(
+            scenario,
+            source,
+            target,
+            job,
+            source_data_set,
+            conflicts={},
+            excluded_source_units=excluded_source_units,
         )
 
     target_data_set = target.find_data_set(job.target_data_set)
@@ -371,6 +494,18 @@ def reconcile_target_organisation_units(
         "targetRootOrganisationUnits": sorted(target_root_ids),
         "missingDirectOrganisationUnits": sorted(direct_source_ids - set(target_by_uid)),
         "organisationUnitsToCreate": missing_ids,
+        "organisationUnitConflictPolicy": policy.conflict_policy,
+        "organisationUnitExclusions": _organisation_unit_exclusion_payload(job),
+        "detectedOrganisationUnitConflicts": _organisation_unit_conflict_payload(
+            _dynamic_conflicts or quarantinable_conflicts
+        ),
+        "organisationUnitQuarantineArtifact": (
+            str(quarantine_path) if quarantine_path else None
+        ),
+        "excludedSourceOrganisationUnitCount": len(excluded_source_units),
+        "excludedSourceOrganisationUnits": _organisation_unit_summary_payload(
+            excluded_source_units
+        ),
         "dataSetAssignmentsToAdd": assignments_to_add,
         "dataSetAssignmentPendingMetadataCreation": bool(
             policy.attach_to_target_data_set and target_data_set is None
@@ -387,6 +522,8 @@ def reconcile_target_organisation_units(
         progress,
         "organisation_units.reconcile.plan",
         hierarchy=len(hierarchy_ids),
+        excluded=len(excluded_source_units),
+        quarantinedConflicts=len(_dynamic_conflicts or quarantinable_conflicts),
         create=len(missing_ids),
         attach=len(assignments_to_add),
         warnings=len(warnings),
@@ -435,6 +572,8 @@ def reconcile_target_organisation_units(
     _write_json(artifact_dir / "validation.json", validation or {})
     _write_json(artifact_dir / "commit.json", commit or {})
     status = "already_aligned" if not package else ("created" if apply else "validated")
+    if _dynamic_conflicts:
+        status = f"{status}_with_quarantine"
     if apply and package:
         verification_conflicts: list[str] = []
         if missing_ids:
@@ -558,6 +697,7 @@ def run_transfer(
         "context.resolve.done",
         sourceDataElements=len(context.source_data_elements),
         organisationUnits=len(context.source_organisation_units),
+        excludedOrganisationUnits=len(context.excluded_source_organisation_units),
         start=context.start,
         end=context.end,
         metadataBootstrap=context.metadata_bootstrap_required,
@@ -878,6 +1018,24 @@ def run_transfer(
             "metadata": metadata_report,
             "historicalDataElements": historical_data_element_report,
             "categoryOptionCombos": category_option_combo_report,
+            "organisationUnitExclusions": _organisation_unit_exclusion_payload(
+                context.job
+            ),
+            "organisationUnitConflictPolicy": (
+                context.job.organisation_units.synchronization.conflict_policy
+            ),
+            "detectedOrganisationUnitConflicts": list(
+                context.detected_organisation_unit_conflicts
+            ),
+            "organisationUnitQuarantineActive": bool(
+                context.detected_organisation_unit_conflicts
+            ),
+            "excludedSourceOrganisationUnitCount": len(
+                context.excluded_source_organisation_units
+            ),
+            "excludedSourceOrganisationUnits": _organisation_unit_summary_payload(
+                context.excluded_source_organisation_units
+            ),
             "dataValidationPendingMetadataCommit": bool(
                 context.target_data_set is None and not apply
             ),
@@ -981,6 +1139,15 @@ def repair_target_metadata(
         source_package,
     )
     prepared, preparation_report = _prepare_metadata_package(source_package)
+    _restrict_data_set_organisation_units(
+        prepared,
+        data_set_id=context.source_data_set.id,
+        allowed_uids={
+            str(unit["id"])
+            for unit in context.source_organisation_units
+            if unit.get("id")
+        },
+    )
 
     if not context.category_combo_repairs:
         report = {
@@ -1221,6 +1388,15 @@ def reconcile_target_metadata(
     )
     source_path = _write_json(artifact_dir / "source.json", source_package)
     prepared, preparation_report = _prepare_metadata_package(source_package)
+    _restrict_data_set_organisation_units(
+        prepared,
+        data_set_id=context.source_data_set.id,
+        allowed_uids={
+            str(unit["id"])
+            for unit in context.source_organisation_units
+            if unit.get("id")
+        },
+    )
 
     all_target_elements = target.data_elements(page_size=1000)
     source_by_uid = {
@@ -1680,7 +1856,40 @@ def resolve_transfer_context(
             "Data Set transfer does not copy DHIS2 file resources. Unsupported Data Elements: "
             + ", ".join(file_elements[:10])
         )
-    source_units = tuple(_resolve_source_units(source, source_data_set, job))
+    dynamic_conflicts: dict[str, tuple[str, ...]] = {}
+    if job.organisation_units.synchronization.conflict_policy == "exclude":
+        try:
+            dynamic_conflicts = _load_organisation_unit_quarantine(
+                scenario,
+                source,
+                target,
+                job,
+                source_data_set,
+            )
+        except PipelineError as exc:
+            if "quarantine manifest" not in str(exc):
+                raise
+            reconcile_target_organisation_units(
+                scenario,
+                source,
+                target,
+                job_id=job.id,
+                apply=False,
+            )
+            dynamic_conflicts = _load_organisation_unit_quarantine(
+                scenario,
+                source,
+                target,
+                job,
+                source_data_set,
+            )
+    selected_source_units, excluded_source_units = _resolve_source_unit_selection(
+        source,
+        source_data_set,
+        job,
+        additional_excluded_ids=set(dynamic_conflicts),
+    )
+    source_units = tuple(selected_source_units)
     if not source_units:
         raise PipelineError(
             f"Source Data Set '{job.source_data_set}' has no organisation units available "
@@ -1737,6 +1946,10 @@ def resolve_transfer_context(
         start=resolved_start,
         end=resolved_end,
         metadata_bootstrap_required=bootstrap_required,
+        excluded_source_organisation_units=tuple(excluded_source_units),
+        detected_organisation_unit_conflicts=tuple(
+            _organisation_unit_conflict_payload(dynamic_conflicts)
+        ),
     )
     repairs = _validate_data_set_compatibility(
         context,
@@ -1829,10 +2042,58 @@ def _validate_data_set_compatibility(
 def _resolve_source_units(
     source: DHIS2Client, data_set: DataSetRef, job: TransferJobConfig
 ) -> list[dict[str, Any]]:
+    selected, _ = _resolve_source_unit_selection(source, data_set, job)
+    return selected
+
+
+def _resolve_source_unit_selection(
+    source: DHIS2Client,
+    data_set: DataSetRef,
+    job: TransferJobConfig,
+    *,
+    additional_excluded_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     policy = job.organisation_units
     if policy.discovery == "configured_roots":
-        return [source.resolve_organisation_unit(item) for item in policy.source_roots]
-    return source.organisation_units_for_data_set(data_set.id)
+        units = [source.resolve_organisation_unit(item) for item in policy.source_roots]
+    else:
+        units = source.organisation_units_for_data_set(data_set.id)
+    excluded_ids = {item.uid for item in policy.exclusions} | set(
+        additional_excluded_ids or ()
+    )
+    if not excluded_ids:
+        return units, []
+
+    available_hierarchy_ids: set[str] = set()
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        uid = str(unit.get("id") or "")
+        if uid:
+            available_hierarchy_ids.add(uid)
+        available_hierarchy_ids.update(_organisation_unit_path_ids(unit))
+    unknown_ids = sorted(excluded_ids - available_hierarchy_ids)
+    if unknown_ids:
+        raise PipelineError(
+            "Configured organisation unit exclusions are neither selected source "
+            "units nor ancestors of the source selection for job "
+            f"{job.id}: {', '.join(unknown_ids[:10])}"
+        )
+
+    selected: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        unit_hierarchy_ids = set(_organisation_unit_path_ids(unit))
+        uid = str(unit.get("id") or "")
+        if uid:
+            unit_hierarchy_ids.add(uid)
+        if unit_hierarchy_ids & excluded_ids:
+            excluded.append(unit)
+        else:
+            selected.append(unit)
+    return selected, excluded
 
 
 def _organisation_unit_path_ids(unit: dict[str, Any]) -> list[str]:
@@ -2374,6 +2635,24 @@ def _category_option_combo_key(value: dict[str, Any]) -> tuple[str, tuple[str, .
         str(_reference_uid(value.get("categoryCombo")) or ""),
         tuple(sorted(_reference_ids(value.get("categoryOptions")))),
     )
+
+
+def _restrict_data_set_organisation_units(
+    package: dict[str, Any],
+    *,
+    data_set_id: str,
+    allowed_uids: set[str],
+) -> None:
+    """Keep a bootstrap package aligned with the effective transfer selection."""
+    data_sets = package.get("dataSets")
+    if not isinstance(data_sets, list):
+        return
+    for data_set in data_sets:
+        if not isinstance(data_set, dict) or str(data_set.get("id") or "") != data_set_id:
+            continue
+        data_set["organisationUnits"] = [
+            {"id": uid} for uid in sorted(allowed_uids)
+        ]
 
 
 def _prepare_metadata_package(
@@ -4105,6 +4384,22 @@ def _review_payload(
         "targetDataElementCount": len(context.target_data_elements),
         "sourceOrganisationUnitCount": len(context.source_organisation_units),
         "targetMatchedOrganisationUnitCount": len(context.target_organisation_units),
+        "organisationUnitExclusions": _organisation_unit_exclusion_payload(context.job),
+        "organisationUnitConflictPolicy": (
+            context.job.organisation_units.synchronization.conflict_policy
+        ),
+        "detectedOrganisationUnitConflicts": list(
+            context.detected_organisation_unit_conflicts
+        ),
+        "organisationUnitQuarantineActive": bool(
+            context.detected_organisation_unit_conflicts
+        ),
+        "excludedSourceOrganisationUnitCount": len(
+            context.excluded_source_organisation_units
+        ),
+        "excludedSourceOrganisationUnits": _organisation_unit_summary_payload(
+            context.excluded_source_organisation_units
+        ),
         "organisationUnitMappingStrategy": context.job.id_schemes.organisation_units,
         "start": context.start,
         "end": context.end,
@@ -4127,6 +4422,18 @@ def _write_metadata_caches(
             "dataSet": asdict(context.source_data_set),
             "dataElements": list(context.source_data_elements),
             "organisationUnits": list(context.source_organisation_units),
+            "organisationUnitExclusions": _organisation_unit_exclusion_payload(
+                context.job
+            ),
+            "organisationUnitConflictPolicy": (
+                context.job.organisation_units.synchronization.conflict_policy
+            ),
+            "detectedOrganisationUnitConflicts": list(
+                context.detected_organisation_unit_conflicts
+            ),
+            "excludedSourceOrganisationUnits": list(
+                context.excluded_source_organisation_units
+            ),
         },
     )
     _write_json(
@@ -4136,8 +4443,138 @@ def _write_metadata_caches(
             "dataSet": asdict(context.target_data_set) if context.target_data_set else None,
             "dataElements": list(context.target_data_elements),
             "organisationUnits": list(context.target_organisation_units),
+            "organisationUnitExclusions": _organisation_unit_exclusion_payload(
+                context.job
+            ),
+            "excludedSourceOrganisationUnits": _organisation_unit_summary_payload(
+                context.excluded_source_organisation_units
+            ),
         },
     )
+
+
+def _organisation_unit_exclusion_payload(
+    job: TransferJobConfig,
+) -> list[dict[str, str]]:
+    return [asdict(item) for item in job.organisation_units.exclusions]
+
+
+def _organisation_unit_conflict_payload(
+    conflicts: dict[str, tuple[str, ...]] | dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    return [
+        {"uid": uid, "reasons": list(conflicts[uid])}
+        for uid in sorted(conflicts)
+    ]
+
+
+def _organisation_unit_quarantine_path(
+    scenario: TransferScenario,
+    job: TransferJobConfig,
+) -> Path:
+    return (
+        scenario.job_state_dir(job.id)
+        / "cache"
+        / "organisation-unit-quarantine.json"
+    )
+
+
+def _write_organisation_unit_quarantine(
+    scenario: TransferScenario,
+    source: DHIS2Client,
+    target: DHIS2Client,
+    job: TransferJobConfig,
+    source_data_set: DataSetRef,
+    *,
+    conflicts: dict[str, tuple[str, ...]],
+    excluded_source_units: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> Path:
+    return _write_json(
+        _organisation_unit_quarantine_path(scenario, job),
+        {
+            "schemaVersion": 1,
+            "scenario": scenario.id,
+            "job": job.id,
+            "sourceInstance": source.base_url,
+            "targetInstance": target.base_url,
+            "sourceDataSet": source_data_set.id,
+            "conflictPolicy": job.organisation_units.synchronization.conflict_policy,
+            "detectedConflicts": _organisation_unit_conflict_payload(conflicts),
+            "excludedSourceOrganisationUnits": _organisation_unit_summary_payload(
+                excluded_source_units
+            ),
+        },
+    )
+
+
+def _load_organisation_unit_quarantine(
+    scenario: TransferScenario,
+    source: DHIS2Client,
+    target: DHIS2Client,
+    job: TransferJobConfig,
+    source_data_set: DataSetRef,
+) -> dict[str, tuple[str, ...]]:
+    path = _organisation_unit_quarantine_path(scenario, job)
+    if not path.exists():
+        raise PipelineError(
+            "Organisation-unit quarantine manifest is missing; run the guarded "
+            f"organisation-unit reconciliation first: {path}"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PipelineError(
+            f"Organisation-unit quarantine manifest is unreadable: {path}"
+        ) from exc
+    expected = {
+        "scenario": scenario.id,
+        "job": job.id,
+        "sourceInstance": source.base_url,
+        "targetInstance": target.base_url,
+        "sourceDataSet": source_data_set.id,
+        "conflictPolicy": "exclude",
+    }
+    mismatches = [
+        f"{key}={payload.get(key)!r} (expected {value!r})"
+        for key, value in expected.items()
+        if payload.get(key) != value
+    ]
+    if payload.get("schemaVersion") != 1 or mismatches:
+        detail = "; ".join(mismatches[:10]) or "unsupported schema version"
+        raise PipelineError(
+            f"Organisation-unit quarantine manifest is stale or incompatible: {detail}. "
+            f"Manifest: {path}"
+        )
+    raw_conflicts = payload.get("detectedConflicts")
+    if not isinstance(raw_conflicts, list):
+        raise PipelineError(
+            f"Organisation-unit quarantine manifest has no conflict list: {path}"
+        )
+    conflicts: dict[str, tuple[str, ...]] = {}
+    for item in raw_conflicts:
+        if not isinstance(item, dict) or not item.get("uid"):
+            raise PipelineError(
+                f"Organisation-unit quarantine manifest contains an invalid conflict: {path}"
+            )
+        reasons = item.get("reasons")
+        if not isinstance(reasons, list) or not all(
+            isinstance(reason, str) and reason for reason in reasons
+        ):
+            raise PipelineError(
+                f"Organisation-unit quarantine manifest contains invalid reasons: {path}"
+            )
+        conflicts[str(item["uid"])] = tuple(reasons)
+    return conflicts
+
+
+def _organisation_unit_summary_payload(
+    units: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    fields = ("id", "code", "name", "path", "level")
+    return [
+        {field: unit[field] for field in fields if unit.get(field) is not None}
+        for unit in units
+    ]
 
 
 def _resolve_window(
