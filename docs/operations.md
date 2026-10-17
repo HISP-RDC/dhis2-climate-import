@@ -288,6 +288,13 @@ Root creation is disabled by default because a DHIS2 instance must keep a single
 root. If the target is completely empty, root creation therefore requires an explicit, separately
 reviewed `allow_root_creation: true` decision.
 
+After the first plan is approved, set `run_before_transfer: true` to perform this reconciliation
+automatically before each parent transfer. `require_same_name` and `require_same_code` control the
+two identity fields independently; UID collisions and parent differences always remain blocking.
+For a target that intentionally prefixes OU codes, keep `require_same_name: true` and set
+`require_same_code: false`. The value import also performs a final DataSet assignment audit and
+stops before DHIS2 can return `E8022`.
+
 Validate without mutation:
 
 ```sh

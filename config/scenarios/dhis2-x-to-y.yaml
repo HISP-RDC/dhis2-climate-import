@@ -43,11 +43,15 @@ target:
     include_children: false
     batch_size: 40
     synchronization:
-      # Explicitly run reconcile-org-units --dry-run, inspect the plan, then --apply.
+      # Audit and repair the hierarchy/assignments before each parent transfer.
       # Existing units are never moved or overwritten.
       enabled: true
+      run_before_transfer: true
       create_missing: true
-      require_same_identity: true
+      # UID and parent remain authoritative. Y intentionally uses prefixed OU
+      # codes, while labels must stay identical to X.
+      require_same_name: true
+      require_same_code: false
       allow_root_creation: false
       attach_to_target_data_set: true
       preserve_geometry: true

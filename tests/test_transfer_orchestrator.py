@@ -106,6 +106,47 @@ class TransferOrchestratorTests(unittest.TestCase):
             self.assertEqual(result["status"], "metadata_changes_required")
             self.assertEqual(result["windowCount"], 0)
 
+    def test_organisation_unit_dry_run_runs_automatically_and_stops_before_export(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = _monthly_scenario(
+                Path(tmp),
+                run_org_unit_reconciliation=True,
+            )
+            source = SimpleNamespace(base_url="https://x.example.org")
+            target = SimpleNamespace(base_url="https://y.example.org")
+            with (
+                patch(
+                    "dhis2_climate_import.transfer_orchestrator.reconcile_target_metadata",
+                    return_value={"requiresChanges": False, "committed": False},
+                ),
+                patch(
+                    "dhis2_climate_import.transfer_orchestrator."
+                    "reconcile_target_organisation_units",
+                    return_value={
+                        "requiresChanges": True,
+                        "committed": False,
+                        "status": "validated",
+                    },
+                ) as reconcile_units,
+            ):
+                result = orchestrate_transfer(
+                    scenario,
+                    source,
+                    target,
+                    job_id="hospital",
+                    apply=False,
+                    window_runner=lambda *_args: self.fail(
+                        "value export must not run"
+                    ),
+                )
+
+            reconcile_units.assert_called_once()
+            self.assertEqual(result["status"], "metadata_changes_required")
+            self.assertEqual(result["windowCount"], 0)
+            self.assertTrue(result["organisationUnits"]["requiresChanges"])
+
     def test_retries_transient_error_but_not_permanent_error(self) -> None:
         with TemporaryDirectory() as tmp:
             scenario = _monthly_scenario(Path(tmp))
@@ -240,11 +281,15 @@ class TransferOrchestratorTests(unittest.TestCase):
             self.assertEqual(result["sourceDataValueCount"], 9)
 
 
-def _monthly_scenario(root: Path):
+def _monthly_scenario(
+    root: Path,
+    *,
+    run_org_unit_reconciliation: bool = False,
+):
     path = root / "config" / "scenarios" / "x-to-y.yaml"
     path.parent.mkdir(parents=True)
     path.write_text(
-        """
+        f"""
 schema_version: 2
 id: x-to-y
 source:
@@ -257,6 +302,10 @@ target:
     import:
       strategy: CREATE
       atomic: true
+  organisation_units:
+    synchronization:
+      enabled: {str(run_org_unit_reconciliation).lower()}
+      run_before_transfer: {str(run_org_unit_reconciliation).lower()}
 transfer:
   retry:
     attempts: 2

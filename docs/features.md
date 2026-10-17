@@ -347,8 +347,10 @@ target:
     mapping_strategy: uid
     synchronization:
       enabled: true
+      run_before_transfer: true
       create_missing: true
-      require_same_identity: true
+      require_same_name: true
+      require_same_code: false
       allow_root_creation: false
       attach_to_target_data_set: true
       preserve_geometry: true
@@ -370,13 +372,21 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
 
 La commande lit le `path` de chaque unité directement affectée au Data Set X, récupère tous ses
 ancêtres et construit le paquet dans l’ordre parent-enfant. Elle crée uniquement les UID absents.
-Une unité déjà présente sur Y n’est jamais renommée, déplacée ou écrasée. Une divergence de code,
-de nom ou de parent bloque l’opération et produit un artefact `blocked.json`.
+Une unité déjà présente sur Y n’est jamais renommée, déplacée ou écrasée. Le parent reste toujours
+bloquant. Le nom et le code sont contrôlés séparément : `require_same_name: true` protège les
+libellés, tandis que `require_same_code: false` autorise la convention de codes préfixés de Y. Les
+différences autorisées sont conservées dans `warnings`; les conflits réels produisent
+`blocked.json`.
 
 Lorsque le Data Set existe déjà sur Y, les affectations d’unités sont complétées par union : aucune
 affectation existante n’est supprimée. La création d’une racine reste désactivée par défaut afin de
 ne pas introduire une seconde racine DHIS2. Tous les plans, paquets, validations et commits sont
 conservés dans `runs/<run-id>/organisation-units/`, puis résumés dans un rapport JSON du job.
+
+Avec `run_before_transfer: true`, cette réconciliation s’exécute automatiquement sous le verrou des
+métadonnées avant la première tranche. Le pipeline vérifie ensuite que chaque OU réellement
+présente dans les valeurs est affectée au DataSet cible et bloque localement avant un rejet DHIS2
+`E8022`.
 
 La création automatique d’objets absents peut être autorisée par le YAML. Les mises à jour d’objets
 existants restent soumises aux critères `safe_repair`. Un objet contenant des valeurs ou utilisé
@@ -630,8 +640,8 @@ rapport global success/partial/failed
 
 ## 14. Recommandation opérationnelle actuelle
 
-- exécuter `review` ; si des unités manquent, lancer `reconcile-org-units --dry-run`, puis
-  `--apply` après lecture du plan ;
+- exécuter `review`, puis approuver une première exécution `reconcile-org-units --dry-run` ; après
+  cela, activer `run_before_transfer: true` pour automatiser le même garde-fou ;
 - exécuter ensuite `reconcile-metadata --dry-run`, puis `--apply` après lecture du plan ;
 - relancer `transfer run --dry-run` avant le premier import réel ;
 - garder des tranches d’un à trois mois pour les Data Sets mensuels volumineux ;

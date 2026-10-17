@@ -136,8 +136,10 @@ class MetadataPolicy:
 @dataclass(frozen=True)
 class OrganisationUnitSynchronizationPolicy:
     enabled: bool = False
+    run_before_transfer: bool = False
     create_missing: bool = True
-    require_same_identity: bool = True
+    require_same_name: bool = True
+    require_same_code: bool = True
     allow_root_creation: bool = False
     attach_to_target_data_set: bool = True
     preserve_geometry: bool = True
@@ -578,6 +580,45 @@ def _parse_job(
             "CREATE_AND_UPDATE."
         )
 
+    organisation_unit_synchronization = OrganisationUnitSynchronizationPolicy(
+        enabled=_boolean(ou_synchronization_raw.get("enabled", False)),
+        run_before_transfer=_boolean(
+            ou_synchronization_raw.get("run_before_transfer", False)
+        ),
+        create_missing=_boolean(
+            ou_synchronization_raw.get("create_missing", True)
+        ),
+        require_same_name=_boolean(
+            ou_synchronization_raw.get(
+                "require_same_name",
+                ou_synchronization_raw.get("require_same_identity", True),
+            )
+        ),
+        require_same_code=_boolean(
+            ou_synchronization_raw.get(
+                "require_same_code",
+                ou_synchronization_raw.get("require_same_identity", True),
+            )
+        ),
+        allow_root_creation=_boolean(
+            ou_synchronization_raw.get("allow_root_creation", False)
+        ),
+        attach_to_target_data_set=_boolean(
+            ou_synchronization_raw.get("attach_to_target_data_set", True)
+        ),
+        preserve_geometry=_boolean(
+            ou_synchronization_raw.get("preserve_geometry", True)
+        ),
+    )
+    if (
+        organisation_unit_synchronization.run_before_transfer
+        and not organisation_unit_synchronization.enabled
+    ):
+        raise PipelineError(
+            f"jobs.{job_id}.organisation_units.synchronization.run_before_transfer "
+            "requires synchronization.enabled: true."
+        )
+
     return TransferJobConfig(
         id=job_id,
         source_data_set=source_data_set,
@@ -593,24 +634,7 @@ def _parse_job(
             include_children=_boolean(ou_raw.get("include_children", bool(source_roots))),
             mapping_strategy=id_schemes.organisation_units,
             batch_size=_positive_int(ou_raw.get("batch_size", 40), "batch_size"),
-            synchronization=OrganisationUnitSynchronizationPolicy(
-                enabled=_boolean(ou_synchronization_raw.get("enabled", False)),
-                create_missing=_boolean(
-                    ou_synchronization_raw.get("create_missing", True)
-                ),
-                require_same_identity=_boolean(
-                    ou_synchronization_raw.get("require_same_identity", True)
-                ),
-                allow_root_creation=_boolean(
-                    ou_synchronization_raw.get("allow_root_creation", False)
-                ),
-                attach_to_target_data_set=_boolean(
-                    ou_synchronization_raw.get("attach_to_target_data_set", True)
-                ),
-                preserve_geometry=_boolean(
-                    ou_synchronization_raw.get("preserve_geometry", True)
-                ),
-            ),
+            synchronization=organisation_unit_synchronization,
         ),
         id_schemes=id_schemes,
         transfer=transfer,

@@ -45,8 +45,13 @@ target:
     synchronization:
       # Keep disabled until the generated hierarchy plan has been reviewed.
       enabled: false
+      # Once the manual dry-run has been approved, this can guard every transfer.
+      run_before_transfer: false
       create_missing: true
-      require_same_identity: true
+      require_same_name: true
+      # Set false only when Y intentionally uses a different code convention.
+      # UID collisions and parent differences remain blocking in all cases.
+      require_same_code: true
       allow_root_creation: false
       attach_to_target_data_set: true
       preserve_geometry: true

@@ -1053,6 +1053,9 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "metadata.reconcile.lock.wait": "Attente du verrou des métadonnées cible",
         "metadata.reconcile.start": "Synchronisation des métadonnées démarrée",
         "metadata.reconcile.done": "Synchronisation des métadonnées terminée",
+        "organisation_units.reconcile.lock.wait": (
+            "Attente du verrou des unités d’organisation cible"
+        ),
         "organisation_units.reconcile.start": (
             "Audit de la hiérarchie des unités d’organisation"
         ),
@@ -1074,6 +1077,12 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         ),
         "organisation_units.reconcile.done": (
             "Synchronisation des unités d’organisation terminée"
+        ),
+        "target.organisation_units.audit.start": (
+            "Vérification des affectations DataSet–unités d’organisation"
+        ),
+        "target.organisation_units.audit.done": (
+            "Affectations DataSet–unités d’organisation compatibles"
         ),
         "historical_data_elements.audit.start": (
             "Audit des Data Elements historiques"

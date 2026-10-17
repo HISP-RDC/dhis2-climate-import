@@ -2,6 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from dhis2_climate_import.errors import PipelineError
 from dhis2_climate_import.transfer_config import (
     load_instance_registry,
     load_transfer_scenario,
@@ -9,6 +10,36 @@ from dhis2_climate_import.transfer_config import (
 
 
 class TransferConfigTests(unittest.TestCase):
+    def test_automatic_org_unit_reconciliation_requires_enabled_policy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config" / "scenarios" / "invalid.yaml"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                """
+schema_version: 2
+id: invalid
+source:
+  instance: x
+target:
+  instance: y
+  organisation_units:
+    synchronization:
+      enabled: false
+      run_before_transfer: true
+jobs:
+  - id: monthly
+    source_data_set: DataSet0001
+    target_data_set: DataSet0001
+    period_type: month
+    default_start_period: 2026-01
+    default_end_period: 2026-12
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(PipelineError, "requires synchronization.enabled"):
+                load_transfer_scenario(path)
+
     def test_job_execution_override_deep_merges_global_retry_and_flags(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "config" / "scenarios" / "merge.yaml"
@@ -147,7 +178,12 @@ jobs:
         self.assertEqual(job.period_type, "week")
         self.assertEqual(job.organisation_units.discovery, "linked_to_dataset")
         self.assertTrue(job.organisation_units.synchronization.enabled)
+        self.assertFalse(
+            job.organisation_units.synchronization.run_before_transfer
+        )
         self.assertTrue(job.organisation_units.synchronization.create_missing)
+        self.assertTrue(job.organisation_units.synchronization.require_same_name)
+        self.assertTrue(job.organisation_units.synchronization.require_same_code)
         self.assertFalse(job.organisation_units.synchronization.allow_root_creation)
         self.assertTrue(
             job.organisation_units.synchronization.attach_to_target_data_set

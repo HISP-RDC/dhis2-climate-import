@@ -272,6 +272,7 @@ class TransferTests(unittest.TestCase):
                     "name": "Climate Weekly",
                     "shortName": "Climate Weekly",
                     "periodType": "Weekly",
+                    "dataSetElements": [],
                     "organisationUnits": [
                         {"id": uid} for uid in sorted(self.assignments)
                     ],
@@ -426,6 +427,64 @@ class TransferTests(unittest.TestCase):
                     apply=False,
                 )
 
+    def test_reconcile_org_units_warns_on_allowed_code_difference(self) -> None:
+        source_root = {
+            "id": "RootUnit001",
+            "code": "100000",
+            "name": "Country",
+            "shortName": "Country",
+            "openingDate": "2000-01-01",
+            "path": "/RootUnit001",
+            "level": 1,
+        }
+        target_root = {
+            **source_root,
+            "code": "RDC-100000",
+        }
+
+        class HierarchyClient(FakeTransferClient):
+            def __init__(self, base_url, unit, *, target=False):
+                super().__init__(
+                    base_url,
+                    target_has_dataset=target,
+                    target_units=[unit],
+                )
+                self.unit = unit
+
+            def organisation_units_for_data_set(self, data_set_id):
+                return [self.unit]
+
+            def metadata_objects_by_ids(self, **kwargs):
+                return (
+                    [self.unit]
+                    if self.unit["id"] in set(kwargs["object_ids"])
+                    else []
+                )
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+                organisation_unit_require_same_code=False,
+            )
+            result = reconcile_target_organisation_units(
+                scenario,
+                HierarchyClient("https://x.example.org", source_root),
+                HierarchyClient(
+                    "https://y.example.org",
+                    target_root,
+                    target=True,
+                ),
+                job_id="weekly_climate",
+                apply=False,
+            )
+
+            self.assertEqual(result["status"], "already_aligned")
+            self.assertEqual(result["blocked"], [])
+            self.assertEqual(len(result["warnings"]), 1)
+            self.assertIn("code", result["warnings"][0])
+
     def test_membership_update_preserves_existing_dataset_element_category_combo(self) -> None:
         class Target:
             def data_set_details(self, data_set_id):
@@ -436,6 +495,10 @@ class TransferTests(unittest.TestCase):
                     "shortName": "Climate Weekly Y",
                     "periodType": "Weekly",
                     "categoryCombo": {"id": "CatCombo001"},
+                    "organisationUnits": [
+                        {"id": "OrgUnit00001"},
+                        {"id": "OrgUnit00002"},
+                    ],
                     "dataSetElements": [
                         {
                             "dataSet": {"id": data_set_id},
@@ -460,6 +523,10 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(data_set["code"], "CCH_WEEKLY")
         self.assertEqual(data_set["categoryCombo"], {"id": "CatCombo001"})
         self.assertEqual(
+            data_set["organisationUnits"],
+            [{"id": "OrgUnit00001"}, {"id": "OrgUnit00002"}],
+        )
+        self.assertEqual(
             by_id["DataEl00001"]["categoryCombo"]["id"],
             "OverrideCC1",
         )
@@ -472,11 +539,33 @@ class TransferTests(unittest.TestCase):
                     "id": data_set_id,
                     "name": "Climate Weekly",
                     "dataSetElements": [],
+                    "organisationUnits": [],
                 }
 
         with self.assertRaisesRegex(
             PipelineError,
             "required target properties are missing: shortName, periodType",
+        ):
+            _data_set_membership_package(
+                Target(),
+                data_set_id="DataSet0001",
+                data_element_ids={"DataEl00001"},
+            )
+
+    def test_membership_update_blocks_when_org_unit_assignments_are_unreadable(self) -> None:
+        class Target:
+            def data_set_details(self, data_set_id):
+                return {
+                    "id": data_set_id,
+                    "name": "Climate Weekly",
+                    "shortName": "Climate Weekly",
+                    "periodType": "Weekly",
+                    "dataSetElements": [],
+                }
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "organisationUnits collection was not returned",
         ):
             _data_set_membership_package(
                 Target(),
@@ -1155,6 +1244,34 @@ class TransferTests(unittest.TestCase):
                     apply=True,
                 )
 
+    def test_transfer_blocks_before_import_when_dataset_is_not_assigned_to_value_ou(
+        self,
+    ) -> None:
+        class UnassignedTarget(FakeTransferClient):
+            def data_set_details(self, data_set_id):
+                details = super().data_set_details(data_set_id)
+                details["organisationUnits"] = []
+                return details
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(Path(tmp), chunk_size=5000)
+            source = FakeTransferClient("https://x.example.org")
+            target = UnassignedTarget(
+                "https://y.example.org",
+                target_has_dataset=True,
+            )
+
+            with self.assertRaisesRegex(PipelineError, "E8022"):
+                run_transfer(
+                    scenario,
+                    source,
+                    target,
+                    job_id="weekly_climate",
+                    apply=False,
+                )
+
+            self.assertEqual(target.data_import_calls, [])
+
     def test_prepares_minimal_metadata_without_invalid_source_dependencies(self) -> None:
         source_package = {
             "categories": [
@@ -1470,6 +1587,7 @@ def _scenario(
     source_period_batch_size: int | None = None,
     historical_uid_collision_strategy: str = "block",
     organisation_unit_synchronization: bool = False,
+    organisation_unit_require_same_code: bool = True,
 ):
     path = root / "config" / "scenarios" / "x-to-y.yaml"
     path.parent.mkdir(parents=True)
@@ -1497,6 +1615,7 @@ target:
     mapping_strategy: {organisation_unit_mapping}
     synchronization:
       enabled: {str(organisation_unit_synchronization).lower()}
+      require_same_code: {str(organisation_unit_require_same_code).lower()}
 mapping:
   data_elements: uid
   organisation_units: {organisation_unit_mapping}
@@ -1652,6 +1771,7 @@ class _HistoricalTarget:
             "shortName": "Hospital service",
             "periodType": "Monthly",
             "categoryCombo": {"id": "CatCombo001"},
+            "organisationUnits": [{"id": "OrgUnit00001"}],
             "dataSetElements": [
                 {
                     "dataSet": {"id": data_set_id},

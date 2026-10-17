@@ -213,6 +213,7 @@ def reconcile_target_organisation_units(
     )
 
     blocked: list[str] = []
+    warnings: list[str] = []
     if duplicate_target_uids:
         blocked.append(
             "duplicate target UIDs: " + ", ".join(sorted(duplicate_target_uids)[:10])
@@ -278,14 +279,22 @@ def reconcile_target_organisation_units(
                     )
             continue
 
-        if policy.require_same_identity:
-            for field in ("code", "name"):
-                source_value = source_unit.get(field)
-                target_value = target_unit.get(field)
-                if source_value and source_value != target_value:
-                    blocked.append(
-                        f"OU {uid} {field}: source={source_value!r}, target={target_value!r}"
-                    )
+        identity_checks = (
+            ("code", policy.require_same_code),
+            ("name", policy.require_same_name),
+        )
+        for field, required in identity_checks:
+            source_value = source_unit.get(field)
+            target_value = target_unit.get(field)
+            if source_value and source_value != target_value:
+                message = (
+                    f"OU {uid} {field}: source={source_value!r}, "
+                    f"target={target_value!r}"
+                )
+                if required:
+                    blocked.append(message)
+                else:
+                    warnings.append(message)
         target_parent = _organisation_unit_parent_uid(target_unit)
         if target_parent != expected_parent:
             blocked.append(
@@ -324,6 +333,12 @@ def reconcile_target_organisation_units(
                 target_data_set_details,
                 target_data_set.id,
             )
+            data_set_update["dataSetElements"] = (
+                _target_data_set_element_memberships(
+                    target_data_set_details,
+                    target_data_set.id,
+                )
+            )
             data_set_update["organisationUnits"] = [
                 {"id": uid}
                 for uid in sorted(existing_assignments | direct_source_ids)
@@ -360,6 +375,7 @@ def reconcile_target_organisation_units(
         "dataSetAssignmentPendingMetadataCreation": bool(
             policy.attach_to_target_data_set and target_data_set is None
         ),
+        "warnings": warnings,
         "blocked": blocked,
         "sourceArtifact": str(source_path),
         "targetSnapshotArtifact": str(target_snapshot_path),
@@ -373,6 +389,7 @@ def reconcile_target_organisation_units(
         hierarchy=len(hierarchy_ids),
         create=len(missing_ids),
         attach=len(assignments_to_add),
+        warnings=len(warnings),
         blocked=len(blocked),
     )
     if blocked:
@@ -738,6 +755,12 @@ def run_transfer(
         dry_run_responses: list[dict[str, Any]] = []
         apply_responses: list[dict[str, Any]] = []
         if context.target_data_set is not None and not historical_pending:
+            _validate_target_data_set_organisation_units(
+                target,
+                context,
+                source_values,
+                progress=progress,
+            )
             _validate_target_category_option_combos(
                 target,
                 context,
@@ -1510,19 +1533,10 @@ def _data_set_membership_package(
         raise PipelineError(
             f"Cannot update target Data Set {data_set_id}: its metadata could not be read."
         )
-    existing = details.get("dataSetElements")
-    memberships: dict[str, dict[str, Any]] = {}
-    if isinstance(existing, list):
-        for item in existing:
-            if not isinstance(item, dict):
-                continue
-            element_id = _reference_uid(item.get("dataElement"))
-            if not element_id:
-                continue
-            preserved = deepcopy(item)
-            preserved["dataSet"] = {"id": data_set_id}
-            preserved["dataElement"] = {"id": element_id}
-            memberships[element_id] = preserved
+    memberships = {
+        str(item["dataElement"]["id"]): item
+        for item in _target_data_set_element_memberships(details, data_set_id)
+    }
     for element_id in data_element_ids:
         memberships.setdefault(
             element_id,
@@ -1536,7 +1550,48 @@ def _data_set_membership_package(
         memberships[element_id]
         for element_id in sorted(memberships)
     ]
+    data_set_payload["organisationUnits"] = (
+        _target_data_set_organisation_unit_references(details, data_set_id)
+    )
     return {"dataSets": [data_set_payload]}
+
+
+def _target_data_set_element_memberships(
+    details: dict[str, Any] | None,
+    data_set_id: str,
+) -> list[dict[str, Any]]:
+    if details is None or not isinstance(details.get("dataSetElements"), list):
+        raise PipelineError(
+            f"Cannot update target Data Set {data_set_id}: its dataSetElements "
+            "collection was not returned, so existing memberships cannot be preserved."
+        )
+    memberships: dict[str, dict[str, Any]] = {}
+    for item in details["dataSetElements"]:
+        if not isinstance(item, dict):
+            continue
+        element_id = _reference_uid(item.get("dataElement"))
+        if not element_id:
+            continue
+        preserved = deepcopy(item)
+        preserved["dataSet"] = {"id": data_set_id}
+        preserved["dataElement"] = {"id": element_id}
+        memberships[element_id] = preserved
+    return [memberships[element_id] for element_id in sorted(memberships)]
+
+
+def _target_data_set_organisation_unit_references(
+    details: dict[str, Any] | None,
+    data_set_id: str,
+) -> list[dict[str, str]]:
+    if details is None or not isinstance(details.get("organisationUnits"), list):
+        raise PipelineError(
+            f"Cannot update target Data Set {data_set_id}: its organisationUnits "
+            "collection was not returned, so existing assignments cannot be preserved."
+        )
+    return [
+        {"id": uid}
+        for uid in sorted(_reference_ids(details["organisationUnits"]))
+    ]
 
 
 def _target_data_set_identity_payload(
@@ -3893,6 +3948,54 @@ def _normalise_source_category_option_combos(
         remappedValues=remapped_count,
     )
     return data_values, report
+
+
+def _validate_target_data_set_organisation_units(
+    target: DHIS2Client,
+    context: TransferContext,
+    data_values: list[dict[str, Any]],
+    *,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """Fail before DHIS2 E8022 when the Data Set is not assigned to value OUs."""
+    if context.target_data_set is None:
+        raise PipelineError(
+            "Cannot audit target Data Set organisation units without a target Data Set."
+        )
+    _emit_progress(progress, "target.organisation_units.audit.start")
+    details = _target_data_set_details(target, context.target_data_set.id)
+    assigned_units = _target_data_set_organisation_unit_references(
+        details,
+        context.target_data_set.id,
+    )
+    scheme = context.job.id_schemes.organisation_units
+    field = "id" if scheme == "uid" else "code"
+    assigned_keys = {
+        str(item.get(field))
+        for item in (details or {}).get("organisationUnits", [])
+        if isinstance(item, dict) and item.get(field)
+    }
+    used_keys = {
+        str(item.get("orgUnit"))
+        for item in data_values
+        if isinstance(item, dict) and item.get("orgUnit")
+    }
+    missing = sorted(used_keys - assigned_keys)
+    if missing:
+        raise PipelineError(
+            f"Target Data Set {context.target_data_set.id} is not assigned to "
+            f"{len(missing)} organisation unit(s) used by the exported values; DHIS2 "
+            "would reject them with E8022. Missing assignments: "
+            + ", ".join(missing[:10])
+            + ". Run reconcile-org-units --apply or enable "
+            "target.organisation_units.synchronization.run_before_transfer."
+        )
+    _emit_progress(
+        progress,
+        "target.organisation_units.audit.done",
+        assigned=len(assigned_units),
+        used=len(used_keys),
+    )
 
 
 def _validate_target_category_option_combos(

@@ -210,6 +210,11 @@ mapping, the separate `reconcile-org-units` command can validate and create only
 their missing ancestors. It never moves or overwrites an existing target unit. Additional target
 units are allowed.
 
+Set `target.organisation_units.synchronization.run_before_transfer: true` after approving the
+first hierarchy dry-run to execute the same guarded reconciliation before every parent transfer.
+It also restores missing DataSet–organisation-unit assignments before values are exported. A final
+preflight blocks the import locally if DHIS2 would reject it with `E8022`.
+
 Prepare profiles and a scenario:
 
 ```sh
@@ -228,7 +233,7 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
   review weekly_climate
 
-# Only when review reports missing organisation units:
+# Manual audit (recommended before enabling run_before_transfer):
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
@@ -258,7 +263,9 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
 With `target.metadata.mode: create_if_missing`, `reconcile-metadata --dry-run` exports the Data Set
 dependency package from X and validates it against Y without writing metadata. After review,
 `reconcile-metadata --apply` creates missing objects, attaches compatible Data Elements and rereads
-Y before any large data export. `transfer run` also executes this preflight automatically. Caches,
+Y before any large data export. `transfer run` also executes this preflight automatically. When
+`run_before_transfer` is enabled, it then audits/creates missing organisation units and completes
+the target DataSet assignments under the same metadata lock. Caches,
 artifacts, reports, and the SQLite journal are isolated per job under
 `state/<target-profile>/<scenario>/jobs/<job>/`.
 
