@@ -134,12 +134,25 @@ class MetadataPolicy:
 
 
 @dataclass(frozen=True)
+class OrganisationUnitSynchronizationPolicy:
+    enabled: bool = False
+    create_missing: bool = True
+    require_same_identity: bool = True
+    allow_root_creation: bool = False
+    attach_to_target_data_set: bool = True
+    preserve_geometry: bool = True
+
+
+@dataclass(frozen=True)
 class OrganisationUnitPolicy:
     discovery: str = "linked_to_dataset"
     source_roots: tuple[str, ...] = ()
     include_children: bool = False
     mapping_strategy: str = "uid"
     batch_size: int = 40
+    synchronization: OrganisationUnitSynchronizationPolicy = (
+        OrganisationUnitSynchronizationPolicy()
+    )
 
 
 @dataclass(frozen=True)
@@ -444,7 +457,18 @@ def _parse_job(
         _required_string(raw.get("period_type"), f"jobs.{job_id}.period_type")
     )
 
-    ou_raw = {**default_ou, **_mapping(raw.get("organisation_units", {}), "organisation_units")}
+    job_ou_raw = _mapping(raw.get("organisation_units", {}), "organisation_units")
+    ou_raw = {**default_ou, **job_ou_raw}
+    ou_synchronization_raw = {
+        **_mapping(
+            default_ou.get("synchronization", {}),
+            "target.organisation_units.synchronization",
+        ),
+        **_mapping(
+            job_ou_raw.get("synchronization", {}),
+            f"jobs.{job_id}.organisation_units.synchronization",
+        ),
+    }
     source_roots = _string_tuple(ou_raw.get("source_roots", ()))
     default_discovery = "configured_roots" if source_roots else "linked_to_dataset"
     discovery = str(ou_raw.get("discovery", default_discovery))
@@ -569,6 +593,24 @@ def _parse_job(
             include_children=_boolean(ou_raw.get("include_children", bool(source_roots))),
             mapping_strategy=id_schemes.organisation_units,
             batch_size=_positive_int(ou_raw.get("batch_size", 40), "batch_size"),
+            synchronization=OrganisationUnitSynchronizationPolicy(
+                enabled=_boolean(ou_synchronization_raw.get("enabled", False)),
+                create_missing=_boolean(
+                    ou_synchronization_raw.get("create_missing", True)
+                ),
+                require_same_identity=_boolean(
+                    ou_synchronization_raw.get("require_same_identity", True)
+                ),
+                allow_root_creation=_boolean(
+                    ou_synchronization_raw.get("allow_root_creation", False)
+                ),
+                attach_to_target_data_set=_boolean(
+                    ou_synchronization_raw.get("attach_to_target_data_set", True)
+                ),
+                preserve_geometry=_boolean(
+                    ou_synchronization_raw.get("preserve_geometry", True)
+                ),
+            ),
         ),
         id_schemes=id_schemes,
         transfer=transfer,

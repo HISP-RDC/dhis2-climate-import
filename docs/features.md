@@ -45,6 +45,7 @@ Le pipeline sait :
 - utiliser un PAT ou un couple utilisateur/mot de passe ;
 - découvrir un Data Set source et ses Data Elements associés ;
 - comparer les unités d’organisation X et Y par UID ou code ;
+- planifier et créer explicitement les unités absentes avec toute leur chaîne de parents ;
 - créer un Data Set cible manquant avec un paquet minimal de dépendances ;
 - réutiliser les dépendances déjà présentes sur Y sans les mettre à jour implicitement ;
 - bloquer un transfert lorsque les Data Elements existants sont incompatibles ;
@@ -334,6 +335,49 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   reconcile-metadata hospital_service --apply
 ```
 
+### 8.5 Synchronisation de la hiérarchie des unités d’organisation
+
+La synchronisation des unités est distincte de celle des Data Elements. Elle est activée de façon
+explicite et n’est disponible qu’avec un mapping par UID :
+
+```yaml
+target:
+  organisation_units:
+    discovery: linked_to_dataset
+    mapping_strategy: uid
+    synchronization:
+      enabled: true
+      create_missing: true
+      require_same_identity: true
+      allow_root_creation: false
+      attach_to_target_data_set: true
+      preserve_geometry: true
+```
+
+Le mode opératoire est :
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units relevant_epidemiological_data --dry-run
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units relevant_epidemiological_data --apply
+```
+
+La commande lit le `path` de chaque unité directement affectée au Data Set X, récupère tous ses
+ancêtres et construit le paquet dans l’ordre parent-enfant. Elle crée uniquement les UID absents.
+Une unité déjà présente sur Y n’est jamais renommée, déplacée ou écrasée. Une divergence de code,
+de nom ou de parent bloque l’opération et produit un artefact `blocked.json`.
+
+Lorsque le Data Set existe déjà sur Y, les affectations d’unités sont complétées par union : aucune
+affectation existante n’est supprimée. La création d’une racine reste désactivée par défaut afin de
+ne pas introduire une seconde racine DHIS2. Tous les plans, paquets, validations et commits sont
+conservés dans `runs/<run-id>/organisation-units/`, puis résumés dans un rapport JSON du job.
+
 La création automatique d’objets absents peut être autorisée par le YAML. Les mises à jour d’objets
 existants restent soumises aux critères `safe_repair`. Un objet contenant des valeurs ou utilisé
 ailleurs n’est jamais modifié automatiquement.
@@ -586,7 +630,9 @@ rapport global success/partial/failed
 
 ## 14. Recommandation opérationnelle actuelle
 
-- exécuter `review`, `reconcile-metadata --dry-run`, puis `--apply` après lecture du plan ;
+- exécuter `review` ; si des unités manquent, lancer `reconcile-org-units --dry-run`, puis
+  `--apply` après lecture du plan ;
+- exécuter ensuite `reconcile-metadata --dry-run`, puis `--apply` après lecture du plan ;
 - relancer `transfer run --dry-run` avant le premier import réel ;
 - garder des tranches d’un à trois mois pour les Data Sets mensuels volumineux ;
 - ne pas utiliser `--force` dans systemd ;

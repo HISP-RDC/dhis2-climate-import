@@ -257,6 +257,37 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   review weekly_climate
 ```
 
+If the review reports `missing on target`, use the dedicated hierarchy reconciliation. It requires
+`mapping_strategy: uid` and `organisation_units.synchronization.enabled: true`:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units relevant_epidemiological_data --dry-run
+```
+
+Inspect `planArtifact` and `packageArtifact`. The package contains only missing units, ordered from
+parent to child, plus an additive target Data Set assignment when the Data Set already exists. It
+never removes existing assignments. Apply the exact validated plan, then rerun `review`:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units relevant_epidemiological_data --apply
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  review relevant_epidemiological_data
+```
+
+The operation blocks on UID/code collisions, identity differences, or a different existing parent.
+Root creation is disabled by default because a DHIS2 instance must keep a single organisation-unit
+root. If the target is completely empty, root creation therefore requires an explicit, separately
+reviewed `allow_root_creation: true` decision.
+
 Validate without mutation:
 
 ```sh

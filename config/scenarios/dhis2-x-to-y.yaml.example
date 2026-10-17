@@ -42,6 +42,14 @@ target:
     mapping_strategy: uid
     include_children: false
     batch_size: 40
+    synchronization:
+      # Keep disabled until the generated hierarchy plan has been reviewed.
+      enabled: false
+      create_missing: true
+      require_same_identity: true
+      allow_root_creation: false
+      attach_to_target_data_set: true
+      preserve_geometry: true
 
 mapping:
   data_elements: uid

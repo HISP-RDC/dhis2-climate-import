@@ -15,6 +15,7 @@ from dhis2_climate_import.transfer import (
     _validate_target_category_option_combos,
     _validate_metadata_package,
     _version_unmappable_historical_values,
+    reconcile_target_organisation_units,
     reconcile_target_metadata,
     repair_target_metadata,
     review_transfer,
@@ -78,6 +79,28 @@ class FakeTransferClient:
 
     def data_elements(self, *, page_size):
         return self.global_target_elements
+
+    def data_set_details(self, data_set_id):
+        linked = self.data_elements_for_data_set(
+            data_set_id=data_set_id,
+            page_size=500,
+        )
+        return {
+            "id": data_set_id,
+            "code": self.data_set.code,
+            "name": self.data_set.name,
+            "shortName": "Climate Weekly",
+            "periodType": self.data_set.period_type,
+            "categoryCombo": {"id": "CatCombo001"},
+            "dataSetElements": [
+                {
+                    "dataSet": {"id": data_set_id},
+                    "dataElement": {"id": item["id"]},
+                }
+                for item in linked
+            ],
+            "organisationUnits": self.target_units,
+        }
 
     def organisation_units_for_data_set(self, data_set_id):
         return [{"id": "OrgUnit00001", "code": "OU-1", "name": "Zone 1"}]
@@ -179,10 +202,240 @@ class FakeTransferClient:
 
 
 class TransferTests(unittest.TestCase):
+    def test_reconcile_org_units_creates_missing_hierarchy_parent_first(self) -> None:
+        root = {
+            "id": "RootUnit001",
+            "code": "ROOT",
+            "name": "Country",
+            "shortName": "Country",
+            "openingDate": "2000-01-01",
+            "path": "/RootUnit001",
+            "level": 1,
+        }
+        parent = {
+            "id": "ParentUnit1",
+            "code": "PARENT",
+            "name": "Province",
+            "shortName": "Province",
+            "openingDate": "2000-01-01",
+            "path": "/RootUnit001/ParentUnit1",
+            "level": 2,
+            "parent": {"id": "RootUnit001"},
+        }
+        child = {
+            "id": "ChildUnit01",
+            "code": "CHILD",
+            "name": "Zone",
+            "shortName": "Zone",
+            "openingDate": "2000-01-01",
+            "path": "/RootUnit001/ParentUnit1/ChildUnit01",
+            "level": 3,
+            "parent": {"id": "ParentUnit1"},
+        }
+
+        class OrgUnitClient:
+            def __init__(self, base_url, units, *, direct_ids=(), target=False):
+                self.base_url = base_url
+                self.units = {item["id"]: dict(item) for item in units}
+                self.direct_ids = set(direct_ids)
+                self.target = target
+                self.assignments = {"RootUnit001"} if target else set()
+                self.metadata_payloads = []
+                self.data_set = DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Climate Weekly",
+                    period_type="Weekly",
+                )
+
+            def resolve_data_set(self, selector):
+                return self.data_set
+
+            def find_data_set(self, selector):
+                return self.data_set if self.target else None
+
+            def organisation_units_for_data_set(self, data_set_id):
+                return [self.units[uid] for uid in sorted(self.direct_ids)]
+
+            def organisation_units(self, *, page_size=1000):
+                return list(self.units.values())
+
+            def metadata_objects_by_ids(
+                self, *, resource, root_key, object_ids, fields, batch_size=40
+            ):
+                return [self.units[uid] for uid in object_ids if uid in self.units]
+
+            def data_set_details(self, data_set_id):
+                return {
+                    "id": data_set_id,
+                    "code": "CCH_WEEKLY",
+                    "name": "Climate Weekly",
+                    "shortName": "Climate Weekly",
+                    "periodType": "Weekly",
+                    "organisationUnits": [
+                        {"id": uid} for uid in sorted(self.assignments)
+                    ],
+                }
+
+            def import_metadata(
+                self,
+                payload,
+                *,
+                commit,
+                import_strategy,
+                atomic_mode,
+                identifier,
+                skip_sharing,
+            ):
+                self.metadata_payloads.append((commit, payload))
+                if commit:
+                    for item in payload.get("organisationUnits", []):
+                        stored = dict(item)
+                        parent_uid = (stored.get("parent") or {}).get("id")
+                        parent_path = (
+                            self.units[parent_uid]["path"] if parent_uid else ""
+                        )
+                        stored["path"] = f"{parent_path}/{stored['id']}"
+                        stored["level"] = len(
+                            [part for part in stored["path"].split("/") if part]
+                        )
+                        self.units[stored["id"]] = stored
+                    for data_set in payload.get("dataSets", []):
+                        self.assignments = {
+                            item["id"] for item in data_set.get("organisationUnits", [])
+                        }
+                return {"status": "OK"}
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+            )
+            source = OrgUnitClient(
+                "https://x.example.org",
+                [root, parent, child],
+                direct_ids=["ChildUnit01"],
+            )
+            target = OrgUnitClient(
+                "https://y.example.org",
+                [root],
+                target=True,
+            )
+
+            dry_run = reconcile_target_organisation_units(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+                apply=False,
+            )
+            package = target.metadata_payloads[0][1]
+
+            self.assertEqual(dry_run["status"], "validated")
+            self.assertEqual(
+                [item["id"] for item in package["organisationUnits"]],
+                ["ParentUnit1", "ChildUnit01"],
+            )
+            self.assertEqual(
+                package["organisationUnits"][1]["parent"]["id"],
+                "ParentUnit1",
+            )
+            self.assertEqual(target.metadata_payloads[0][0], False)
+
+            applied = reconcile_target_organisation_units(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+                apply=True,
+            )
+
+            self.assertEqual(applied["status"], "created")
+            self.assertIn("ChildUnit01", target.units)
+            self.assertIn("ChildUnit01", target.assignments)
+
+    def test_reconcile_org_units_blocks_existing_unit_under_different_parent(self) -> None:
+        source_units = [
+            {
+                "id": "RootUnit001",
+                "code": "ROOT",
+                "name": "Country",
+                "path": "/RootUnit001",
+                "level": 1,
+            },
+            {
+                "id": "ChildUnit01",
+                "code": "CHILD",
+                "name": "Zone",
+                "path": "/RootUnit001/ChildUnit01",
+                "level": 2,
+                "parent": {"id": "RootUnit001"},
+            },
+        ]
+
+        class Source(FakeTransferClient):
+            def organisation_units_for_data_set(self, data_set_id):
+                return [source_units[1]]
+
+            def metadata_objects_by_ids(self, **kwargs):
+                wanted = set(kwargs["object_ids"])
+                return [item for item in source_units if item["id"] in wanted]
+
+        class Target(FakeTransferClient):
+            def __init__(self):
+                super().__init__(
+                    "https://y.example.org",
+                    target_has_dataset=True,
+                    target_units=[
+                        source_units[0],
+                        {
+                            **source_units[1],
+                            "path": "/OtherRoot01/ChildUnit01",
+                            "parent": {"id": "OtherRoot01"},
+                        },
+                    ],
+                )
+
+            def metadata_objects_by_ids(self, **kwargs):
+                wanted = set(kwargs["object_ids"])
+                return [item for item in self.target_units if item["id"] in wanted]
+
+            def data_set_details(self, data_set_id):
+                return {
+                    "id": data_set_id,
+                    "code": "CCH_WEEKLY",
+                    "name": "Climate Weekly",
+                    "shortName": "Climate Weekly",
+                    "periodType": "Weekly",
+                    "organisationUnits": [{"id": "ChildUnit01"}],
+                }
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+            )
+            with self.assertRaisesRegex(PipelineError, "parent: source=RootUnit001"):
+                reconcile_target_organisation_units(
+                    scenario,
+                    Source("https://x.example.org"),
+                    Target(),
+                    job_id="weekly_climate",
+                    apply=False,
+                )
+
     def test_membership_update_preserves_existing_dataset_element_category_combo(self) -> None:
         class Target:
             def data_set_details(self, data_set_id):
                 return {
+                    "id": data_set_id,
+                    "code": "CCH_WEEKLY",
+                    "name": "Climate Weekly on Y",
+                    "shortName": "Climate Weekly Y",
+                    "periodType": "Weekly",
+                    "categoryCombo": {"id": "CatCombo001"},
                     "dataSetElements": [
                         {
                             "dataSet": {"id": data_set_id},
@@ -199,12 +452,37 @@ class TransferTests(unittest.TestCase):
         )
 
         elements = package["dataSets"][0]["dataSetElements"]
+        data_set = package["dataSets"][0]
         by_id = {item["dataElement"]["id"]: item for item in elements}
+        self.assertEqual(data_set["name"], "Climate Weekly on Y")
+        self.assertEqual(data_set["shortName"], "Climate Weekly Y")
+        self.assertEqual(data_set["periodType"], "Weekly")
+        self.assertEqual(data_set["code"], "CCH_WEEKLY")
+        self.assertEqual(data_set["categoryCombo"], {"id": "CatCombo001"})
         self.assertEqual(
             by_id["DataEl00001"]["categoryCombo"]["id"],
             "OverrideCC1",
         )
         self.assertNotIn("categoryCombo", by_id["DataEl00002"])
+
+    def test_membership_update_blocks_incomplete_target_dataset_identity(self) -> None:
+        class Target:
+            def data_set_details(self, data_set_id):
+                return {
+                    "id": data_set_id,
+                    "name": "Climate Weekly",
+                    "dataSetElements": [],
+                }
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "required target properties are missing: shortName, periodType",
+        ):
+            _data_set_membership_package(
+                Target(),
+                data_set_id="DataSet0001",
+                data_element_ids={"DataEl00001"},
+            )
 
     def test_reconcile_plans_attachment_of_compatible_unlinked_data_element(self) -> None:
         class PartialTarget(FakeTransferClient):
@@ -1191,6 +1469,7 @@ def _scenario(
     default_end_period: str = "2026-W02",
     source_period_batch_size: int | None = None,
     historical_uid_collision_strategy: str = "block",
+    organisation_unit_synchronization: bool = False,
 ):
     path = root / "config" / "scenarios" / "x-to-y.yaml"
     path.parent.mkdir(parents=True)
@@ -1216,6 +1495,8 @@ target:
   organisation_units:
     discovery: linked_to_dataset
     mapping_strategy: {organisation_unit_mapping}
+    synchronization:
+      enabled: {str(organisation_unit_synchronization).lower()}
 mapping:
   data_elements: uid
   organisation_units: {organisation_unit_mapping}
@@ -1362,6 +1643,23 @@ class _HistoricalTarget:
             )
         }
         self.linked: list[dict] = []
+
+    def data_set_details(self, data_set_id: str) -> dict:
+        return {
+            "id": data_set_id,
+            "code": "CCH_WEEKLY",
+            "name": "Hospital service",
+            "shortName": "Hospital service",
+            "periodType": "Monthly",
+            "categoryCombo": {"id": "CatCombo001"},
+            "dataSetElements": [
+                {
+                    "dataSet": {"id": data_set_id},
+                    "dataElement": {"id": item["id"]},
+                }
+                for item in self.linked
+            ],
+        }
 
     def metadata_objects_by_ids(
         self,

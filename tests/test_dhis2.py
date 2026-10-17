@@ -40,6 +40,7 @@ class FakeHttp:
                 "id": "DataSet0001",
                 "code": "CCH_DAILY",
                 "name": "Climate Daily",
+                "shortName": "Climate Daily",
                 "periodType": "Daily",
                 "dataSetElements": [
                     {
@@ -97,6 +98,15 @@ class Dhis2Tests(unittest.TestCase):
 
         self.assertEqual(data_set.id, "DataSet0001")
         self.assertEqual(elements[0]["code"], "CCH_PRECIP")
+
+    def test_data_set_details_requests_required_update_identity(self) -> None:
+        http = FakeHttp()
+        client = DHIS2Client("https://dhis2.example.org", http=http)
+
+        details = client.data_set_details("DataSet0001")
+
+        self.assertEqual(details["shortName"], "Climate Daily")
+        self.assertIn("shortName", http.calls[-1][2]["fields"])
 
     def test_metadata_and_data_transfer_endpoints(self) -> None:
         http = FakeTransferHttp()

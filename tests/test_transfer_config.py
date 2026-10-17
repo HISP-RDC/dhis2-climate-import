@@ -120,6 +120,13 @@ target:
   organisation_units:
     discovery: linked_to_dataset
     mapping_strategy: uid
+    synchronization:
+      enabled: true
+      create_missing: true
+      require_same_identity: true
+      allow_root_creation: false
+      attach_to_target_data_set: true
+      preserve_geometry: true
 transfer:
   chunk_size: 100
 jobs:
@@ -139,6 +146,12 @@ jobs:
         self.assertTrue(scenario.metadata.reconcile_existing)
         self.assertEqual(job.period_type, "week")
         self.assertEqual(job.organisation_units.discovery, "linked_to_dataset")
+        self.assertTrue(job.organisation_units.synchronization.enabled)
+        self.assertTrue(job.organisation_units.synchronization.create_missing)
+        self.assertFalse(job.organisation_units.synchronization.allow_root_creation)
+        self.assertTrue(
+            job.organisation_units.synchronization.attach_to_target_data_set
+        )
         self.assertEqual(job.transfer.chunk_size, 100)
         self.assertEqual(job.transfer.source_period_batch_size, 13)
         self.assertEqual(job.transfer.execution.period_batch_size, 13)

@@ -96,6 +96,24 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   review hospital_service
 ```
 
+Si cette commande signale des unités d’organisation absentes sur Y, validez puis appliquez leur
+hiérarchie avant de relancer `review` :
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units hospital_service --dry-run
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units hospital_service --apply
+```
+
+La commande crée seulement les UID absents, dans l’ordre parent-enfant. Elle bloque si une unité
+existante possède un code, un nom ou un parent différent et ne déplace jamais une branche de Y.
+
 Validez d'abord les métadonnées puis les données avant le premier import réel :
 
 ```sh
@@ -186,10 +204,11 @@ The transfer workflow discovers every Data Element linked to a configured source
 validate an existing target Data Set or bootstrap a missing target from the official DHIS2 metadata
 dependency export before importing the data values.
 
-Every source organisation unit involved in the transfer must already exist on the target according
-to the configured `uid` or `code` mapping. Missing or ambiguous matches block the transfer before
-metadata creation; additional organisation units on the target are allowed. Target units are read
-in paginated batches and compared locally instead of issuing one API request per unit.
+Every source organisation unit involved in the transfer must exist on the target according to the
+configured `uid` or `code` mapping. Missing or ambiguous matches block the normal transfer. With UID
+mapping, the separate `reconcile-org-units` command can validate and create only missing units and
+their missing ancestors. It never moves or overwrites an existing target unit. Additional target
+units are allowed.
 
 Prepare profiles and a scenario:
 
@@ -208,6 +227,17 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
   review weekly_climate
+
+# Only when review reports missing organisation units:
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units weekly_climate --dry-run
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-org-units weekly_climate --apply
 
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --instances config/instances.yaml \

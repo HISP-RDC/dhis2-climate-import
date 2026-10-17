@@ -272,7 +272,8 @@ class DHIS2Client:
             f"/api/dataSets/{data_set_id}",
             params={
                 "fields": (
-                    "id,code,name,displayName,periodType,categoryCombo[id,code,name],"
+                    "id,code,name,shortName,displayName,periodType,"
+                    "categoryCombo[id,code,name],"
                     "dataSetElements[dataSet[id],categoryCombo[id],"
                     "dataElement[id,code,name,displayName,valueType,domainType,"
                     "aggregationType,periodType,categoryCombo[id,code,name],"

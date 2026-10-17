@@ -42,6 +42,15 @@ target:
     mapping_strategy: uid
     include_children: false
     batch_size: 40
+    synchronization:
+      # Explicitly run reconcile-org-units --dry-run, inspect the plan, then --apply.
+      # Existing units are never moved or overwritten.
+      enabled: true
+      create_missing: true
+      require_same_identity: true
+      allow_root_creation: false
+      attach_to_target_data_set: true
+      preserve_geometry: true
 
 mapping:
   data_elements: uid

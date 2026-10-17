@@ -7,6 +7,7 @@ from dhis2_climate_import.cli import (
     _check_transfer_instance,
     _format_http_error,
     build_parser,
+    cmd_transfer_reconcile_organisation_units,
     cmd_transfer_reconcile_metadata,
     cmd_transfer_repair_metadata,
     cmd_transfer_run_window,
@@ -148,8 +149,22 @@ class CliErrorFormattingTests(unittest.TestCase):
                 "window-1",
             ]
         )
+        organisation_units = build_parser().parse_args(
+            [
+                "transfer",
+                "--scenario",
+                "config/scenarios/x-to-y.yaml",
+                "reconcile-org-units",
+                "hospital_service",
+                "--dry-run",
+            ]
+        )
 
         self.assertIs(reconcile.func, cmd_transfer_reconcile_metadata)
+        self.assertIs(
+            organisation_units.func,
+            cmd_transfer_reconcile_organisation_units,
+        )
         self.assertIs(window.func, cmd_transfer_run_window)
 
 

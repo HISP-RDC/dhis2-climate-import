@@ -74,6 +74,437 @@ def review_transfer(
     return _review_payload(scenario, source, target, context)
 
 
+def reconcile_target_organisation_units(
+    scenario: TransferScenario,
+    source: DHIS2Client,
+    target: DHIS2Client,
+    *,
+    job_id: str,
+    apply: bool,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Create a missing source OU hierarchy on the target without moving existing OUs."""
+    job = scenario.get_job(job_id)
+    policy = job.organisation_units.synchronization
+    if not policy.enabled:
+        raise PipelineError(
+            "Organisation unit synchronization is disabled for this job. Enable "
+            "target.organisation_units.synchronization.enabled first."
+        )
+    if job.id_schemes.organisation_units != "uid":
+        raise PipelineError(
+            "Organisation unit synchronization requires UID mapping so hierarchy "
+            "identity can be preserved safely."
+        )
+
+    _emit_progress(
+        progress,
+        "organisation_units.reconcile.start",
+        job=job_id,
+        apply=apply,
+    )
+    source_data_set = source.resolve_data_set(job.source_data_set)
+    direct_source_units = tuple(_resolve_source_units(source, source_data_set, job))
+    if not direct_source_units:
+        raise PipelineError(
+            f"Source Data Set '{job.source_data_set}' has no organisation units to reconcile."
+        )
+
+    direct_source_ids = _metadata_keys(
+        direct_source_units,
+        "uid",
+        "source organisation units",
+    )
+    hierarchy_ids: set[str] = set()
+    path_errors: list[str] = []
+    for unit in direct_source_units:
+        uid = str(unit.get("id") or "")
+        path_ids = _organisation_unit_path_ids(unit)
+        if not path_ids or path_ids[-1] != uid:
+            path_errors.append(f"{uid or '<sans UID>'} has invalid path {unit.get('path')!r}")
+            continue
+        hierarchy_ids.update(path_ids)
+    if path_errors:
+        raise PipelineError(
+            "Source organisation unit hierarchy is incomplete: "
+            + "; ".join(path_errors[:10])
+        )
+
+    source_hierarchy = source.metadata_objects_by_ids(
+        resource="organisationUnits",
+        root_key="organisationUnits",
+        object_ids=sorted(hierarchy_ids),
+        fields=(
+            "id,code,name,shortName,description,openingDate,closedDate,comment,"
+            "geometry,parent[id],path,level"
+        ),
+        batch_size=job.organisation_units.batch_size,
+    )
+    source_by_uid = {
+        str(item["id"]): item for item in source_hierarchy if item.get("id")
+    }
+    unresolved_source_ids = sorted(hierarchy_ids - set(source_by_uid))
+    if unresolved_source_ids:
+        raise PipelineError(
+            "Could not read the complete source organisation unit hierarchy: "
+            + ", ".join(unresolved_source_ids[:10])
+        )
+
+    target_inventory = target.organisation_units(page_size=1000)
+    target_inventory_by_uid: dict[str, dict[str, Any]] = {}
+    duplicate_target_uids: set[str] = set()
+    target_by_code: dict[str, dict[str, Any]] = {}
+    duplicate_target_codes: set[str] = set()
+    for unit in target_inventory:
+        uid = str(unit.get("id") or "")
+        if uid:
+            if uid in target_inventory_by_uid:
+                duplicate_target_uids.add(uid)
+            else:
+                target_inventory_by_uid[uid] = unit
+        code = str(unit.get("code") or "")
+        if code:
+            if code in target_by_code and target_by_code[code].get("id") != uid:
+                duplicate_target_codes.add(code)
+            else:
+                target_by_code[code] = unit
+    target_root_ids = {
+        str(unit["id"])
+        for unit in target_inventory
+        if unit.get("id")
+        and (
+            unit.get("level") == 1
+            or len(_organisation_unit_path_ids(unit)) == 1
+        )
+    }
+
+    existing_hierarchy_ids = sorted(hierarchy_ids & set(target_inventory_by_uid))
+    target_hierarchy = target.metadata_objects_by_ids(
+        resource="organisationUnits",
+        root_key="organisationUnits",
+        object_ids=existing_hierarchy_ids,
+        fields="id,code,name,parent[id],path,level",
+        batch_size=job.organisation_units.batch_size,
+    )
+    target_by_uid = {
+        str(item["id"]): item for item in target_hierarchy if item.get("id")
+    }
+    for uid in existing_hierarchy_ids:
+        target_by_uid.setdefault(uid, target_inventory_by_uid[uid])
+
+    state_dir = scenario.job_state_dir(job.id)
+    current_run_id = run_id(f"organisation-units-{scenario.id}-{job.id}")
+    artifact_dir = state_dir / "runs" / current_run_id / "organisation-units"
+    source_path = _write_json(
+        artifact_dir / "source.json",
+        {
+            "dataSet": asdict(source_data_set),
+            "directOrganisationUnitIds": sorted(direct_source_ids),
+            "hierarchy": source_hierarchy,
+        },
+    )
+    target_snapshot_path = _write_json(
+        artifact_dir / "target-before.json",
+        {
+            "matchingHierarchy": [target_by_uid[uid] for uid in sorted(target_by_uid)],
+            "duplicateUids": sorted(duplicate_target_uids),
+            "duplicateCodes": sorted(duplicate_target_codes),
+        },
+    )
+
+    blocked: list[str] = []
+    if duplicate_target_uids:
+        blocked.append(
+            "duplicate target UIDs: " + ", ".join(sorted(duplicate_target_uids)[:10])
+        )
+    source_codes = {
+        str(item.get("code"))
+        for item in source_hierarchy
+        if item.get("code")
+    }
+    relevant_duplicate_codes = sorted(source_codes & duplicate_target_codes)
+    if relevant_duplicate_codes:
+        blocked.append(
+            "duplicate target codes used by source hierarchy: "
+            + ", ".join(relevant_duplicate_codes[:10])
+        )
+
+    ordered_source_ids = sorted(
+        hierarchy_ids,
+        key=lambda uid: (
+            len(_organisation_unit_path_ids(source_by_uid[uid])),
+            str(source_by_uid[uid].get("path") or ""),
+            uid,
+        ),
+    )
+    source_parents: dict[str, str | None] = {}
+    for uid in ordered_source_ids:
+        source_unit = source_by_uid[uid]
+        path_ids = _organisation_unit_path_ids(source_unit)
+        if not path_ids or path_ids[-1] != uid:
+            blocked.append(f"source OU {uid} has invalid path {source_unit.get('path')!r}")
+            continue
+        expected_parent = path_ids[-2] if len(path_ids) > 1 else None
+        explicit_parent = _reference_uid(source_unit.get("parent"))
+        if explicit_parent and explicit_parent != expected_parent:
+            blocked.append(
+                f"source OU {uid} parent/path mismatch: parent={explicit_parent}, "
+                f"pathParent={expected_parent}"
+            )
+        source_parents[uid] = expected_parent
+        if expected_parent and expected_parent not in source_by_uid:
+            blocked.append(f"source OU {uid} parent {expected_parent} was not retrieved")
+
+        target_unit = target_by_uid.get(uid)
+        source_code = str(source_unit.get("code") or "")
+        if source_code:
+            code_match = target_by_code.get(source_code)
+            if code_match and str(code_match.get("id") or "") != uid:
+                blocked.append(
+                    f"source OU {uid} code {source_code!r} is already used on target by "
+                    f"UID {code_match.get('id')}"
+                )
+        if target_unit is None:
+            if expected_parent is None:
+                if not policy.allow_root_creation:
+                    blocked.append(
+                        f"source root OU {uid} is missing on target while "
+                        "allow_root_creation=false"
+                    )
+                elif target_root_ids:
+                    blocked.append(
+                        f"source root OU {uid} cannot be created because target already has "
+                        f"root(s): {', '.join(sorted(target_root_ids)[:10])}"
+                    )
+            continue
+
+        if policy.require_same_identity:
+            for field in ("code", "name"):
+                source_value = source_unit.get(field)
+                target_value = target_unit.get(field)
+                if source_value and source_value != target_value:
+                    blocked.append(
+                        f"OU {uid} {field}: source={source_value!r}, target={target_value!r}"
+                    )
+        target_parent = _organisation_unit_parent_uid(target_unit)
+        if target_parent != expected_parent:
+            blocked.append(
+                f"OU {uid} parent: source={expected_parent}, target={target_parent}"
+            )
+
+    missing_ids = [uid for uid in ordered_source_ids if uid not in target_by_uid]
+    if missing_ids and not policy.create_missing:
+        blocked.append(
+            f"{len(missing_ids)} organisation units are missing while create_missing=false"
+        )
+
+    target_data_set = target.find_data_set(job.target_data_set)
+    if (
+        target_data_set is None
+        and scenario.metadata.identity_strategy == "preserve_uid"
+        and job.target_data_set != source_data_set.id
+    ):
+        target_data_set = target.find_data_set(source_data_set.id)
+    target_data_set_details = _target_data_set_details(
+        target,
+        target_data_set.id if target_data_set else None,
+    )
+    existing_assignments = {
+        uid
+        for uid in _reference_ids(
+            (target_data_set_details or {}).get("organisationUnits")
+        )
+    }
+    assignments_to_add: list[str] = []
+    data_set_package: list[dict[str, Any]] = []
+    if policy.attach_to_target_data_set and target_data_set is not None:
+        assignments_to_add = sorted(direct_source_ids - existing_assignments)
+        if assignments_to_add:
+            data_set_update = _target_data_set_identity_payload(
+                target_data_set_details,
+                target_data_set.id,
+            )
+            data_set_update["organisationUnits"] = [
+                {"id": uid}
+                for uid in sorted(existing_assignments | direct_source_ids)
+            ]
+            data_set_package = [data_set_update]
+
+    organisation_units_package = [
+        _organisation_unit_create_payload(
+            source_by_uid[uid],
+            parent_uid=source_parents.get(uid),
+            preserve_geometry=policy.preserve_geometry,
+        )
+        for uid in missing_ids
+    ]
+    package: dict[str, Any] = {}
+    if organisation_units_package:
+        package["organisationUnits"] = organisation_units_package
+    if data_set_package:
+        package["dataSets"] = data_set_package
+
+    plan = {
+        "scenario": scenario.id,
+        "job": job.id,
+        "dryRun": not apply,
+        "sourceDataSet": asdict(source_data_set),
+        "targetDataSet": asdict(target_data_set) if target_data_set else None,
+        "directSourceOrganisationUnits": len(direct_source_ids),
+        "hierarchyOrganisationUnits": len(hierarchy_ids),
+        "existingHierarchyOrganisationUnits": len(target_by_uid),
+        "targetRootOrganisationUnits": sorted(target_root_ids),
+        "missingDirectOrganisationUnits": sorted(direct_source_ids - set(target_by_uid)),
+        "organisationUnitsToCreate": missing_ids,
+        "dataSetAssignmentsToAdd": assignments_to_add,
+        "dataSetAssignmentPendingMetadataCreation": bool(
+            policy.attach_to_target_data_set and target_data_set is None
+        ),
+        "blocked": blocked,
+        "sourceArtifact": str(source_path),
+        "targetSnapshotArtifact": str(target_snapshot_path),
+    }
+    plan["requiresChanges"] = bool(package)
+    plan_path = _write_json(artifact_dir / "plan.json", plan)
+    package_path = _write_json(artifact_dir / "package.json", package)
+    _emit_progress(
+        progress,
+        "organisation_units.reconcile.plan",
+        hierarchy=len(hierarchy_ids),
+        create=len(missing_ids),
+        attach=len(assignments_to_add),
+        blocked=len(blocked),
+    )
+    if blocked:
+        blocked_path = _write_json(artifact_dir / "blocked.json", {"blocked": blocked})
+        raise PipelineError(
+            "Organisation unit synchronization blocked: "
+            + "; ".join(blocked[:10])
+            + f". Audit: {blocked_path}"
+        )
+
+    validation: dict[str, Any] | None = None
+    commit: dict[str, Any] | None = None
+    if package:
+        _emit_progress(
+            progress,
+            "organisation_units.validation.start",
+            create=len(missing_ids),
+            attach=len(assignments_to_add),
+        )
+        validation = target.import_metadata(
+            package,
+            commit=False,
+            import_strategy="CREATE_AND_UPDATE" if data_set_package else "CREATE",
+            atomic_mode="ALL",
+            identifier="UID",
+            skip_sharing=scenario.metadata.skip_sharing,
+        )
+        _assert_success_response(validation, "Organisation unit hierarchy validation")
+        _emit_progress(progress, "organisation_units.validation.done")
+        if apply:
+            _emit_progress(progress, "organisation_units.commit.start")
+            commit = target.import_metadata(
+                package,
+                commit=True,
+                import_strategy="CREATE_AND_UPDATE" if data_set_package else "CREATE",
+                atomic_mode="ALL",
+                identifier="UID",
+                skip_sharing=scenario.metadata.skip_sharing,
+            )
+            _assert_success_response(commit, "Organisation unit hierarchy import")
+            _emit_progress(progress, "organisation_units.commit.done")
+
+    _write_json(artifact_dir / "validation.json", validation or {})
+    _write_json(artifact_dir / "commit.json", commit or {})
+    status = "already_aligned" if not package else ("created" if apply else "validated")
+    if apply and package:
+        verification_conflicts: list[str] = []
+        if missing_ids:
+            verified_units = target.metadata_objects_by_ids(
+                resource="organisationUnits",
+                root_key="organisationUnits",
+                object_ids=missing_ids,
+                fields="id,code,name,parent[id],path,level",
+                batch_size=job.organisation_units.batch_size,
+            )
+            verified_by_uid = {
+                str(item["id"]): item for item in verified_units if item.get("id")
+            }
+            missing_after_commit = sorted(set(missing_ids) - set(verified_by_uid))
+            if missing_after_commit:
+                verification_conflicts.append(
+                    "missing after import: " + ", ".join(missing_after_commit[:10])
+                )
+            for uid in sorted(set(missing_ids) & set(verified_by_uid)):
+                source_unit = source_by_uid[uid]
+                target_unit = verified_by_uid[uid]
+                for field in ("code", "name"):
+                    if source_unit.get(field) != target_unit.get(field):
+                        verification_conflicts.append(
+                            f"OU {uid} {field} differs after import"
+                        )
+                if _organisation_unit_parent_uid(target_unit) != source_parents.get(uid):
+                    verification_conflicts.append(f"OU {uid} parent differs after import")
+        if assignments_to_add and target_data_set is not None:
+            verified_data_set = _target_data_set_details(target, target_data_set.id) or {}
+            verified_assignments = set(
+                _reference_ids(verified_data_set.get("organisationUnits"))
+            )
+            missing_assignments = sorted(set(assignments_to_add) - verified_assignments)
+            if missing_assignments:
+                verification_conflicts.append(
+                    "target Data Set assignments missing: "
+                    + ", ".join(missing_assignments[:10])
+                )
+        verification_path = _write_json(
+            artifact_dir / "verification.json",
+            {
+                "status": "ERROR" if verification_conflicts else "OK",
+                "conflicts": verification_conflicts,
+                "createdOrganisationUnits": missing_ids,
+                "dataSetAssignments": assignments_to_add,
+            },
+        )
+        if verification_conflicts:
+            raise PipelineError(
+                "Organisation unit verification failed: "
+                + "; ".join(verification_conflicts[:10])
+                + f". Audit: {verification_path}"
+            )
+        _emit_progress(
+            progress,
+            "organisation_units.verify.done",
+            created=len(missing_ids),
+            attached=len(assignments_to_add),
+        )
+
+    report = {
+        **plan,
+        "runId": current_run_id,
+        "status": status,
+        "validated": validation is not None or not package,
+        "committed": commit is not None,
+        "planArtifact": str(plan_path),
+        "packageArtifact": str(package_path),
+        "validationArtifact": str(artifact_dir / "validation.json"),
+        "commitArtifact": str(artifact_dir / "commit.json"),
+        "verificationArtifact": (
+            str(artifact_dir / "verification.json") if apply and package else None
+        ),
+    }
+    report_path = write_report(state_dir, current_run_id, report)
+    report["reportPath"] = str(report_path)
+    _emit_progress(
+        progress,
+        "organisation_units.reconcile.done",
+        status=status,
+        created=len(missing_ids) if apply else 0,
+        attached=len(assignments_to_add) if apply else 0,
+    )
+    return report
+
+
 def run_transfer(
     scenario: TransferScenario,
     source: DHIS2Client,
@@ -1073,8 +1504,12 @@ def _data_set_membership_package(
     data_set_id: str,
     data_element_ids: set[str],
 ) -> dict[str, Any]:
-    """Build an additive Data Set update while preserving existing DSE fields."""
-    details = _target_data_set_details(target, data_set_id) or {}
+    """Build an additive, valid Data Set update from the target's own identity."""
+    details = _target_data_set_details(target, data_set_id)
+    if details is None:
+        raise PipelineError(
+            f"Cannot update target Data Set {data_set_id}: its metadata could not be read."
+        )
     existing = details.get("dataSetElements")
     memberships: dict[str, dict[str, Any]] = {}
     if isinstance(existing, list):
@@ -1096,17 +1531,49 @@ def _data_set_membership_package(
                 "dataElement": {"id": element_id},
             },
         )
-    return {
-        "dataSets": [
-            {
-                "id": data_set_id,
-                "dataSetElements": [
-                    memberships[element_id]
-                    for element_id in sorted(memberships)
-                ],
-            }
-        ]
+    data_set_payload = _target_data_set_identity_payload(details, data_set_id)
+    data_set_payload["dataSetElements"] = [
+        memberships[element_id]
+        for element_id in sorted(memberships)
+    ]
+    return {"dataSets": [data_set_payload]}
+
+
+def _target_data_set_identity_payload(
+    details: dict[str, Any] | None,
+    data_set_id: str,
+) -> dict[str, Any]:
+    """Copy only the target identity fields required for a safe metadata update."""
+    if details is None:
+        raise PipelineError(
+            f"Cannot update target Data Set {data_set_id}: its metadata could not be read."
+        )
+    returned_id = str(details.get("id") or data_set_id)
+    if returned_id != data_set_id:
+        raise PipelineError(
+            f"Target Data Set lookup returned UID {returned_id}, expected {data_set_id}."
+        )
+    required_identity = ("name", "shortName", "periodType")
+    missing_identity = [
+        field for field in required_identity if not details.get(field)
+    ]
+    if missing_identity:
+        raise PipelineError(
+            f"Cannot update target Data Set {data_set_id}: required target properties are "
+            f"missing: {', '.join(missing_identity)}."
+        )
+    payload: dict[str, Any] = {
+        "id": data_set_id,
+        "name": details["name"],
+        "shortName": details["shortName"],
+        "periodType": details["periodType"],
     }
+    if details.get("code"):
+        payload["code"] = details["code"]
+    category_combo_id = _reference_uid(details.get("categoryCombo"))
+    if category_combo_id:
+        payload["categoryCombo"] = {"id": category_combo_id}
+    return payload
 
 
 def resolve_transfer_context(
@@ -1311,6 +1778,52 @@ def _resolve_source_units(
     if policy.discovery == "configured_roots":
         return [source.resolve_organisation_unit(item) for item in policy.source_roots]
     return source.organisation_units_for_data_set(data_set.id)
+
+
+def _organisation_unit_path_ids(unit: dict[str, Any]) -> list[str]:
+    path = unit.get("path")
+    if not isinstance(path, str):
+        return []
+    return [part for part in path.split("/") if part]
+
+
+def _organisation_unit_parent_uid(unit: dict[str, Any]) -> str | None:
+    explicit = _reference_uid(unit.get("parent"))
+    if explicit:
+        return explicit
+    path_ids = _organisation_unit_path_ids(unit)
+    return path_ids[-2] if len(path_ids) > 1 else None
+
+
+def _organisation_unit_create_payload(
+    source: dict[str, Any],
+    *,
+    parent_uid: str | None,
+    preserve_geometry: bool,
+) -> dict[str, Any]:
+    uid = str(source.get("id") or "")
+    name = str(source.get("name") or "")
+    if not uid or not name:
+        raise PipelineError("A source organisation unit is missing its UID or name.")
+    payload: dict[str, Any] = {
+        "id": uid,
+        "name": name,
+        "shortName": str(source.get("shortName") or _limited_text(name, 50)),
+        "openingDate": source.get("openingDate") or "1970-01-01",
+    }
+    for field in (
+        "code",
+        "description",
+        "closedDate",
+        "comment",
+    ):
+        if source.get(field) not in {None, ""}:
+            payload[field] = source[field]
+    if preserve_geometry and isinstance(source.get("geometry"), dict):
+        payload["geometry"] = deepcopy(source["geometry"])
+    if parent_uid:
+        payload["parent"] = {"id": parent_uid}
+    return payload
 
 
 def _resolve_target_units(
@@ -2616,6 +3129,10 @@ def _version_unmappable_historical_values(
     _write_json(artifact_dir / "plan.json", plan)
     validations: list[dict[str, Any]] = []
     commits: list[dict[str, Any]] = []
+    validation_path = artifact_dir / "validation.json"
+    commit_path = artifact_dir / "commit.json"
+    _write_json(validation_path, validations)
+    _write_json(commit_path, commits)
 
     with exclusive_lock(
         scenario.state_dir / "locks" / "metadata.lock",
@@ -2639,6 +3156,7 @@ def _version_unmappable_historical_values(
             )
             _assert_success_response(validation, "Historical metadata validation")
             validations.append({"stage": "create", "response": validation})
+            _write_json(validation_path, validations)
             if apply:
                 commit = target.import_metadata(
                     non_empty_package,
@@ -2650,6 +3168,7 @@ def _version_unmappable_historical_values(
                 )
                 _assert_success_response(commit, "Historical metadata creation")
                 commits.append({"stage": "create", "response": commit})
+                _write_json(commit_path, commits)
 
         if missing_memberships:
             membership_package = _data_set_membership_package(
@@ -2671,6 +3190,7 @@ def _version_unmappable_historical_values(
                     validation, "Historical Data Set membership validation"
                 )
                 validations.append({"stage": "attach", "response": validation})
+                _write_json(validation_path, validations)
                 if apply:
                     commit = target.import_metadata(
                         membership_package,
@@ -2684,11 +3204,10 @@ def _version_unmappable_historical_values(
                         commit, "Historical Data Set membership update"
                     )
                     commits.append({"stage": "attach", "response": commit})
+                    _write_json(commit_path, commits)
             else:
                 plan["membershipValidationPendingCreateCommit"] = True
 
-    _write_json(artifact_dir / "validation.json", validations)
-    _write_json(artifact_dir / "commit.json", commits)
     pending = bool((non_empty_package or missing_memberships) and not apply)
     if pending:
         report.update(
@@ -2741,7 +3260,7 @@ def _version_unmappable_historical_values(
             "validationPendingMetadataCommit": False,
             "planArtifact": str(artifact_dir / "plan.json"),
             "validationArtifact": str(artifact_dir / "validation.json"),
-            "commitArtifact": str(artifact_dir / "commit.json"),
+            "commitArtifact": str(commit_path),
             "exactEquivalentValueCount": exact_equivalents,
         }
     )

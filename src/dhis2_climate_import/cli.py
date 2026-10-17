@@ -31,6 +31,7 @@ from .pipeline import aggregate_job, import_job, review_import, run_monthly_impo
 from .reports import run_id, write_report
 from .locks import exclusive_lock
 from .transfer import (
+    reconcile_target_organisation_units,
     reconcile_target_metadata,
     repair_target_metadata,
     review_transfer,
@@ -188,6 +189,23 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_mode.add_argument("--dry-run", action="store_true")
     reconcile_mode.add_argument("--apply", action="store_true")
     transfer_reconcile.set_defaults(func=cmd_transfer_reconcile_metadata)
+
+    transfer_reconcile_org_units = transfer_commands.add_parser(
+        "reconcile-org-units",
+        help=(
+            "Plan or create missing target organisation units with their source "
+            "parent hierarchy."
+        ),
+    )
+    transfer_reconcile_org_units.add_argument("job_id")
+    reconcile_org_units_mode = (
+        transfer_reconcile_org_units.add_mutually_exclusive_group(required=True)
+    )
+    reconcile_org_units_mode.add_argument("--dry-run", action="store_true")
+    reconcile_org_units_mode.add_argument("--apply", action="store_true")
+    transfer_reconcile_org_units.set_defaults(
+        func=cmd_transfer_reconcile_organisation_units
+    )
 
     transfer_run = transfer_commands.add_parser(
         "run", help="Validate or apply a DHIS2-to-DHIS2 transfer."
@@ -730,6 +748,26 @@ def cmd_transfer_reconcile_metadata(args: argparse.Namespace) -> None:
     _print_json(result)
 
 
+def cmd_transfer_reconcile_organisation_units(args: argparse.Namespace) -> None:
+    _env, scenario, source, target = _transfer_runtime(
+        args, progress=_transfer_progress
+    )
+    with exclusive_lock(
+        scenario.state_dir / "locks" / "metadata.lock",
+        purpose=f"organisation units for {scenario.id}/{args.job_id}",
+        transient_when_busy=True,
+    ):
+        result = reconcile_target_organisation_units(
+            scenario,
+            source,
+            target,
+            job_id=args.job_id,
+            apply=args.apply,
+            progress=_transfer_progress,
+        )
+    _print_json(result)
+
+
 def cmd_transfer_repair_metadata(args: argparse.Namespace) -> None:
     _env, scenario, source, target = _transfer_runtime(args)
     result = repair_target_metadata(
@@ -1015,6 +1053,28 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "metadata.reconcile.lock.wait": "Attente du verrou des métadonnées cible",
         "metadata.reconcile.start": "Synchronisation des métadonnées démarrée",
         "metadata.reconcile.done": "Synchronisation des métadonnées terminée",
+        "organisation_units.reconcile.start": (
+            "Audit de la hiérarchie des unités d’organisation"
+        ),
+        "organisation_units.reconcile.plan": (
+            "Plan de synchronisation des unités d’organisation préparé"
+        ),
+        "organisation_units.validation.start": (
+            "Validation de la hiérarchie cible"
+        ),
+        "organisation_units.validation.done": "Hiérarchie cible validée",
+        "organisation_units.commit.start": (
+            "Création des unités d’organisation manquantes"
+        ),
+        "organisation_units.commit.done": (
+            "Unités d’organisation manquantes créées"
+        ),
+        "organisation_units.verify.done": (
+            "Hiérarchie et affectations vérifiées après création"
+        ),
+        "organisation_units.reconcile.done": (
+            "Synchronisation des unités d’organisation terminée"
+        ),
         "historical_data_elements.audit.start": (
             "Audit des Data Elements historiques"
         ),
