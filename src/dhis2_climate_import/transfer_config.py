@@ -101,6 +101,27 @@ class InstanceRegistry:
 
 
 @dataclass(frozen=True)
+class HistoricalDataElementPolicy:
+    enabled: bool = True
+    strategy: str = "versioned"
+    name_suffix: str = " — Historique"
+
+
+@dataclass(frozen=True)
+class MetadataSynchronizationPolicy:
+    enabled: bool = True
+    create_missing_objects: bool = True
+    attach_compatible_data_elements: bool = True
+    incompatible_policy: str = "safe_repair"
+    require_no_data_values: bool = True
+    require_no_other_dataset_memberships: bool = True
+    require_same_identity: bool = True
+    historical_data_elements: HistoricalDataElementPolicy = (
+        HistoricalDataElementPolicy()
+    )
+
+
+@dataclass(frozen=True)
 class MetadataPolicy:
     mode: str = "require_existing"
     identity_strategy: str = "preserve_uid"
@@ -108,6 +129,7 @@ class MetadataPolicy:
     skip_sharing: bool = True
     import_strategy: str = "CREATE"
     atomic_mode: str = "ALL"
+    synchronization: MetadataSynchronizationPolicy = MetadataSynchronizationPolicy()
 
 
 @dataclass(frozen=True)
@@ -138,6 +160,21 @@ class IdSchemePolicy:
 
 
 @dataclass(frozen=True)
+class RetryPolicy:
+    attempts: int = 5
+    initial_delay_seconds: float = 5.0
+    max_delay_seconds: float = 120.0
+
+
+@dataclass(frozen=True)
+class WindowExecutionPolicy:
+    period_batch_size: int = 1
+    process_isolation: bool = True
+    resume: bool = True
+    stop_on_error: bool = True
+
+
+@dataclass(frozen=True)
 class TransferSettings:
     import_strategy: str = "CREATE_AND_UPDATE"
     chunk_size: int = 5000
@@ -145,6 +182,8 @@ class TransferSettings:
     preheat_cache: bool = True
     include_deleted: bool = False
     preserve_comments: bool = True
+    retry: RetryPolicy = RetryPolicy()
+    execution: WindowExecutionPolicy = WindowExecutionPolicy()
 
 
 @dataclass(frozen=True)
@@ -170,6 +209,7 @@ class TransferScenario:
     target_instance: str
     metadata: MetadataPolicy
     state_directory: str
+    max_parallel_jobs: int
     jobs: tuple[TransferJobConfig, ...]
 
     @property
@@ -182,6 +222,10 @@ class TransferScenario:
     @property
     def state_dir(self) -> Path:
         return self.project_root / self.state_directory / self.target_instance / self.id
+
+    def job_state_dir(self, job_id: str) -> Path:
+        _validate_safe_id(job_id, "transfer job")
+        return self.state_dir / "jobs" / job_id
 
     def get_job(self, job_id: str) -> TransferJobConfig:
         for job in self.jobs:
@@ -261,6 +305,29 @@ def load_transfer_scenario(path: str | Path) -> TransferScenario:
     if identity_strategy != "preserve_uid":
         raise PipelineError("Only target.metadata.identity_strategy=preserve_uid is supported.")
     metadata_import_raw = _mapping(metadata_raw.get("import", {}), "target.metadata.import")
+    synchronization_raw = _mapping(
+        metadata_raw.get("synchronization", {}),
+        "target.metadata.synchronization",
+    )
+    incompatible_raw = _mapping(
+        synchronization_raw.get("incompatible", {}),
+        "target.metadata.synchronization.incompatible",
+    )
+    historical_raw = _mapping(
+        synchronization_raw.get("historical_data_elements", {}),
+        "target.metadata.synchronization.historical_data_elements",
+    )
+    incompatible_policy = str(incompatible_raw.get("policy", "safe_repair")).lower()
+    if incompatible_policy not in {"block", "safe_repair"}:
+        raise PipelineError(
+            "target.metadata.synchronization.incompatible.policy must be block or "
+            "safe_repair."
+        )
+    historical_strategy = str(historical_raw.get("strategy", "versioned")).lower()
+    if historical_strategy != "versioned":
+        raise PipelineError(
+            "Only historical_data_elements.strategy=versioned is supported."
+        )
     metadata = MetadataPolicy(
         mode=metadata_mode,
         identity_strategy=identity_strategy,
@@ -268,7 +335,44 @@ def load_transfer_scenario(path: str | Path) -> TransferScenario:
         skip_sharing=_boolean(metadata_raw.get("skip_sharing", True)),
         import_strategy=str(metadata_import_raw.get("strategy", "CREATE")).upper(),
         atomic_mode="ALL" if _boolean(metadata_import_raw.get("atomic", True)) else "NONE",
+        synchronization=MetadataSynchronizationPolicy(
+            enabled=_boolean(synchronization_raw.get("enabled", True)),
+            create_missing_objects=_boolean(
+                synchronization_raw.get("create_missing_objects", True)
+            ),
+            attach_compatible_data_elements=_boolean(
+                synchronization_raw.get("attach_compatible_data_elements", True)
+            ),
+            incompatible_policy=incompatible_policy,
+            require_no_data_values=_boolean(
+                incompatible_raw.get("require_no_data_values", True)
+            ),
+            require_no_other_dataset_memberships=_boolean(
+                incompatible_raw.get("require_no_other_dataset_memberships", True)
+            ),
+            require_same_identity=_boolean(
+                incompatible_raw.get("require_same_identity", True)
+            ),
+            historical_data_elements=HistoricalDataElementPolicy(
+                enabled=_boolean(historical_raw.get("enabled", True)),
+                strategy=historical_strategy,
+                name_suffix=str(
+                    historical_raw.get("name_suffix", " — Historique")
+                ),
+            ),
+        ),
     )
+    if metadata.synchronization.incompatible_policy == "safe_repair" and not all(
+        (
+            metadata.synchronization.require_no_data_values,
+            metadata.synchronization.require_no_other_dataset_memberships,
+            metadata.synchronization.require_same_identity,
+        )
+    ):
+        raise PipelineError(
+            "safe_repair requires require_no_data_values, "
+            "require_no_other_dataset_memberships and require_same_identity to remain true."
+        )
     if metadata.import_strategy not in {"CREATE", "CREATE_AND_UPDATE"}:
         raise PipelineError(
             "target.metadata.import.strategy must be CREATE or CREATE_AND_UPDATE."
@@ -298,6 +402,7 @@ def load_transfer_scenario(path: str | Path) -> TransferScenario:
     state_directory = str(state_raw.get("directory", "state"))
     if Path(state_directory).is_absolute() or ".." in Path(state_directory).parts:
         raise PipelineError("state.directory must be a safe relative path.")
+    execution_raw = _mapping(root.get("execution", {}), "execution")
     return TransferScenario(
         path=config_path,
         id=scenario_id,
@@ -305,6 +410,10 @@ def load_transfer_scenario(path: str | Path) -> TransferScenario:
         target_instance=target_instance,
         metadata=metadata,
         state_directory=state_directory,
+        max_parallel_jobs=_positive_int(
+            execution_raw.get("max_parallel_jobs", 1),
+            "execution.max_parallel_jobs",
+        ),
         jobs=jobs,
     )
 
@@ -366,9 +475,21 @@ def _parse_job(
         ),
     )
 
-    transfer_raw = {
-        **default_transfer,
-        **_mapping(raw.get("transfer", {}), f"jobs.{job_id}.transfer"),
+    job_transfer_raw = _mapping(raw.get("transfer", {}), f"jobs.{job_id}.transfer")
+    transfer_raw = {**default_transfer, **job_transfer_raw}
+    retry_raw = {
+        **_mapping(default_transfer.get("retry", {}), "transfer.retry"),
+        **_mapping(
+            job_transfer_raw.get("retry", {}),
+            f"jobs.{job_id}.transfer.retry",
+        ),
+    }
+    execution_raw = {
+        **_mapping(default_transfer.get("execution", {}), "transfer.execution"),
+        **_mapping(
+            job_transfer_raw.get("execution", {}),
+            f"jobs.{job_id}.transfer.execution",
+        ),
     }
     transfer = TransferSettings(
         import_strategy=str(transfer_raw.get("import_strategy", "CREATE_AND_UPDATE")).upper(),
@@ -383,7 +504,40 @@ def _parse_job(
         preheat_cache=_boolean(transfer_raw.get("preheat_cache", True)),
         include_deleted=_boolean(transfer_raw.get("include_deleted", False)),
         preserve_comments=_boolean(transfer_raw.get("preserve_comments", True)),
+        retry=RetryPolicy(
+            attempts=_positive_int(
+                retry_raw.get("attempts", 5),
+                f"jobs.{job_id}.transfer.retry.attempts",
+            ),
+            initial_delay_seconds=_positive_float(
+                retry_raw.get("initial_delay_seconds", 5),
+                f"jobs.{job_id}.transfer.retry.initial_delay_seconds",
+            ),
+            max_delay_seconds=_positive_float(
+                retry_raw.get("max_delay_seconds", 120),
+                f"jobs.{job_id}.transfer.retry.max_delay_seconds",
+            ),
+        ),
+        execution=WindowExecutionPolicy(
+            period_batch_size=_positive_int(
+                execution_raw.get(
+                    "period_batch_size",
+                    _default_execution_period_batch_size(period_type),
+                ),
+                f"jobs.{job_id}.transfer.execution.period_batch_size",
+            ),
+            process_isolation=_boolean(
+                execution_raw.get("process_isolation", True)
+            ),
+            resume=_boolean(execution_raw.get("resume", True)),
+            stop_on_error=_boolean(execution_raw.get("stop_on_error", True)),
+        ),
     )
+    if transfer.retry.max_delay_seconds < transfer.retry.initial_delay_seconds:
+        raise PipelineError(
+            f"jobs.{job_id}.transfer.retry.max_delay_seconds must be greater than or "
+            "equal to initial_delay_seconds."
+        )
     if transfer.import_strategy not in {"CREATE", "UPDATE", "CREATE_AND_UPDATE"}:
         raise PipelineError(
             f"jobs.{job_id}.transfer.import_strategy must be CREATE, UPDATE or "
@@ -459,6 +613,25 @@ def _positive_int(value: Any, label: str) -> int:
     if result <= 0:
         raise PipelineError(f"Configuration field '{label}' must be greater than zero.")
     return result
+
+
+def _positive_float(value: Any, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PipelineError(f"Configuration field '{label}' must be a number.") from exc
+    if result <= 0:
+        raise PipelineError(f"Configuration field '{label}' must be greater than zero.")
+    return result
+
+
+def _default_execution_period_batch_size(period_type: str) -> int:
+    return {
+        "day": 31,
+        "week": 13,
+        "month": 3,
+        "year": 1,
+    }[period_type]
 
 
 def _normalise_period_type(value: str) -> str:

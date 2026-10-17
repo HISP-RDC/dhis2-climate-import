@@ -1,0 +1,11 @@
+[Unit]
+Description=Planification du transfert DHIS2 — job %i
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 Africa/Kinshasa
+Persistent=true
+RandomizedDelaySec=10m
+Unit=dhis2-transfer@%i.service
+
+[Install]
+WantedBy=timers.target

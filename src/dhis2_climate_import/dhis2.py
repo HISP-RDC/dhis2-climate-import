@@ -273,7 +273,8 @@ class DHIS2Client:
             params={
                 "fields": (
                     "id,code,name,displayName,periodType,categoryCombo[id,code,name],"
-                    "dataSetElements[dataElement[id,code,name,displayName,valueType,domainType,"
+                    "dataSetElements[dataSet[id],categoryCombo[id],"
+                    "dataElement[id,code,name,displayName,valueType,domainType,"
                     "aggregationType,periodType,categoryCombo[id,code,name],"
                     "optionSet[id,code,name]]],"
                     "organisationUnits[id,code,name,path,level]"

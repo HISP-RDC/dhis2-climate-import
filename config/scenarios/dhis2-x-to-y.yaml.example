@@ -18,6 +18,19 @@ target:
     import:
       strategy: CREATE
       atomic: true
+    synchronization:
+      enabled: true
+      create_missing_objects: true
+      attach_compatible_data_elements: true
+      incompatible:
+        policy: safe_repair
+        require_no_data_values: true
+        require_no_other_dataset_memberships: true
+        require_same_identity: true
+      historical_data_elements:
+        enabled: true
+        strategy: versioned
+        name_suffix: " — Historique"
 
   organisation_units:
     # Uses the organisation units assigned to the source Data Set. Use
@@ -43,6 +56,19 @@ transfer:
   preheat_cache: true
   include_deleted: false
   preserve_comments: true
+  retry:
+    attempts: 5
+    initial_delay_seconds: 5
+    max_delay_seconds: 120
+  execution:
+    # period_batch_size defaults to 31 days, 13 weeks, 3 months or 1 year
+    # and may be overridden per job.
+    process_isolation: true
+    resume: true
+    stop_on_error: true
+
+execution:
+  max_parallel_jobs: 1
 
 state:
   directory: state

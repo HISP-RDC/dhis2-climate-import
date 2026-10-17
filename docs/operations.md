@@ -266,6 +266,21 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   run weekly_climate --dry-run
 ```
 
+If this reports `metadata_changes_required`, inspect and apply the dedicated metadata plan before
+exporting the large value range:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-metadata hospital_service --dry-run
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-metadata hospital_service --apply
+```
+
 If the target Data Set is missing, this validates the metadata package but reports that data-value
 validation is pending the metadata commit. Apply only after reviewing the generated report:
 
@@ -277,8 +292,8 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
 ```
 
 The apply workflow creates missing metadata atomically, refreshes the target cache, dry-runs every
-data-value chunk, and writes the values only if no conflicts were reported. Generated state is kept in
-`state/<target-profile>/<scenario>/` and is ignored by Git.
+data-value chunk, and writes the values only if no conflicts were reported. Generated state is kept
+in `state/<target-profile>/<scenario>/jobs/<job>/` and is ignored by Git.
 
 For large Data Sets, source export is two-dimensional: organisation-unit batches and DHIS2-period
 batches. A monthly job defaults to one month per request. You can make the setting explicit per job:
@@ -289,7 +304,21 @@ jobs:
     # ...
     transfer:
       source_period_batch_size: 1
+      execution:
+        period_batch_size: 3
+        process_isolation: true
+        resume: true
+        stop_on_error: true
 ```
+
+`source_period_batch_size` limits one HTTP request. `execution.period_batch_size` limits the whole
+in-memory export/validation/import unit. The parent starts a new process for each execution window,
+records its result in `state/<target>/<scenario>/jobs/<job>/journal.sqlite3`, then releases all of
+that child's memory. On restart, successful windows are skipped automatically.
+
+Transient failures (timeouts, resets, 429, 502/503/504 and common Cloudflare gateway errors) use
+the configured retry policy and exit as `75` after exhaustion. Configuration, permissions and
+metadata incompatibilities exit as `2` without blind retries.
 
 Every source request is logged to stderr with its date window, organisation-unit count, duration,
 and cumulative value count. If DHIS2, nginx, or Cloudflare returns a timeout/gateway error, the
@@ -301,6 +330,31 @@ With metadata strategy `CREATE`, dependencies reported by DHIS2 as already exist
 removed from the commit package and reused by UID. They are never updated implicitly. The full source
 package is retained as `*.metadata.source.json`; the validated minimal package is retained as
 `*.metadata.json`. Any discarded stale category references are summarized in the run report.
+
+### systemd execution per Data Set
+
+Install the templates after adapting `User`, `Group` and paths when the checkout is not under
+`/opt/dhis2-climate-import`:
+
+```sh
+sudo cp deploy/systemd/dhis2-transfer@.service /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer@.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dhis2-transfer@hospital_service.timer
+sudo systemctl enable --now dhis2-transfer@sigl_fosa.timer
+systemctl list-timers 'dhis2-transfer@*'
+```
+
+Audit commands:
+
+```sh
+sudo systemctl status dhis2-transfer@hospital_service.service
+sudo journalctl -u dhis2-transfer@hospital_service.service --since today
+sudo journalctl -fu dhis2-transfer@hospital_service.service
+```
+
+The template intentionally omits `--force`. The YAML setting `execution.max_parallel_jobs` limits
+heavy jobs globally, while a per-job lock and one target-metadata lock prevent conflicting runs.
 
 ### Repair partial target metadata
 

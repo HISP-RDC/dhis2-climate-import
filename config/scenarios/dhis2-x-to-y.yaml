@@ -11,13 +11,26 @@ target:
     # DHIS2 dependency package before importing data values.
     mode: create_if_missing
     identity_strategy: preserve_uid
-    # Allows the explicit repair-metadata command to reconcile incomplete
-    # existing objects. The normal transfer command never repairs them implicitly.
+    # Allows guarded safe_repair during reconcile-metadata and transfer run.
+    # Unsafe or ambiguous existing objects are still blocked.
     reconcile_existing: true
     skip_sharing: true
     import:
       strategy: CREATE
       atomic: true
+    synchronization:
+      enabled: true
+      create_missing_objects: true
+      attach_compatible_data_elements: true
+      incompatible:
+        policy: safe_repair
+        require_no_data_values: true
+        require_no_other_dataset_memberships: true
+        require_same_identity: true
+      historical_data_elements:
+        enabled: true
+        strategy: versioned
+        name_suffix: " — Historique"
 
   organisation_units:
     # Uses the organisation units assigned to the source Data Set. Use
@@ -40,6 +53,17 @@ transfer:
   preheat_cache: true
   include_deleted: false
   preserve_comments: true
+  retry:
+    attempts: 5
+    initial_delay_seconds: 5
+    max_delay_seconds: 120
+  execution:
+    process_isolation: true
+    resume: true
+    stop_on_error: true
+
+execution:
+  max_parallel_jobs: 1
 
 state:
   directory: state
@@ -61,6 +85,17 @@ jobs:
     default_end_period: 2026-10
     data_elements:
       discovery: linked_to_dataset
+    transfer:
+      # Export one DHIS2 month per source request; timeout responses are then
+      # subdivided automatically by organisation unit.
+      source_period_batch_size: 1
+      execution:
+        # Une tranche trimestrielle garde la mémoire bornée; chaque tranche
+        # s'exécute dans un nouveau processus.
+        period_batch_size: 3
+        process_isolation: true
+        resume: true
+        stop_on_error: true
   - id: hospital_service
     source_data_set: OeWrFwkFMvf
     target_data_set: OeWrFwkFMvf
@@ -73,6 +108,13 @@ jobs:
       # Export one DHIS2 month per source request; timeout responses are then
       # subdivided automatically by organisation unit.
       source_period_batch_size: 1
+      execution:
+        # Une tranche trimestrielle garde la mémoire bornée; chaque tranche
+        # s'exécute dans un nouveau processus.
+        period_batch_size: 3
+        process_isolation: true
+        resume: true
+        stop_on_error: true
   - id: population_as
     source_data_set: mV0r6yDCZy3
     target_data_set: mV0r6yDCZy3
@@ -81,3 +123,32 @@ jobs:
     default_end_period: 2026-10
     data_elements:
       discovery: linked_to_dataset
+    transfer:
+      # Export one DHIS2 month per source request; timeout responses are then
+      # subdivided automatically by organisation unit.
+      source_period_batch_size: 1
+      execution:
+        # Une tranche trimestrielle garde la mémoire bornée; chaque tranche
+        # s'exécute dans un nouveau processus.
+        period_batch_size: 3
+        process_isolation: true
+        resume: true
+        stop_on_error: true
+  - id: relevant_epidemiological_data
+    source_data_set: Fo5ux0Ja21i
+    target_data_set: Fo5ux0Ja21i
+    period_type: week
+    default_start_period: 2017-W01
+    default_end_period: 2026-W40
+    data_elements:
+      discovery: linked_to_dataset
+    transfer:
+      # Export one DHIS2 week per source request; timeout responses are then
+      # subdivided automatically by organisation unit.
+      source_period_batch_size: 1
+      execution:
+        # Treize semaines par sous-processus gardent la mémoire bornée.
+        period_batch_size: 13
+        process_isolation: true
+        resume: true
+        stop_on_error: true

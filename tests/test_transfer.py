@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -6,9 +7,15 @@ from dhis2_climate_import.dhis2 import DataSetRef
 from dhis2_climate_import.errors import PipelineError
 from dhis2_climate_import.http import HttpRequestError
 from dhis2_climate_import.transfer import (
+    TransferContext,
+    _data_set_membership_package,
+    _normalise_source_category_option_combos,
     _prepare_metadata_package,
     _remove_existing_metadata_objects,
+    _validate_target_category_option_combos,
     _validate_metadata_package,
+    _version_unmappable_historical_values,
+    reconcile_target_metadata,
     repair_target_metadata,
     review_transfer,
     run_transfer,
@@ -172,6 +179,325 @@ class FakeTransferClient:
 
 
 class TransferTests(unittest.TestCase):
+    def test_membership_update_preserves_existing_dataset_element_category_combo(self) -> None:
+        class Target:
+            def data_set_details(self, data_set_id):
+                return {
+                    "dataSetElements": [
+                        {
+                            "dataSet": {"id": data_set_id},
+                            "dataElement": {"id": "DataEl00001"},
+                            "categoryCombo": {"id": "OverrideCC1"},
+                        }
+                    ]
+                }
+
+        package = _data_set_membership_package(
+            Target(),
+            data_set_id="DataSet0001",
+            data_element_ids={"DataEl00001", "DataEl00002"},
+        )
+
+        elements = package["dataSets"][0]["dataSetElements"]
+        by_id = {item["dataElement"]["id"]: item for item in elements}
+        self.assertEqual(
+            by_id["DataEl00001"]["categoryCombo"]["id"],
+            "OverrideCC1",
+        )
+        self.assertNotIn("categoryCombo", by_id["DataEl00002"])
+
+    def test_reconcile_plans_attachment_of_compatible_unlinked_data_element(self) -> None:
+        class PartialTarget(FakeTransferClient):
+            def data_elements_for_data_set(self, *, data_set_id, page_size):
+                return self.elements[:1]
+
+            def data_elements(self, *, page_size):
+                return self.elements
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(Path(tmp), chunk_size=5000)
+            source = FakeTransferClient("https://x.example.org")
+            target = PartialTarget(
+                "https://y.example.org",
+                target_has_dataset=True,
+            )
+
+            result = reconcile_target_metadata(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+                apply=False,
+            )
+
+            self.assertTrue(result["requiresChanges"])
+            self.assertEqual(result["createDataElements"], [])
+            self.assertEqual(result["attachDataElements"], ["DataEl00002"])
+            self.assertEqual(target.metadata_calls, [False])
+            self.assertTrue(Path(result["targetSnapshotArtifact"]).exists())
+
+    def test_reconcile_blocks_same_code_with_different_uid(self) -> None:
+        class CollisionTarget(FakeTransferClient):
+            def data_elements_for_data_set(self, *, data_set_id, page_size):
+                return self.elements[:1]
+
+            def data_elements(self, *, page_size):
+                return [
+                    self.elements[0],
+                    {
+                        "id": "OtherDE0001",
+                        "code": "CCH_TEMP",
+                        "name": "Another object",
+                    },
+                ]
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(Path(tmp), chunk_size=5000)
+            with self.assertRaisesRegex(PipelineError, "code CCH_TEMP"):
+                reconcile_target_metadata(
+                    scenario,
+                    FakeTransferClient("https://x.example.org"),
+                    CollisionTarget(
+                        "https://y.example.org",
+                        target_has_dataset=True,
+                    ),
+                    job_id="weekly_climate",
+                    apply=False,
+                )
+
+    def test_reconcile_validates_creation_of_missing_data_element(self) -> None:
+        class MissingTarget(FakeTransferClient):
+            def data_elements_for_data_set(self, *, data_set_id, page_size):
+                return self.elements[:1]
+
+            def data_elements(self, *, page_size):
+                return self.elements[:1]
+
+        with TemporaryDirectory() as tmp:
+            result = reconcile_target_metadata(
+                _scenario(Path(tmp), chunk_size=5000),
+                FakeTransferClient("https://x.example.org"),
+                MissingTarget(
+                    "https://y.example.org",
+                    target_has_dataset=True,
+                ),
+                job_id="weekly_climate",
+                apply=False,
+            )
+
+            self.assertEqual(result["createDataElements"], ["DataEl00002"])
+            self.assertTrue(result["attachmentValidationPendingCreateCommit"])
+            self.assertTrue(result["validated"])
+
+    def test_versions_historical_data_element_without_losing_old_category_semantics(self) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                period_type="month",
+                default_start_period="2026-01",
+                default_end_period="2026-01",
+            )
+            source = _HistoricalSource()
+            target = _HistoricalTarget()
+            canonical = {
+                "id": "DataEl00001",
+                "code": "HOSP_ADM",
+                "name": "Admissions",
+                "valueType": "INTEGER",
+                "domainType": "AGGREGATE",
+                "aggregationType": "SUM",
+                "categoryCombo": {"id": "CurrentCC01"},
+            }
+            context = TransferContext(
+                job=scenario.get_job("weekly_climate"),
+                source_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                target_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                source_data_elements=(canonical,),
+                target_data_elements=(canonical,),
+                source_organisation_units=(),
+                target_organisation_units=(),
+                start="2026-01-01",
+                end="2026-01-31",
+                metadata_bootstrap_required=False,
+            )
+            target.linked = [canonical]
+            values = [
+                {
+                    "dataElement": "DataEl00001",
+                    "period": "202601",
+                    "orgUnit": "OrgUnit00001",
+                    "categoryOptionCombo": "HistoricC01",
+                    "value": "7",
+                }
+            ]
+
+            rewritten, report = _version_unmappable_historical_values(
+                source,
+                target,
+                scenario,
+                context,
+                values,
+                apply=True,
+            )
+
+            historical_id = report["mappings"][0]["targetDataElement"]
+            self.assertNotEqual(historical_id, "DataEl00001")
+            self.assertEqual(rewritten[0]["dataElement"], historical_id)
+            self.assertEqual(rewritten[0]["categoryOptionCombo"], "HistoricC01")
+            self.assertEqual(report["rewrittenValueCount"], 1)
+            self.assertIn(historical_id, {item["id"] for item in target.linked})
+
+    def test_remaps_historical_category_option_combo_by_exact_options(self) -> None:
+        client = _CategoryOptionComboClient(
+            current=[
+                {
+                    "id": "CurrentC001",
+                    "categoryCombo": {"id": "CurrentCC01"},
+                    "categoryOptions": [{"id": "CategoryO01"}],
+                }
+            ],
+            historical=[
+                {
+                    "id": "HistoricC01",
+                    "name": "Medicine",
+                    "categoryCombo": {"id": "HistoricCC1"},
+                    "categoryOptions": [
+                        {"id": "CategoryO01", "name": "Medicine"}
+                    ],
+                }
+            ],
+        )
+        context = _category_context()
+        source_values = [
+            {
+                "dataElement": "DataEl00001",
+                "period": "202601",
+                "orgUnit": "OrgUnit00001",
+                "categoryOptionCombo": "HistoricC01",
+                "value": "12",
+            }
+        ]
+
+        normalised, report = _normalise_source_category_option_combos(
+            client,
+            context,
+            source_values,
+        )
+
+        self.assertEqual(
+            normalised[0]["categoryOptionCombo"],
+            "CurrentC001",
+        )
+        self.assertIs(normalised, source_values)
+        self.assertEqual(report["remappedValueCount"], 1)
+        self.assertEqual(report["historicalCombinationCount"], 1)
+
+    def test_blocks_historical_category_option_combo_without_exact_equivalent(self) -> None:
+        client = _CategoryOptionComboClient(
+            current=[
+                {
+                    "id": "CurrentC001",
+                    "categoryCombo": {"id": "CurrentCC01"},
+                    "categoryOptions": [{"id": "CategoryO01"}],
+                }
+            ],
+            historical=[
+                {
+                    "id": "HistoricC01",
+                    "name": "Speciality",
+                    "categoryCombo": {"id": "HistoricCC1"},
+                    "categoryOptions": [
+                        {"id": "RemovedOp01", "name": "Speciality"}
+                    ],
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(PipelineError, "cannot be mapped losslessly"):
+            _normalise_source_category_option_combos(
+                client,
+                _category_context(),
+                [
+                    {
+                        "dataElement": "DataEl00001",
+                        "period": "202601",
+                        "orgUnit": "OrgUnit00001",
+                        "categoryOptionCombo": "HistoricC01",
+                        "value": "12",
+                    }
+                ],
+            )
+
+    def test_blocks_historical_remap_that_would_create_duplicate_value_key(self) -> None:
+        client = _CategoryOptionComboClient(
+            current=[
+                {
+                    "id": "CurrentC001",
+                    "categoryCombo": {"id": "CurrentCC01"},
+                    "categoryOptions": [{"id": "CategoryO01"}],
+                }
+            ],
+            historical=[
+                {
+                    "id": "HistoricC01",
+                    "categoryCombo": {"id": "HistoricCC1"},
+                    "categoryOptions": [{"id": "CategoryO01"}],
+                }
+            ],
+        )
+        values = [
+            {
+                "dataElement": "DataEl00001",
+                "period": "202601",
+                "orgUnit": "OrgUnit00001",
+                "categoryOptionCombo": combo,
+                "attributeOptionCombo": "AttrOpt0001",
+                "value": value,
+            }
+            for combo, value in (
+                ("HistoricC01", "12"),
+                ("CurrentC001", "14"),
+            )
+        ]
+
+        with self.assertRaisesRegex(PipelineError, "duplicate data value keys"):
+            _normalise_source_category_option_combos(
+                client,
+                _category_context(),
+                values,
+            )
+
+        self.assertEqual(values[0]["categoryOptionCombo"], "HistoricC01")
+
+    def test_target_category_option_combo_preflight_explains_e8024(self) -> None:
+        target = _CategoryOptionComboClient(current=[], historical=[])
+
+        with self.assertRaisesRegex(PipelineError, "E8024"):
+            _validate_target_category_option_combos(
+                target,
+                _category_context(target=True),
+                [
+                    {
+                        "dataElement": "DataEl00001",
+                        "period": "202601",
+                        "orgUnit": "OrgUnit00001",
+                        "categoryOptionCombo": "MissingC001",
+                        "value": "12",
+                    }
+                ],
+            )
+
     def test_review_discovers_data_elements_and_requires_bootstrap(self) -> None:
         with TemporaryDirectory() as tmp:
             scenario = _scenario(Path(tmp), chunk_size=5000)
@@ -191,7 +517,12 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(review["targetMatchedOrganisationUnitCount"], 1)
             self.assertEqual(target.organisation_unit_list_calls, 1)
             self.assertTrue(
-                (scenario.state_dir / "cache" / "source" / "weekly_climate.json").exists()
+                (
+                    scenario.job_state_dir("weekly_climate")
+                    / "cache"
+                    / "source"
+                    / "weekly_climate.json"
+                ).exists()
             )
 
     def test_dry_run_validates_missing_metadata_without_committing(self) -> None:
@@ -786,6 +1117,198 @@ jobs:
         encoding="utf-8",
     )
     return load_transfer_scenario(path)
+
+
+class _CategoryOptionComboClient:
+    def __init__(self, *, current: list[dict], historical: list[dict]) -> None:
+        self.current = current
+        self.historical = historical
+
+    def category_option_combos_for_category_combos(
+        self, category_combo_ids: list[str]
+    ) -> list[dict]:
+        return [
+            item
+            for item in self.current
+            if (item.get("categoryCombo") or {}).get("id") in category_combo_ids
+        ]
+
+    def metadata_objects_by_ids(
+        self,
+        *,
+        resource: str,
+        root_key: str,
+        object_ids: list[str],
+        fields: str,
+    ) -> list[dict]:
+        return [item for item in self.historical if item.get("id") in object_ids]
+
+
+class _HistoricalSource:
+    def category_option_combos_for_category_combos(
+        self, category_combo_ids: list[str]
+    ) -> list[dict]:
+        items = {
+            "CurrentCC01": [
+                {
+                    "id": "CurrentC001",
+                    "name": "Current",
+                    "categoryCombo": {"id": "CurrentCC01"},
+                    "categoryOptions": [{"id": "CurrentOp01"}],
+                }
+            ],
+            "HistoricCC1": [
+                {
+                    "id": "HistoricC01",
+                    "name": "Speciality",
+                    "categoryCombo": {"id": "HistoricCC1"},
+                    "categoryOptions": [{"id": "HistoricOp1"}],
+                }
+            ],
+        }
+        return [item for uid in category_combo_ids for item in items.get(uid, [])]
+
+    def metadata_objects_by_ids(
+        self,
+        *,
+        resource: str,
+        root_key: str,
+        object_ids: list[str],
+        fields: str,
+    ) -> list[dict]:
+        objects = {
+            "categoryOptionCombos": self.category_option_combos_for_category_combos(
+                ["HistoricCC1"]
+            ),
+            "categoryCombos": [
+                {
+                    "id": "HistoricCC1",
+                    "code": "HIST_CC",
+                    "name": "Old speciality",
+                    "dataDimensionType": "DISAGGREGATION",
+                    "categories": [{"id": "HistoricCat"}],
+                }
+            ],
+            "categories": [
+                {
+                    "id": "HistoricCat",
+                    "code": "HIST_CAT",
+                    "name": "Old speciality",
+                    "shortName": "Old speciality",
+                    "dataDimensionType": "DISAGGREGATION",
+                    "categoryOptions": [{"id": "HistoricOp1"}],
+                }
+            ],
+            "categoryOptions": [
+                {
+                    "id": "HistoricOp1",
+                    "code": "HIST_OPT",
+                    "name": "Speciality",
+                    "shortName": "Speciality",
+                }
+            ],
+            "dataElements": [
+                {
+                    "id": "DataEl00001",
+                    "code": "HOSP_ADM",
+                    "name": "Admissions",
+                    "shortName": "Admissions",
+                    "valueType": "INTEGER",
+                    "domainType": "AGGREGATE",
+                    "aggregationType": "SUM",
+                }
+            ],
+        }
+        return [
+            item
+            for item in objects.get(resource, [])
+            if item.get("id") in object_ids
+        ]
+
+
+class _HistoricalTarget:
+    def __init__(self) -> None:
+        self.objects: dict[str, dict[str, dict]] = {
+            key: {}
+            for key in (
+                "categoryOptions",
+                "categories",
+                "categoryCombos",
+                "categoryOptionCombos",
+                "dataElements",
+            )
+        }
+        self.linked: list[dict] = []
+
+    def metadata_objects_by_ids(
+        self,
+        *,
+        resource: str,
+        root_key: str,
+        object_ids: list[str],
+        fields: str,
+    ) -> list[dict]:
+        return [
+            self.objects.get(resource, {})[uid]
+            for uid in object_ids
+            if uid in self.objects.get(resource, {})
+        ]
+
+    def import_metadata(
+        self,
+        payload,
+        *,
+        commit,
+        import_strategy,
+        atomic_mode,
+        identifier,
+        skip_sharing,
+    ):
+        if commit:
+            for collection, items in payload.items():
+                if collection == "dataSets":
+                    memberships = items[0].get("dataSetElements", [])
+                    linked_ids = {
+                        item["dataElement"]["id"] for item in memberships
+                    }
+                    by_id = {item["id"]: item for item in self.linked}
+                    by_id.update(self.objects["dataElements"])
+                    self.linked = [by_id[uid] for uid in linked_ids]
+                    continue
+                if collection in self.objects:
+                    for item in items:
+                        self.objects[collection][item["id"]] = item
+        return {"status": "OK"}
+
+    def data_elements_for_data_set(self, *, data_set_id: str, page_size: int):
+        return self.linked
+
+
+def _category_context(*, target: bool = False) -> SimpleNamespace:
+    element = {
+        "id": "DataEl00001",
+        "categoryCombo": {"id": "CurrentCC01"},
+    }
+    return SimpleNamespace(
+        job=SimpleNamespace(
+            id_schemes=SimpleNamespace(
+                data_elements="uid",
+                category_option_combos="uid",
+            )
+        ),
+        source_data_elements=(element,),
+        target_data_elements=(element,),
+        target_data_set=(
+            DataSetRef(
+                id="DataSet0001",
+                code="DATA_SET",
+                name="Data Set",
+                period_type="Monthly",
+            )
+            if target
+            else None
+        ),
+    )
 
 
 if __name__ == "__main__":

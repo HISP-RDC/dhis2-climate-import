@@ -5,7 +5,9 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import time
 from typing import Any, Callable
 
 from .cache import (
@@ -20,13 +22,21 @@ from .config import PipelineConfig, load_pipeline_config
 from .diagnostics import diagnose_dhis2_access
 from .dhis2 import DHIS2Client
 from .env import load_env_file
-from .errors import PipelineError
+from .errors import PipelineError, TransientPipelineError
 from .http import HttpRequestError
+from .journal import TransferRunJournal
 from .ocs import OCSClient
 from .periods import date_window_period_bounds, period_range_bounds, relative_year_window
 from .pipeline import aggregate_job, import_job, review_import, run_monthly_imports
 from .reports import run_id, write_report
-from .transfer import repair_target_metadata, review_transfer, run_transfer
+from .locks import exclusive_lock
+from .transfer import (
+    reconcile_target_metadata,
+    repair_target_metadata,
+    review_transfer,
+    run_transfer,
+)
+from .transfer_orchestrator import orchestrate_transfer
 from .transfer_config import load_instance_registry, load_transfer_scenario
 
 
@@ -35,12 +45,15 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         args.func(args)
+    except TransientPipelineError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(75) from exc
     except PipelineError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     except HttpRequestError as exc:
         print(f"ERROR: {_format_http_error(exc)}", file=sys.stderr)
-        raise SystemExit(2) from exc
+        raise SystemExit(75 if _is_transient_http_error(exc) else 2) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -165,6 +178,17 @@ def build_parser() -> argparse.ArgumentParser:
     repair_mode.add_argument("--apply", action="store_true")
     transfer_repair.set_defaults(func=cmd_transfer_repair_metadata)
 
+    transfer_reconcile = transfer_commands.add_parser(
+        "reconcile-metadata",
+        help="Plan or apply safe target metadata synchronization before data export.",
+    )
+    transfer_reconcile.add_argument("job_id")
+    _add_window_args(transfer_reconcile)
+    reconcile_mode = transfer_reconcile.add_mutually_exclusive_group(required=True)
+    reconcile_mode.add_argument("--dry-run", action="store_true")
+    reconcile_mode.add_argument("--apply", action="store_true")
+    transfer_reconcile.set_defaults(func=cmd_transfer_reconcile_metadata)
+
     transfer_run = transfer_commands.add_parser(
         "run", help="Validate or apply a DHIS2-to-DHIS2 transfer."
     )
@@ -176,6 +200,21 @@ def build_parser() -> argparse.ArgumentParser:
     transfer_run.add_argument("--force", action="store_true")
     transfer_run.add_argument("--keep-payload", action="store_true")
     transfer_run.set_defaults(func=cmd_transfer_run)
+
+    transfer_window = transfer_commands.add_parser(
+        "run-window",
+        help="Internal isolated-window worker used by the parent transfer command.",
+    )
+    transfer_window.add_argument("job_id")
+    transfer_window.add_argument("--start", required=True)
+    transfer_window.add_argument("--end", required=True)
+    window_mode = transfer_window.add_mutually_exclusive_group(required=True)
+    window_mode.add_argument("--dry-run", action="store_true")
+    window_mode.add_argument("--apply", action="store_true")
+    transfer_window.add_argument("--keep-payload", action="store_true")
+    transfer_window.add_argument("--parent-run-id", required=True)
+    transfer_window.add_argument("--window-id", required=True)
+    transfer_window.set_defaults(func=cmd_transfer_run_window)
 
     return parser
 
@@ -515,7 +554,10 @@ def cmd_transfer_run(args: argparse.Namespace) -> None:
         "instances.check.done",
         {"source": source.base_url, "target": target.base_url},
     )
-    result = run_transfer(
+    runner = None
+    if scenario.get_job(args.job_id).transfer.execution.process_isolation:
+        runner = _subprocess_window_runner(args)
+    result = orchestrate_transfer(
         scenario,
         source,
         target,
@@ -530,6 +572,43 @@ def cmd_transfer_run(args: argparse.Namespace) -> None:
         years_back=args.years_back,
         as_of=args.as_of,
         progress=_transfer_progress,
+        window_runner=runner,
+    )
+    _print_json(result)
+
+
+def cmd_transfer_run_window(args: argparse.Namespace) -> None:
+    _env, scenario, source, target = _transfer_runtime(
+        args, progress=_transfer_progress
+    )
+    journal = TransferRunJournal(
+        scenario.job_state_dir(args.job_id) / "journal.sqlite3"
+    )
+
+    def progress(event: str, details: dict[str, Any]) -> None:
+        _transfer_progress(event, details)
+        phase = _window_phase(event)
+        if phase:
+            journal.update_window_phase(window_id=args.window_id, phase=phase)
+        journal.record_event(
+            run_id=args.parent_run_id,
+            window_id=args.window_id,
+            event=event,
+            details=details,
+            level="error" if event == "transfer.failed" else "info",
+        )
+
+    result = run_transfer(
+        scenario,
+        source,
+        target,
+        job_id=args.job_id,
+        apply=args.apply,
+        force=True,
+        keep_payload=args.keep_payload,
+        start=args.start,
+        end=args.end,
+        progress=progress,
     )
     _print_json(
         {
@@ -538,18 +617,117 @@ def cmd_transfer_run(args: argparse.Namespace) -> None:
             "job": result["job"],
             "dryRun": result["dryRun"],
             "sourceDataValueCount": result["sourceDataValueCount"],
-            "metadata": {
-                "required": result["metadata"]["required"],
-                "validated": result["metadata"]["validated"],
-                "committed": result["metadata"]["committed"],
-            },
+            "counts": result["counts"],
             "dataValidationPendingMetadataCommit": result[
                 "dataValidationPendingMetadataCommit"
             ],
-            "counts": result["counts"],
+            "dataValidationPendingHistoricalMetadataCommit": result[
+                "dataValidationPendingHistoricalMetadataCommit"
+            ],
+            "historicalDataElements": result["historicalDataElements"],
             "reportPath": result["reportPath"],
         }
     )
+
+
+def _subprocess_window_runner(args: argparse.Namespace) -> Callable[
+    [str, str, int, int, str, str], dict[str, Any]
+]:
+    def run(
+        start: str,
+        end: str,
+        _index: int,
+        _count: int,
+        window_id: str,
+        parent_run_id: str,
+    ) -> dict[str, Any]:
+        command = [
+            sys.executable,
+            "-m",
+            "dhis2_climate_import",
+            "--env-file",
+            str(args.env_file),
+            "transfer",
+            "--instances",
+            str(args.instances),
+            "--scenario",
+            str(args.scenario),
+            "run-window",
+            str(args.job_id),
+            "--start",
+            start,
+            "--end",
+            end,
+            "--apply" if args.apply else "--dry-run",
+            "--parent-run-id",
+            parent_run_id,
+            "--window-id",
+            window_id,
+        ]
+        if args.keep_payload:
+            command.append("--keep-payload")
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        error_tail: list[str] = []
+        if process.stderr is not None:
+            for line in process.stderr:
+                print(line, end="", file=sys.stderr, flush=True)
+                error_tail.append(line.rstrip())
+                error_tail = error_tail[-20:]
+        stdout = process.stdout.read() if process.stdout is not None else ""
+        return_code = process.wait()
+        detail = " | ".join(error_tail[-3:])
+        if return_code == 75:
+            raise TransientPipelineError(
+                f"Window subprocess ended with temporary exit code 75 ({start} to {end})"
+                + (f": {detail}" if detail else ".")
+            )
+        if return_code != 0:
+            raise PipelineError(
+                f"Window subprocess ended with exit code {return_code} "
+                f"({start} to {end})" + (f": {detail}" if detail else ".")
+            )
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise PipelineError(
+                "Window subprocess succeeded but did not return a valid JSON summary."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise PipelineError("Window subprocess returned a non-object JSON summary.")
+        return payload
+
+    return run
+
+
+def cmd_transfer_reconcile_metadata(args: argparse.Namespace) -> None:
+    _env, scenario, source, target = _transfer_runtime(
+        args, progress=_transfer_progress
+    )
+    with exclusive_lock(
+        scenario.state_dir / "locks" / "metadata.lock",
+        purpose=f"canonical metadata for {scenario.id}/{args.job_id}",
+        transient_when_busy=True,
+    ):
+        result = reconcile_target_metadata(
+            scenario,
+            source,
+            target,
+            job_id=args.job_id,
+            apply=args.apply,
+            start=args.start,
+            end=args.end,
+            start_period=args.start_period,
+            end_period=args.end_period,
+            years_back=args.years_back,
+            as_of=args.as_of,
+            progress=_transfer_progress,
+        )
+    _print_json(result)
 
 
 def cmd_transfer_repair_metadata(args: argparse.Namespace) -> None:
@@ -621,13 +799,59 @@ def _transfer_runtime(
         raise PipelineError(
             "Source and target instance profiles resolve to the same DHIS2 base URL."
         )
-    source.check(min_version=(2, 37))
+    job = scenario.get_job(args.job_id)
+    _check_transfer_instance(
+        source,
+        label="source",
+        attempts=job.transfer.retry.attempts,
+        initial_delay=job.transfer.retry.initial_delay_seconds,
+        max_delay=job.transfer.retry.max_delay_seconds,
+        progress=progress,
+    )
     if progress is not None:
         progress("instances.source.done", {"source": source.base_url})
-    target.check(min_version=(2, 37))
+    _check_transfer_instance(
+        target,
+        label="target",
+        attempts=job.transfer.retry.attempts,
+        initial_delay=job.transfer.retry.initial_delay_seconds,
+        max_delay=job.transfer.retry.max_delay_seconds,
+        progress=progress,
+    )
     if progress is not None:
         progress("instances.target.done", {"target": target.base_url})
     return env, scenario, source, target
+
+
+def _check_transfer_instance(
+    client: DHIS2Client,
+    *,
+    label: str,
+    attempts: int,
+    initial_delay: float,
+    max_delay: float,
+    progress: Callable[[str, dict[str, Any]], None] | None,
+) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            client.check(min_version=(2, 37))
+            return
+        except HttpRequestError as exc:
+            if not _is_transient_http_error(exc) or attempt >= attempts:
+                raise
+            delay = min(initial_delay * (2 ** (attempt - 1)), max_delay, 60.0)
+            if progress is not None:
+                progress(
+                    "instances.check.retry",
+                    {
+                        "instance": label,
+                        "attempt": f"{attempt}/{attempts}",
+                        "nextAttempt": attempt + 1,
+                        "delaySeconds": delay,
+                        "error": _format_http_error(exc)[:300],
+                    },
+                )
+            time.sleep(delay)
 
 
 def _data_set_selectors(cli_selector: str | None, config: PipelineConfig) -> list[str]:
@@ -755,12 +979,29 @@ def _print_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def _window_phase(event: str) -> str | None:
+    if event.startswith("metadata.") or event.startswith("historical_data_elements."):
+        return "metadata"
+    if event.startswith("source.export") or event.startswith(
+        "source.category_option_combos"
+    ):
+        return "exporting"
+    if event.startswith("target.dry_run") or event.startswith(
+        "target.category_option_combos"
+    ):
+        return "validating"
+    if event.startswith("target.import"):
+        return "importing"
+    return None
+
+
 def _transfer_progress(event: str, details: dict[str, Any]) -> None:
     labels = {
         "instances.check.start": "Vérification des connexions X et Y",
         "instances.source.done": "Connexion source X validée",
         "instances.target.done": "Connexion cible Y validée",
         "instances.check.done": "Connexions X et Y validées",
+        "instances.check.retry": "Connexion temporairement indisponible, nouvelle tentative",
         "transfer.start": "Démarrage du transfert",
         "context.resolve.start": "Lecture et comparaison des métadonnées",
         "context.resolve.done": "Métadonnées compatibles",
@@ -771,11 +1012,35 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "metadata.validation.done": "Métadonnées cible validées",
         "metadata.commit.start": "Création des métadonnées cible",
         "metadata.commit.done": "Métadonnées cible créées",
+        "metadata.reconcile.lock.wait": "Attente du verrou des métadonnées cible",
+        "metadata.reconcile.start": "Synchronisation des métadonnées démarrée",
+        "metadata.reconcile.done": "Synchronisation des métadonnées terminée",
+        "historical_data_elements.audit.start": (
+            "Audit des Data Elements historiques"
+        ),
+        "historical_data_elements.metadata.validate.start": (
+            "Validation des métadonnées historiques"
+        ),
+        "historical_data_elements.audit.done": (
+            "Traitement des Data Elements historiques terminé"
+        ),
         "source.export.start": "Début de l’export des valeurs source",
         "source.export.request.start": "Requête source en cours",
         "source.export.request.done": "Requête source terminée",
         "source.export.request.split": "Timeout détecté, subdivision automatique",
         "source.export.done": "Export des valeurs source terminé",
+        "source.category_option_combos.audit.start": (
+            "Audit des combinaisons de catégories des valeurs source"
+        ),
+        "source.category_option_combos.audit.done": (
+            "Combinaisons de catégories source normalisées"
+        ),
+        "target.category_option_combos.audit.start": (
+            "Vérification des combinaisons de catégories sur la cible"
+        ),
+        "target.category_option_combos.audit.done": (
+            "Combinaisons de catégories cible compatibles"
+        ),
         "target.dry_run.start": "Début de la validation des valeurs cible",
         "target.dry_run.chunk.start": "Validation d’un lot cible",
         "target.dry_run.chunk.done": "Lot cible validé",
@@ -784,6 +1049,19 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "target.import.chunk.start": "Import d’un lot cible",
         "target.import.chunk.done": "Lot cible importé",
         "target.import.done": "Import réel terminé",
+        "orchestrator.slot.acquired": "Créneau d’exécution acquis",
+        "orchestrator.interrupted.recovered": (
+            "Anciennes tranches interrompues reclassées"
+        ),
+        "orchestrator.start": "Exécution globale démarrée",
+        "orchestrator.window.start": "Tranche démarrée",
+        "orchestrator.window.done": "Tranche terminée",
+        "orchestrator.window.skipped": "Tranche déjà réussie ignorée",
+        "orchestrator.window.metadata_pending": (
+            "Tranche en attente du commit des métadonnées historiques"
+        ),
+        "orchestrator.window.retry": "Nouvelle tentative de tranche planifiée",
+        "orchestrator.done": "Exécution globale terminée",
         "transfer.done": "Transfert terminé",
         "transfer.failed": "Transfert interrompu",
     }
@@ -822,10 +1100,32 @@ def _format_http_error(exc: HttpRequestError) -> str:
     if exc.status_code == 409:
         conflicts = _dhis2_error_details(exc.body)
         if conflicts:
-            return f"{message}\nDHIS2 conflict details:\n" + "\n".join(
+            return (
+                f"{exc.method} {exc.url} failed with 409.\n"
+                "DHIS2 conflict details:\n"
+            ) + "\n".join(
                 f"- {item}" for item in conflicts[:20]
             )
     return message
+
+
+def _is_transient_http_error(exc: HttpRequestError) -> bool:
+    if exc.status_code in {429, 502, 503, 504, 520, 522, 524}:
+        return True
+    if exc.status_code is not None:
+        return False
+    body = exc.body.lower()
+    return any(
+        marker in body
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "temporary failure",
+            "name or service not known",
+            "nodename nor servname",
+        )
+    )
 
 
 def _dhis2_error_details(body: str) -> list[str]:
@@ -835,13 +1135,34 @@ def _dhis2_error_details(body: str) -> list[str]:
         return []
 
     details: list[str] = []
+    fallback_messages = {
+        "E8024": (
+            "Data Set + Data Element is not usable with the supplied "
+            "CategoryOptionCombo"
+        ),
+    }
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
             error_code = value.get("errorCode")
             error_message = value.get("message")
-            if isinstance(error_message, str) and error_code:
-                detail = f"{error_code}: {error_message}"
+            if isinstance(error_code, str):
+                rendered_message = (
+                    error_message
+                    if isinstance(error_message, str) and error_message
+                    else fallback_messages.get(error_code, "DHIS2 conflict")
+                )
+                detail = f"{error_code}: {rendered_message}"
+                indexes = value.get("indexes")
+                if isinstance(indexes, list):
+                    preview = ", ".join(str(item) for item in indexes[:5])
+                    detail += f"; affectedValues={len(indexes)}"
+                    if preview:
+                        detail += f"; firstIndexes=[{preview}]"
+                args = value.get("args")
+                if isinstance(args, list) and args:
+                    rendered_args = json.dumps(args, ensure_ascii=False)
+                    detail += f"; args={rendered_args[:300]}"
                 if detail not in details:
                     details.append(detail)
             for child in value.values():

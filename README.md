@@ -96,7 +96,23 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   review hospital_service
 ```
 
-Validez toujours les donnees avant le premier import reel :
+Validez d'abord les métadonnées puis les données avant le premier import réel :
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-metadata hospital_service --dry-run
+```
+
+Si le plan annonce des changements, relisez son rapport puis appliquez uniquement les métadonnées :
+
+```sh
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-metadata hospital_service --apply
+```
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
@@ -196,6 +212,11 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
+  reconcile-metadata weekly_climate --dry-run
+
+PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+  --instances config/instances.yaml \
+  --scenario config/scenarios/dhis2-x-to-y.yaml \
   run weekly_climate --dry-run
 
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
@@ -204,11 +225,18 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   run weekly_climate --apply
 ```
 
-With `target.metadata.mode: create_if_missing`, `--dry-run` exports the Data Set dependency package
-from X and validates it against Y without writing metadata. `--apply` performs metadata
-`VALIDATE`, metadata `COMMIT`, a data-value dry-run, and finally the real data import. Caches,
-artifacts, reports, and the SQLite journal are isolated under
-`state/<target-profile>/<scenario>/`.
+With `target.metadata.mode: create_if_missing`, `reconcile-metadata --dry-run` exports the Data Set
+dependency package from X and validates it against Y without writing metadata. After review,
+`reconcile-metadata --apply` creates missing objects, attaches compatible Data Elements and rereads
+Y before any large data export. `transfer run` also executes this preflight automatically. Caches,
+artifacts, reports, and the SQLite journal are isolated per job under
+`state/<target-profile>/<scenario>/jobs/<job>/`.
+
+`transfer run` splits the requested range according to `transfer.execution.period_batch_size`.
+Each window runs in a child process by default, so Linux reclaims its memory before the next one.
+Successful windows are checkpointed in SQLite and skipped on restart unless `--force` is supplied.
+Transient network errors are retried with exponential backoff; permanent metadata or permission
+errors stop immediately.
 
 When `import.strategy: CREATE` finds dependencies that already exist on the target with the same
 UID, the transfer reuses them instead of updating them. The original source package and the final
@@ -217,20 +245,23 @@ incompatible compulsory operands are removed from the import package and recorde
 
 If a target contains partial copies of the source metadata (same Data Element UIDs and labels, but
 the default CategoryCombo instead of the source CategoryCombo), enable
-`target.metadata.reconcile_existing` only after a read-only audit. Reconciliation is an explicit,
-separate operation and is never performed implicitly by `transfer run`:
+`target.metadata.reconcile_existing` only after a read-only audit. The guarded reconciliation
+entry point is:
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
-  repair-metadata hospital_service --dry-run
+  reconcile-metadata hospital_service --dry-run
 
 PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
-  repair-metadata hospital_service --apply
+  reconcile-metadata hospital_service --apply
 ```
+
+The lower-level `repair-metadata` command remains available for auditing the narrowly supported
+legacy case; incompatible objects containing values are never overwritten automatically.
 
 The repair accepts only matching UIDs and identity fields, empty target CategoryCombos, Data
 Elements with no target Data Set membership, and no raw or deleted target values between 1900 and
@@ -244,13 +275,41 @@ With `identity_strategy: preserve_uid`, target discovery first uses `target_data
 back to the source Data Set UID. This prevents an existing target object without a code from being
 mistaken for missing metadata.
 
-Long source exports are split on DHIS2 period boundaries before calling `dataValueSets`. Defaults
-are 31 daily periods, 13 weekly periods, one monthly period, or one yearly period per request. Set
-`transfer.source_period_batch_size` globally or on one job to override this. Organisation units are
-still batched with `organisation_units.batch_size`; a timeout or gateway response automatically
-subdivides the failing period/organisation-unit batch until it succeeds or reaches one period and
-one unit. `transfer run` prints timestamped progress to stderr before and after each request, while
-keeping the final JSON result on stdout.
+Long source exports have two limits. `transfer.execution.period_batch_size` bounds one complete
+child execution (defaults: 31 days, 13 weeks, 3 months or 1 year), while
+`transfer.source_period_batch_size` bounds one request to X (defaults: 31 days, 13 weeks, 1 month
+or 1 year). Organisation units are also batched with `organisation_units.batch_size`; a timeout or
+gateway response subdivides the failing request until it succeeds or reaches one period and one
+unit. `transfer run` prints timestamped progress to stderr and keeps the final JSON summary on
+stdout.
+
+Historical source values whose old CategoryOptionCombo has an exact equivalent are remapped by
+their complete CategoryOption UID set. When no lossless equivalent exists, the optional
+`historical_data_elements.strategy: versioned` policy creates a deterministic historical Data
+Element on Y, preserves the old CategoryCombo semantics and attaches that version to the target
+Data Set. UID/code collisions or incompatible existing objects always block the transfer.
+
+### systemd multi-jobs
+
+Templates are provided in `deploy/systemd/`. Adapt `User`, `Group` and `/opt` paths if needed, then:
+
+```sh
+sudo cp deploy/systemd/dhis2-transfer@.service /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer@.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dhis2-transfer@hospital_service.timer
+sudo systemctl enable --now dhis2-transfer@sigl_fosa.timer
+```
+
+Follow one job with:
+
+```sh
+sudo journalctl -fu dhis2-transfer@hospital_service.service
+```
+
+The service never uses `--force`. Exit code `2` is permanent; exit code `75` is transient and can
+be restarted by systemd after the pipeline's own retries. A per-job lock, a target metadata lock
+and `execution.max_parallel_jobs` prevent unsafe concurrency.
 
 ## Commands
 

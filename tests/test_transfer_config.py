@@ -9,6 +9,48 @@ from dhis2_climate_import.transfer_config import (
 
 
 class TransferConfigTests(unittest.TestCase):
+    def test_job_execution_override_deep_merges_global_retry_and_flags(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config" / "scenarios" / "merge.yaml"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                """
+schema_version: 2
+id: merge
+source:
+  instance: x
+target:
+  instance: y
+transfer:
+  retry:
+    attempts: 7
+    initial_delay_seconds: 2
+    max_delay_seconds: 10
+  execution:
+    process_isolation: false
+    resume: false
+    stop_on_error: false
+jobs:
+  - id: monthly
+    source_data_set: DataSet0001
+    target_data_set: DataSet0001
+    period_type: month
+    default_start_period: 2026-01
+    default_end_period: 2026-12
+    transfer:
+      execution:
+        period_batch_size: 6
+""",
+                encoding="utf-8",
+            )
+            job = load_transfer_scenario(path).get_job("monthly")
+
+        self.assertEqual(job.transfer.retry.attempts, 7)
+        self.assertEqual(job.transfer.execution.period_batch_size, 6)
+        self.assertFalse(job.transfer.execution.process_isolation)
+        self.assertFalse(job.transfer.execution.resume)
+        self.assertFalse(job.transfer.execution.stop_on_error)
+
     def test_loads_basic_and_pat_instance_profiles_without_secrets_in_yaml(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "instances.yaml"
@@ -96,6 +138,14 @@ jobs:
         self.assertEqual(job.organisation_units.discovery, "linked_to_dataset")
         self.assertEqual(job.transfer.chunk_size, 100)
         self.assertEqual(job.transfer.source_period_batch_size, 13)
+        self.assertEqual(job.transfer.execution.period_batch_size, 13)
+        self.assertTrue(job.transfer.execution.process_isolation)
+        self.assertTrue(job.transfer.execution.resume)
+        self.assertEqual(job.transfer.retry.attempts, 5)
+        self.assertEqual(scenario.max_parallel_jobs, 1)
+        self.assertTrue(
+            scenario.metadata.synchronization.historical_data_elements.enabled
+        )
         self.assertEqual(scenario.project_root, path.parents[2])
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from copy import deepcopy
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -11,9 +12,10 @@ import time
 from typing import Any
 
 from .dhis2 import DHIS2Client, DataSetRef
-from .errors import PipelineError
+from .errors import PipelineError, TransientPipelineError
 from .http import HttpRequestError
 from .journal import TransferFingerprint, TransferRunJournal
+from .locks import exclusive_lock
 from .periods import (
     date_window_period_bounds,
     period_date_windows,
@@ -68,7 +70,7 @@ def review_transfer(
         years_back=years_back,
         as_of=as_of,
     )
-    _write_metadata_caches(scenario.state_dir, source, target, context)
+    _write_metadata_caches(scenario.job_state_dir(context.job.id), source, target, context)
     return _review_payload(scenario, source, target, context)
 
 
@@ -118,7 +120,7 @@ def run_transfer(
             "Set transfer.include_deleted to false."
         )
 
-    state_dir = scenario.state_dir
+    state_dir = scenario.job_state_dir(context.job.id)
     _write_metadata_caches(state_dir, source, target, context)
     _emit_progress(progress, "cache.metadata.written", directory=str(state_dir))
     config_hash = _sha256_file(scenario.path)
@@ -197,21 +199,9 @@ def run_transfer(
                 }
             )
 
-        source_payload = _export_source_values(source, context, progress=progress)
-        source_values = source_payload["dataValues"]
-        source_count = len(source_values)
-        if not context.job.transfer.preserve_comments:
-            source_values = [
-                {key: value for key, value in item.items() if key != "comment"}
-                for item in source_values
-            ]
-            source_payload = {"dataValues": source_values}
-        if keep_payload:
-            _write_json(
-                state_dir / "artifacts" / "data" / f"{current_run_id}.values.json",
-                source_payload,
-            )
-
+        # Commit and re-read canonical metadata before exporting a potentially
+        # very large value window.  Historical value handling needs the target
+        # Data Set to exist so it can attach versioned Data Elements safely.
         if metadata_package is not None and apply:
             _emit_progress(progress, "metadata.commit.start")
             commit_response = target.import_metadata(
@@ -239,24 +229,90 @@ def run_transfer(
                     data_set_id=target_data_set.id, page_size=500
                 )
             )
-            context = TransferContext(
-                job=context.job,
-                source_data_set=context.source_data_set,
+            context = replace(
+                context,
                 target_data_set=target_data_set,
-                source_data_elements=context.source_data_elements,
                 target_data_elements=target_elements,
-                source_organisation_units=context.source_organisation_units,
-                target_organisation_units=context.target_organisation_units,
-                start=context.start,
-                end=context.end,
                 metadata_bootstrap_required=True,
             )
             _validate_data_set_compatibility(context)
             _write_metadata_caches(state_dir, source, target, context)
 
+        source_payload = _export_source_values(source, context, progress=progress)
+        source_values = source_payload["dataValues"]
+        source_count = len(source_values)
+        if not context.job.transfer.preserve_comments:
+            source_values = [
+                {key: value for key, value in item.items() if key != "comment"}
+                for item in source_values
+            ]
+        source_values, historical_data_element_report = (
+            _version_unmappable_historical_values(
+                source,
+                target,
+                scenario,
+                context,
+                source_values,
+                apply=apply,
+                progress=progress,
+            )
+        )
+        historical_pending = bool(
+            historical_data_element_report.get("validationPendingMetadataCommit")
+        )
+        if historical_pending:
+            category_option_combo_report = {
+                "checked": False,
+                "historicalCombinationCount": 0,
+                "remappedValueCount": 0,
+                "mappings": [],
+            }
+        else:
+            historical_target_ids = {
+                str(item["targetDataElement"])
+                for item in historical_data_element_report.get("mappings", [])
+                if item.get("targetDataElement")
+            }
+            source_values, category_option_combo_report = (
+                _normalise_source_category_option_combos(
+                    source,
+                    context,
+                    source_values,
+                    ignored_data_elements=historical_target_ids,
+                    progress=progress,
+                )
+            )
+        source_payload = {"dataValues": source_values}
+        if keep_payload:
+            _write_json(
+                state_dir / "artifacts" / "data" / f"{current_run_id}.values.json",
+                source_payload,
+            )
+
+        if apply and historical_data_element_report.get("mappings"):
+            if context.target_data_set is None:
+                raise PipelineError(
+                    "Historical Data Elements were created but the target Data Set is unavailable."
+                )
+            context = replace(
+                context,
+                target_data_elements=tuple(
+                    target.data_elements_for_data_set(
+                        data_set_id=context.target_data_set.id,
+                        page_size=500,
+                    )
+                ),
+            )
+
         dry_run_responses: list[dict[str, Any]] = []
         apply_responses: list[dict[str, Any]] = []
-        if context.target_data_set is not None:
+        if context.target_data_set is not None and not historical_pending:
+            _validate_target_category_option_combos(
+                target,
+                context,
+                source_values,
+                progress=progress,
+            )
             target_payload = _target_payload(context, source_values)
             chunks = _chunk_payload(target_payload, context.job.transfer.chunk_size)
             _emit_progress(
@@ -366,9 +422,12 @@ def run_transfer(
             if source_count
             else 0,
             "metadata": metadata_report,
+            "historicalDataElements": historical_data_element_report,
+            "categoryOptionCombos": category_option_combo_report,
             "dataValidationPendingMetadataCommit": bool(
                 context.target_data_set is None and not apply
             ),
+            "dataValidationPendingHistoricalMetadataCommit": historical_pending,
             "dryRunResponses": dry_run_responses,
             "applyResponses": apply_responses,
             "counts": counts,
@@ -455,7 +514,7 @@ def repair_target_metadata(
         )
 
     current_run_id = run_id(f"repair-{scenario.id}-{context.job.id}")
-    state_dir = scenario.state_dir
+    state_dir = scenario.job_state_dir(context.job.id)
     source_package = source.export_data_set_metadata(
         context.source_data_set.id,
         skip_sharing=scenario.metadata.skip_sharing,
@@ -628,6 +687,428 @@ def repair_target_metadata(
     return report
 
 
+def reconcile_target_metadata(
+    scenario: TransferScenario,
+    source: DHIS2Client,
+    target: DHIS2Client,
+    *,
+    job_id: str,
+    apply: bool,
+    start: str | None = None,
+    end: str | None = None,
+    start_period: str | None = None,
+    end_period: str | None = None,
+    years_back: int | None = None,
+    as_of: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Create or complete the canonical target Data Set before exporting values."""
+    if not scenario.metadata.synchronization.enabled:
+        raise PipelineError(
+            "Metadata synchronization is disabled for this scenario."
+        )
+    _emit_progress(progress, "metadata.reconcile.start", job=job_id, apply=apply)
+    context = resolve_transfer_context(
+        scenario,
+        source,
+        target,
+        job_id=job_id,
+        start=start,
+        end=end,
+        start_period=start_period,
+        end_period=end_period,
+        years_back=years_back,
+        as_of=as_of,
+        allow_metadata_repair=(
+            scenario.metadata.synchronization.incompatible_policy == "safe_repair"
+        ),
+        allow_incomplete_target=True,
+    )
+    if context.category_combo_repairs:
+        repair = repair_target_metadata(
+            scenario,
+            source,
+            target,
+            job_id=job_id,
+            apply=apply,
+            start=context.start,
+            end=context.end,
+        )
+        if not apply:
+            return {
+                "scenario": scenario.id,
+                "job": context.job.id,
+                "dryRun": True,
+                "status": "safe_repair_required",
+                "requiresChanges": True,
+                "committed": False,
+                "repair": repair,
+                "nextStep": (
+                    "Run reconcile-metadata with --apply, then rerun the transfer."
+                ),
+            }
+        return reconcile_target_metadata(
+            scenario,
+            source,
+            target,
+            job_id=job_id,
+            apply=True,
+            start=context.start,
+            end=context.end,
+            progress=progress,
+        )
+    state_dir = scenario.job_state_dir(context.job.id)
+    current_run_id = run_id(f"metadata-{scenario.id}-{context.job.id}")
+    artifact_dir = state_dir / "runs" / current_run_id / "metadata"
+
+    source_package = source.export_data_set_metadata(
+        context.source_data_set.id,
+        skip_sharing=scenario.metadata.skip_sharing,
+    )
+    source_path = _write_json(artifact_dir / "source.json", source_package)
+    prepared, preparation_report = _prepare_metadata_package(source_package)
+
+    all_target_elements = target.data_elements(page_size=1000)
+    source_by_uid = {
+        str(item["id"]): item
+        for item in context.source_data_elements
+        if item.get("id")
+    }
+    target_by_uid = {
+        str(item["id"]): item for item in all_target_elements if item.get("id")
+    }
+    target_by_code = {
+        str(item["code"]): item for item in all_target_elements if item.get("code")
+    }
+    source_codes = {
+        str(item["code"])
+        for item in context.source_data_elements
+        if item.get("code")
+    }
+    target_snapshot_path = _write_json(
+        artifact_dir / "target-before.json",
+        {
+            "dataSet": (
+                asdict(context.target_data_set)
+                if context.target_data_set is not None
+                else None
+            ),
+            "linkedDataElements": list(context.target_data_elements),
+            "dataSetDetails": _target_data_set_details(
+                target,
+                context.target_data_set.id if context.target_data_set else None,
+            ),
+            "affectedGlobalDataElements": [
+                item
+                for item in all_target_elements
+                if item.get("id") in source_by_uid
+                or (item.get("code") and str(item["code"]) in source_codes)
+            ],
+        },
+    )
+    linked_uids = {
+        str(item["id"]) for item in context.target_data_elements if item.get("id")
+    }
+
+    collisions: list[str] = []
+    if (
+        context.target_data_set is not None
+        and scenario.metadata.synchronization.require_same_identity
+    ):
+        for field in ("code", "name"):
+            source_value = getattr(context.source_data_set, field)
+            target_value = getattr(context.target_data_set, field)
+            if source_value and source_value != target_value:
+                collisions.append(
+                    f"Data Set {field}: source={source_value!r}, target={target_value!r}"
+                )
+    missing_uids: list[str] = []
+    attach_uids: list[str] = []
+    compatible_uids: list[str] = []
+    incompatible: list[str] = []
+    for uid, source_element in sorted(source_by_uid.items()):
+        target_element = target_by_uid.get(uid)
+        source_code = source_element.get("code")
+        if target_element is None:
+            if source_code and source_code in target_by_code:
+                other = target_by_code[str(source_code)]
+                collisions.append(
+                    f"code {source_code} uses source UID {uid} but target UID "
+                    f"{other.get('id')}"
+                )
+            else:
+                missing_uids.append(uid)
+            continue
+        element_conflicts = _data_element_conflicts(
+            source_element,
+            target_element,
+            category_scheme=context.job.id_schemes.category_option_combos,
+        )
+        if scenario.metadata.synchronization.require_same_identity:
+            for field in ("code", "name"):
+                source_value = source_element.get(field)
+                target_value = target_element.get(field)
+                if source_value and source_value != target_value:
+                    element_conflicts.append(
+                        f"{field}: source={source_value!r}, target={target_value!r}"
+                    )
+        if element_conflicts:
+            incompatible.extend(f"{uid} {item}" for item in element_conflicts)
+            continue
+        compatible_uids.append(uid)
+        if context.target_data_set is not None and uid not in linked_uids:
+            attach_uids.append(uid)
+
+    blocked = collisions + incompatible
+    if missing_uids and not scenario.metadata.synchronization.create_missing_objects:
+        blocked.append(
+            f"{len(missing_uids)} missing Data Elements while create_missing_objects=false"
+        )
+    if attach_uids and not scenario.metadata.synchronization.attach_compatible_data_elements:
+        blocked.append(
+            f"{len(attach_uids)} compatible Data Elements are not attached while "
+            "attach_compatible_data_elements=false"
+        )
+
+    plan = {
+        "scenario": scenario.id,
+        "job": context.job.id,
+        "dryRun": not apply,
+        "targetDataSetExists": context.target_data_set is not None,
+        "createDataSet": context.target_data_set is None,
+        "sourceDataElements": len(source_by_uid),
+        "compatibleDataElements": len(compatible_uids),
+        "createDataElements": missing_uids,
+        "attachDataElements": attach_uids,
+        "blocked": blocked,
+        "preparation": preparation_report,
+        "sourceArtifact": str(source_path),
+        "targetSnapshotArtifact": str(target_snapshot_path),
+    }
+    plan["requiresChanges"] = bool(
+        context.target_data_set is None or missing_uids or attach_uids
+    )
+    plan_path = _write_json(artifact_dir / "plan.json", plan)
+    if blocked:
+        _write_json(artifact_dir / "blocked.json", {"blocked": blocked})
+        raise PipelineError(
+            "Metadata reconciliation blocked: " + "; ".join(blocked[:10])
+        )
+
+    validations: list[dict[str, Any]] = []
+    commits: list[dict[str, Any]] = []
+    if context.target_data_set is None:
+        candidate, validation, reused = _validate_metadata_package(
+            target,
+            prepared,
+            import_strategy=scenario.metadata.import_strategy,
+            atomic_mode=scenario.metadata.atomic_mode,
+            skip_sharing=scenario.metadata.skip_sharing,
+        )
+        _assert_success_response(validation, "Target metadata reconciliation validation")
+        _write_json(artifact_dir / "canonical-package.json", candidate)
+        validations.append({"stage": "create_data_set", "response": validation})
+        plan["reusedExistingObjects"] = reused
+        if apply:
+            response = target.import_metadata(
+                candidate,
+                commit=True,
+                import_strategy=scenario.metadata.import_strategy,
+                atomic_mode=scenario.metadata.atomic_mode,
+                identifier="UID",
+                skip_sharing=scenario.metadata.skip_sharing,
+            )
+            _assert_success_response(response, "Target metadata reconciliation")
+            commits.append({"stage": "create_data_set", "response": response})
+    else:
+        if missing_uids:
+            create_package = _metadata_package_for_missing_data_elements(
+                prepared,
+                set(missing_uids),
+            )
+            candidate, validation, reused = _validate_metadata_package(
+                target,
+                create_package,
+                import_strategy="CREATE",
+                atomic_mode=scenario.metadata.atomic_mode,
+                skip_sharing=scenario.metadata.skip_sharing,
+            )
+            _assert_success_response(validation, "Missing target metadata validation")
+            _write_json(artifact_dir / "create-missing.json", candidate)
+            validations.append({"stage": "create_missing", "response": validation})
+            plan["reusedExistingObjects"] = reused
+            if apply:
+                response = target.import_metadata(
+                    candidate,
+                    commit=True,
+                    import_strategy="CREATE",
+                    atomic_mode=scenario.metadata.atomic_mode,
+                    identifier="UID",
+                    skip_sharing=scenario.metadata.skip_sharing,
+                )
+                _assert_success_response(response, "Create missing target metadata")
+                commits.append({"stage": "create_missing", "response": response})
+
+        membership_uids = sorted(set(missing_uids) | set(attach_uids))
+        if membership_uids:
+            membership_package = _data_set_membership_package(
+                target,
+                data_set_id=context.target_data_set.id,
+                data_element_ids=set(linked_uids) | set(membership_uids),
+            )
+            _write_json(artifact_dir / "attach.json", membership_package)
+            if not missing_uids or apply:
+                validation = target.import_metadata(
+                    membership_package,
+                    commit=False,
+                    import_strategy="CREATE_AND_UPDATE",
+                    atomic_mode=scenario.metadata.atomic_mode,
+                    identifier="UID",
+                    skip_sharing=scenario.metadata.skip_sharing,
+                )
+                _assert_success_response(validation, "Data Set membership validation")
+                validations.append({"stage": "attach", "response": validation})
+                if apply:
+                    response = target.import_metadata(
+                        membership_package,
+                        commit=True,
+                        import_strategy="CREATE_AND_UPDATE",
+                        atomic_mode=scenario.metadata.atomic_mode,
+                        identifier="UID",
+                        skip_sharing=scenario.metadata.skip_sharing,
+                    )
+                    _assert_success_response(response, "Attach target Data Elements")
+                    commits.append({"stage": "attach", "response": response})
+            else:
+                plan["attachmentValidationPendingCreateCommit"] = True
+
+    _write_json(artifact_dir / "validation.json", validations)
+    _write_json(artifact_dir / "commit.json", commits)
+    plan["validated"] = True
+    plan["committed"] = apply
+    plan["planArtifact"] = str(plan_path)
+
+    if apply:
+        verified = resolve_transfer_context(
+            scenario,
+            source,
+            target,
+            job_id=job_id,
+            start=context.start,
+            end=context.end,
+            start_period=None,
+            end_period=None,
+            years_back=None,
+            as_of=None,
+        )
+        plan["verifiedDataElements"] = len(verified.target_data_elements)
+        plan["targetDataSet"] = asdict(verified.target_data_set)
+        _write_metadata_caches(state_dir, source, target, verified)
+
+    report_path = _write_json(artifact_dir.parent / "metadata-summary.json", plan)
+    plan["reportPath"] = str(report_path)
+    _emit_progress(
+        progress,
+        "metadata.reconcile.done",
+        created=len(missing_uids) + int(context.target_data_set is None),
+        attached=len(attach_uids),
+        committed=apply,
+    )
+    return plan
+
+
+def _data_element_conflicts(
+    source: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    category_scheme: str,
+) -> list[str]:
+    conflicts: list[str] = []
+    for field in ("valueType", "domainType"):
+        source_value = source.get(field)
+        target_value = target.get(field)
+        if source_value and target_value and source_value != target_value:
+            conflicts.append(f"{field}: source={source_value}, target={target_value}")
+    source_category = _reference_key(source.get("categoryCombo"), category_scheme)
+    target_category = _reference_key(target.get("categoryCombo"), category_scheme)
+    if source_category and target_category and source_category != target_category:
+        conflicts.append(
+            f"categoryCombo: source={source_category}, target={target_category}"
+        )
+    return conflicts
+
+
+def _metadata_package_for_missing_data_elements(
+    package: dict[str, Any], missing_uids: set[str]
+) -> dict[str, Any]:
+    result = deepcopy(package)
+    result.pop("dataSets", None)
+    result.pop("dataEntryForms", None)
+    elements = result.get("dataElements")
+    if isinstance(elements, list):
+        result["dataElements"] = [
+            item
+            for item in elements
+            if isinstance(item, dict) and item.get("id") in missing_uids
+        ]
+    return result
+
+
+def _target_data_set_details(
+    target: DHIS2Client,
+    data_set_id: str | None,
+) -> dict[str, Any] | None:
+    if not data_set_id:
+        return None
+    reader = getattr(target, "data_set_details", None)
+    if not callable(reader):
+        return None
+    details = reader(data_set_id)
+    return details if isinstance(details, dict) else None
+
+
+def _data_set_membership_package(
+    target: DHIS2Client,
+    *,
+    data_set_id: str,
+    data_element_ids: set[str],
+) -> dict[str, Any]:
+    """Build an additive Data Set update while preserving existing DSE fields."""
+    details = _target_data_set_details(target, data_set_id) or {}
+    existing = details.get("dataSetElements")
+    memberships: dict[str, dict[str, Any]] = {}
+    if isinstance(existing, list):
+        for item in existing:
+            if not isinstance(item, dict):
+                continue
+            element_id = _reference_uid(item.get("dataElement"))
+            if not element_id:
+                continue
+            preserved = deepcopy(item)
+            preserved["dataSet"] = {"id": data_set_id}
+            preserved["dataElement"] = {"id": element_id}
+            memberships[element_id] = preserved
+    for element_id in data_element_ids:
+        memberships.setdefault(
+            element_id,
+            {
+                "dataSet": {"id": data_set_id},
+                "dataElement": {"id": element_id},
+            },
+        )
+    return {
+        "dataSets": [
+            {
+                "id": data_set_id,
+                "dataSetElements": [
+                    memberships[element_id]
+                    for element_id in sorted(memberships)
+                ],
+            }
+        ]
+    }
+
+
 def resolve_transfer_context(
     scenario: TransferScenario,
     source: DHIS2Client,
@@ -641,6 +1122,7 @@ def resolve_transfer_context(
     years_back: int | None,
     as_of: str | None,
     allow_metadata_repair: bool = False,
+    allow_incomplete_target: bool = False,
 ) -> TransferContext:
     job = scenario.get_job(job_id)
     resolved_start, resolved_end = _resolve_window(
@@ -737,6 +1219,7 @@ def resolve_transfer_context(
     repairs = _validate_data_set_compatibility(
         context,
         allow_metadata_repair=allow_metadata_repair,
+        allow_missing_target_elements=allow_incomplete_target,
     )
     return replace(context, category_combo_repairs=repairs)
 
@@ -745,6 +1228,7 @@ def _validate_data_set_compatibility(
     context: TransferContext,
     *,
     allow_metadata_repair: bool = False,
+    allow_missing_target_elements: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     expected = {
         "day": "Daily",
@@ -769,7 +1253,7 @@ def _validate_data_set_compatibility(
     source_keys = _metadata_keys(context.source_data_elements, scheme, "source Data Elements")
     target_keys = _metadata_keys(context.target_data_elements, scheme, "target Data Elements")
     missing = sorted(source_keys - target_keys)
-    if context.target_data_set and missing:
+    if context.target_data_set and missing and not allow_missing_target_elements:
         preview = ", ".join(missing[:10])
         raise PipelineError(
             f"Target Data Set is missing {len(missing)} Data Elements using {scheme.upper()} "
@@ -1623,7 +2107,7 @@ def _export_source_batch(
             context.job.period_type,
         )
         if not child_requests:
-            raise PipelineError(
+            raise TransientPipelineError(
                 "Source export timed out even for one DHIS2 period and one organisation "
                 f"unit ({start} to {end}, {organisation_unit_ids[0]}). Increase "
                 "DHIS2_TIMEOUT_SECONDS or inspect the source DHIS2 performance."
@@ -1719,6 +2203,603 @@ def _is_timeout_or_gateway_error(exc: HttpRequestError) -> bool:
     )
 
 
+def is_transient_transfer_http_error(exc: HttpRequestError) -> bool:
+    text = f"{exc.body} {exc}".lower()
+    return exc.status_code in {429, 502, 503, 504, 520, 522, 524} or any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "cloudflare",
+            "connection reset",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "nodename nor servname provided",
+        )
+    )
+
+
+def _version_unmappable_historical_values(
+    source: DHIS2Client,
+    target: DHIS2Client,
+    scenario: TransferScenario,
+    context: TransferContext,
+    data_values: list[dict[str, Any]],
+    *,
+    apply: bool,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Preserve non-remappable historical category semantics on versioned DEs.
+
+    A source Data Element may have changed CategoryCombo while old values still point
+    at the former CategoryOptionCombos.  When no exact option-set equivalent exists in
+    the current combo, the value is moved to a deterministic historical Data Element
+    on Y.  Its CategoryCombo and CategoryOptionCombo UIDs are preserved from X.
+    """
+    report: dict[str, Any] = {
+        "enabled": scenario.metadata.synchronization.historical_data_elements.enabled,
+        "checked": False,
+        "created": False,
+        "rewrittenValueCount": 0,
+        "mappings": [],
+        "validationPendingMetadataCommit": False,
+    }
+    policy = scenario.metadata.synchronization.historical_data_elements
+    if not policy.enabled or not data_values:
+        return data_values, report
+    if (
+        context.job.id_schemes.data_elements != "uid"
+        or context.job.id_schemes.category_option_combos != "uid"
+    ):
+        raise PipelineError(
+            "Versioned historical Data Elements require UID mapping for Data Elements "
+            "and CategoryOptionCombos."
+        )
+
+    source_elements = {
+        str(item["id"]): item
+        for item in context.source_data_elements
+        if item.get("id")
+    }
+    current_combo_ids = sorted(
+        {
+            combo_id
+            for item in context.source_data_elements
+            if (combo_id := _reference_uid(item.get("categoryCombo")))
+        }
+    )
+    # Older/simple Data Sets without category metadata need no historical audit.
+    if not current_combo_ids:
+        return data_values, report
+
+    _emit_progress(
+        progress,
+        "historical_data_elements.audit.start",
+        dataValues=len(data_values),
+    )
+    current_combos = source.category_option_combos_for_category_combos(
+        current_combo_ids
+    )
+    current_by_id = {
+        str(item["id"]): item for item in current_combos if item.get("id")
+    }
+    stale_usage: Counter[tuple[str, str, str]] = Counter()
+    missing_elements: Counter[str] = Counter()
+    for value in data_values:
+        element_id = str(value.get("dataElement") or "")
+        element = source_elements.get(element_id)
+        if element is None:
+            missing_elements[element_id or "<missing>"] += 1
+            continue
+        expected_combo = _reference_uid(element.get("categoryCombo"))
+        value_combo = str(value.get("categoryOptionCombo") or "")
+        current = current_by_id.get(value_combo)
+        if (
+            not expected_combo
+            or not value_combo
+            or (
+                current is not None
+                and _reference_uid(current.get("categoryCombo")) == expected_combo
+            )
+        ):
+            continue
+        stale_usage[(element_id, value_combo, expected_combo)] += 1
+
+    if missing_elements:
+        preview = ", ".join(
+            f"{key} ({count} values)"
+            for key, count in missing_elements.most_common(10)
+        )
+        raise PipelineError(
+            "Source values reference Data Elements outside the configured Data Set: "
+            + preview
+        )
+    report["checked"] = True
+    if not stale_usage:
+        _emit_progress(
+            progress,
+            "historical_data_elements.audit.done",
+            versions=0,
+            rewrittenValues=0,
+        )
+        return data_values, report
+
+    historical_ids = sorted({combo_id for _, combo_id, _ in stale_usage})
+    historical_combos = source.metadata_objects_by_ids(
+        resource="categoryOptionCombos",
+        root_key="categoryOptionCombos",
+        object_ids=historical_ids,
+        fields=(
+            "id,code,name,categoryCombo[id,code,name],"
+            "categoryOptions[id,code,name]"
+        ),
+    )
+    historical_by_id = {
+        str(item["id"]): item for item in historical_combos if item.get("id")
+    }
+    missing_combos = sorted(set(historical_ids) - set(historical_by_id))
+    if missing_combos:
+        raise PipelineError(
+            "Historical CategoryOptionCombo objects no longer exist on X: "
+            + ", ".join(missing_combos[:10])
+        )
+
+    current_by_semantics: dict[str, set[tuple[str, ...]]] = defaultdict(set)
+    for combo in current_combos:
+        parent_id = _reference_uid(combo.get("categoryCombo"))
+        if parent_id:
+            current_by_semantics[parent_id].add(
+                tuple(sorted(_reference_ids(combo.get("categoryOptions"))))
+            )
+
+    version_usage: Counter[tuple[str, str]] = Counter()
+    combo_to_version: dict[tuple[str, str], str] = {}
+    exact_equivalents = 0
+    for (element_id, combo_id, expected_combo), count in stale_usage.items():
+        historical = historical_by_id[combo_id]
+        semantics = tuple(sorted(_reference_ids(historical.get("categoryOptions"))))
+        if semantics in current_by_semantics.get(expected_combo, set()):
+            exact_equivalents += count
+            continue
+        historical_parent = _reference_uid(historical.get("categoryCombo"))
+        if not historical_parent:
+            raise PipelineError(
+                f"Historical CategoryOptionCombo {combo_id} has no parent CategoryCombo."
+            )
+        version_usage[(element_id, historical_parent)] += count
+        combo_to_version[(element_id, combo_id)] = historical_parent
+
+    # Exact equivalents are deliberately left untouched here and are handled by
+    # _normalise_source_category_option_combos after this phase.
+    if not version_usage:
+        report["exactEquivalentValueCount"] = exact_equivalents
+        _emit_progress(
+            progress,
+            "historical_data_elements.audit.done",
+            versions=0,
+            rewrittenValues=0,
+        )
+        return data_values, report
+    if context.target_data_set is None:
+        report.update(
+            {
+                "validationPendingMetadataCommit": True,
+                "reason": "canonical target Data Set must be committed first",
+                "plannedVersions": len(version_usage),
+            }
+        )
+        return data_values, report
+
+    parent_ids = sorted({parent for _, parent in version_usage})
+    parent_combos = source.metadata_objects_by_ids(
+        resource="categoryCombos",
+        root_key="categoryCombos",
+        object_ids=parent_ids,
+        fields="id,code,name,dataDimensionType,categories[id]",
+    )
+    parents_by_id = {
+        str(item["id"]): item for item in parent_combos if item.get("id")
+    }
+    if set(parent_ids) != set(parents_by_id):
+        missing = sorted(set(parent_ids) - set(parents_by_id))
+        raise PipelineError(
+            "Historical CategoryCombos no longer exist on X: "
+            + ", ".join(missing[:10])
+        )
+    category_ids = sorted(
+        {
+            category_id
+            for combo in parent_combos
+            for category_id in _reference_ids(combo.get("categories"))
+        }
+    )
+    categories = source.metadata_objects_by_ids(
+        resource="categories",
+        root_key="categories",
+        object_ids=category_ids,
+        fields="id,code,name,shortName,dataDimensionType,categoryOptions[id]",
+    )
+    option_ids = sorted(
+        {
+            option_id
+            for category in categories
+            for option_id in _reference_ids(category.get("categoryOptions"))
+        }
+        | {
+            option_id
+            for combo in historical_combos
+            for option_id in _reference_ids(combo.get("categoryOptions"))
+        }
+    )
+    category_options = source.metadata_objects_by_ids(
+        resource="categoryOptions",
+        root_key="categoryOptions",
+        object_ids=option_ids,
+        fields="id,code,name,shortName",
+    )
+    all_parent_combinations = source.category_option_combos_for_category_combos(
+        parent_ids
+    )
+    full_elements = source.metadata_objects_by_ids(
+        resource="dataElements",
+        root_key="dataElements",
+        object_ids=sorted({element for element, _ in version_usage}),
+        fields=(
+            "id,code,name,shortName,description,valueType,domainType,"
+            "aggregationType,zeroIsSignificant,optionSet[id]"
+        ),
+    )
+    full_elements_by_id = {
+        str(item["id"]): item for item in full_elements if item.get("id")
+    }
+
+    version_definitions: list[dict[str, Any]] = []
+    for (element_id, parent_id), count in sorted(version_usage.items()):
+        source_element = full_elements_by_id.get(element_id) or source_elements[element_id]
+        parent = parents_by_id[parent_id]
+        target_id = _stable_dhis2_uid("historical-data-element", element_id, parent_id)
+        parent_label = str(parent.get("name") or parent_id)
+        base_name = str(source_element.get("name") or element_id)
+        name = _limited_text(
+            f"{base_name}{policy.name_suffix} ({parent_label})", 230
+        )
+        short_name = _limited_text(name, 50)
+        source_code = str(source_element.get("code") or element_id)
+        code_suffix = f"_H_{hashlib.sha256(parent_id.encode()).hexdigest()[:8]}"
+        code = source_code[: 50 - len(code_suffix)] + code_suffix
+        version_definitions.append(
+            {
+                "sourceDataElement": element_id,
+                "historicalCategoryCombo": parent_id,
+                "targetDataElement": target_id,
+                "dataValues": count,
+                "name": name,
+                "code": code,
+                "metadata": _historical_data_element_payload(
+                    source_element,
+                    target_id=target_id,
+                    target_code=code,
+                    target_name=name,
+                    target_short_name=short_name,
+                    category_combo_id=parent_id,
+                ),
+            }
+        )
+
+    collections: dict[str, list[dict[str, Any]]] = {
+        "categoryOptions": category_options,
+        "categories": categories,
+        "categoryCombos": parent_combos,
+        "categoryOptionCombos": all_parent_combinations,
+        "dataElements": [item["metadata"] for item in version_definitions],
+    }
+    _assert_historical_target_compatibility(target, collections)
+    package = _missing_historical_metadata(target, collections)
+    existing_target_ids = {
+        str(item["id"])
+        for item in context.target_data_elements
+        if item.get("id")
+    }
+    version_ids = {str(item["targetDataElement"]) for item in version_definitions}
+    missing_memberships = version_ids - existing_target_ids
+    artifact_run = run_id(f"historical-{scenario.id}-{context.job.id}")
+    artifact_dir = (
+        scenario.job_state_dir(context.job.id)
+        / "runs"
+        / artifact_run
+        / "historical-metadata"
+    )
+    plan = {
+        "scenario": scenario.id,
+        "job": context.job.id,
+        "dryRun": not apply,
+        "versions": [
+            {key: value for key, value in item.items() if key != "metadata"}
+            for item in version_definitions
+        ],
+        "objectsToCreate": {
+            key: len(value) for key, value in package.items() if value
+        },
+        "dataSetMembershipsToAdd": sorted(missing_memberships),
+    }
+    _write_json(artifact_dir / "plan.json", plan)
+    validations: list[dict[str, Any]] = []
+    commits: list[dict[str, Any]] = []
+
+    with exclusive_lock(
+        scenario.state_dir / "locks" / "metadata.lock",
+        purpose=f"historical metadata for {scenario.id}/{context.job.id}",
+        transient_when_busy=True,
+    ):
+        non_empty_package = {key: value for key, value in package.items() if value}
+        if non_empty_package:
+            _emit_progress(
+                progress,
+                "historical_data_elements.metadata.validate.start",
+                versions=len(version_definitions),
+            )
+            validation = target.import_metadata(
+                non_empty_package,
+                commit=False,
+                import_strategy="CREATE",
+                atomic_mode=scenario.metadata.atomic_mode,
+                identifier="UID",
+                skip_sharing=scenario.metadata.skip_sharing,
+            )
+            _assert_success_response(validation, "Historical metadata validation")
+            validations.append({"stage": "create", "response": validation})
+            if apply:
+                commit = target.import_metadata(
+                    non_empty_package,
+                    commit=True,
+                    import_strategy="CREATE",
+                    atomic_mode=scenario.metadata.atomic_mode,
+                    identifier="UID",
+                    skip_sharing=scenario.metadata.skip_sharing,
+                )
+                _assert_success_response(commit, "Historical metadata creation")
+                commits.append({"stage": "create", "response": commit})
+
+        if missing_memberships:
+            membership_package = _data_set_membership_package(
+                target,
+                data_set_id=context.target_data_set.id,
+                data_element_ids=existing_target_ids | version_ids,
+            )
+            _write_json(artifact_dir / "membership.json", membership_package)
+            if not non_empty_package or apply:
+                validation = target.import_metadata(
+                    membership_package,
+                    commit=False,
+                    import_strategy="CREATE_AND_UPDATE",
+                    atomic_mode=scenario.metadata.atomic_mode,
+                    identifier="UID",
+                    skip_sharing=scenario.metadata.skip_sharing,
+                )
+                _assert_success_response(
+                    validation, "Historical Data Set membership validation"
+                )
+                validations.append({"stage": "attach", "response": validation})
+                if apply:
+                    commit = target.import_metadata(
+                        membership_package,
+                        commit=True,
+                        import_strategy="CREATE_AND_UPDATE",
+                        atomic_mode=scenario.metadata.atomic_mode,
+                        identifier="UID",
+                        skip_sharing=scenario.metadata.skip_sharing,
+                    )
+                    _assert_success_response(
+                        commit, "Historical Data Set membership update"
+                    )
+                    commits.append({"stage": "attach", "response": commit})
+            else:
+                plan["membershipValidationPendingCreateCommit"] = True
+
+    _write_json(artifact_dir / "validation.json", validations)
+    _write_json(artifact_dir / "commit.json", commits)
+    pending = bool((non_empty_package or missing_memberships) and not apply)
+    if pending:
+        report.update(
+            {
+                "mappings": plan["versions"],
+                "validationPendingMetadataCommit": True,
+                "planArtifact": str(artifact_dir / "plan.json"),
+            }
+        )
+        return data_values, report
+
+    target_elements = target.data_elements_for_data_set(
+        data_set_id=context.target_data_set.id,
+        page_size=500,
+    )
+    linked_ids = {str(item["id"]) for item in target_elements if item.get("id")}
+    missing_after_commit = sorted(version_ids - linked_ids)
+    if missing_after_commit:
+        raise PipelineError(
+            "Historical metadata import completed but these Data Elements are not linked "
+            "to the target Data Set: " + ", ".join(missing_after_commit)
+        )
+
+    target_for_pair = {
+        (str(item["sourceDataElement"]), str(item["historicalCategoryCombo"])):
+        str(item["targetDataElement"])
+        for item in version_definitions
+    }
+    rewritten = 0
+    for value in data_values:
+        element_id = str(value.get("dataElement") or "")
+        combo_id = str(value.get("categoryOptionCombo") or "")
+        parent_id = combo_to_version.get((element_id, combo_id))
+        target_id = target_for_pair.get((element_id, parent_id or ""))
+        if target_id:
+            value["dataElement"] = target_id
+            rewritten += 1
+
+    report.update(
+        {
+            "created": bool(commits),
+            "rewrittenValueCount": rewritten,
+            "mappings": plan["versions"],
+            "validationPendingMetadataCommit": False,
+            "planArtifact": str(artifact_dir / "plan.json"),
+            "validationArtifact": str(artifact_dir / "validation.json"),
+            "commitArtifact": str(artifact_dir / "commit.json"),
+            "exactEquivalentValueCount": exact_equivalents,
+        }
+    )
+    _emit_progress(
+        progress,
+        "historical_data_elements.audit.done",
+        versions=len(version_definitions),
+        rewrittenValues=rewritten,
+    )
+    return data_values, report
+
+
+def _historical_data_element_payload(
+    source: dict[str, Any],
+    *,
+    target_id: str,
+    target_code: str,
+    target_name: str,
+    target_short_name: str,
+    category_combo_id: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": target_id,
+        "code": target_code,
+        "name": target_name,
+        "shortName": target_short_name,
+        "valueType": source.get("valueType") or "NUMBER",
+        "domainType": source.get("domainType") or "AGGREGATE",
+        "aggregationType": source.get("aggregationType") or "SUM",
+        "categoryCombo": {"id": category_combo_id},
+    }
+    for field in ("description", "zeroIsSignificant"):
+        if field in source and source[field] is not None:
+            payload[field] = source[field]
+    option_set = _reference_uid(source.get("optionSet"))
+    if option_set:
+        payload["optionSet"] = {"id": option_set}
+    return payload
+
+
+def _stable_dhis2_uid(*parts: str) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).digest()
+    number = int.from_bytes(digest, "big")
+    encoded = ""
+    for _ in range(10):
+        number, index = divmod(number, len(alphabet))
+        encoded += alphabet[index]
+    first = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[digest[0] % 26]
+    return first + encoded
+
+
+def _limited_text(value: str, maximum: int) -> str:
+    return value if len(value) <= maximum else value[: maximum - 1].rstrip() + "…"
+
+
+def _assert_historical_target_compatibility(
+    target: DHIS2Client,
+    collections: dict[str, list[dict[str, Any]]],
+) -> None:
+    endpoints = {
+        "categoryOptions": "categoryOptions",
+        "categories": "categories",
+        "categoryCombos": "categoryCombos",
+        "categoryOptionCombos": "categoryOptionCombos",
+        "dataElements": "dataElements",
+    }
+    fields = {
+        "categoryOptions": "id,code,name,shortName",
+        "categories": "id,code,name,shortName,dataDimensionType,categoryOptions[id]",
+        "categoryCombos": "id,code,name,dataDimensionType,categories[id]",
+        "categoryOptionCombos": "id,code,name,categoryCombo[id],categoryOptions[id]",
+        "dataElements": (
+            "id,code,name,shortName,valueType,domainType,aggregationType,"
+            "categoryCombo[id]"
+        ),
+    }
+    conflicts: list[str] = []
+    for collection, source_items in collections.items():
+        ids = [str(item["id"]) for item in source_items if item.get("id")]
+        existing = target.metadata_objects_by_ids(
+            resource=endpoints[collection],
+            root_key=collection,
+            object_ids=ids,
+            fields=fields[collection],
+        )
+        expected_by_id = {
+            str(item["id"]): item for item in source_items if item.get("id")
+        }
+        for item in existing:
+            uid = str(item.get("id") or "")
+            expected = expected_by_id.get(uid)
+            if expected is None:
+                continue
+            if collection in {"categories", "categoryOptionCombos"}:
+                relation = (
+                    "categoryOptions"
+                    if collection in {"categories", "categoryOptionCombos"}
+                    else ""
+                )
+                if _reference_ids(expected.get(relation)) != _reference_ids(
+                    item.get(relation)
+                ):
+                    conflicts.append(f"{collection} {uid} {relation} differ")
+            if collection == "categoryCombos" and _reference_ids(
+                expected.get("categories")
+            ) != _reference_ids(item.get("categories")):
+                conflicts.append(f"categoryCombos {uid} categories differ")
+            if collection == "categoryOptionCombos" and _reference_uid(
+                expected.get("categoryCombo")
+            ) != _reference_uid(item.get("categoryCombo")):
+                conflicts.append(f"categoryOptionCombos {uid} parent differs")
+            if collection == "dataElements":
+                conflicts.extend(
+                    f"dataElements {uid} {conflict}"
+                    for conflict in _data_element_conflicts(
+                        expected, item, category_scheme="uid"
+                    )
+                )
+            for field in ("code", "name"):
+                left = expected.get(field)
+                right = item.get(field)
+                if left and right and left != right:
+                    conflicts.append(
+                        f"{collection} {uid} {field}: source={left!r}, target={right!r}"
+                    )
+    if conflicts:
+        raise PipelineError(
+            "Historical metadata synchronization blocked by incompatible objects on Y: "
+            + "; ".join(conflicts[:10])
+        )
+
+
+def _missing_historical_metadata(
+    target: DHIS2Client,
+    collections: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = {}
+    for collection, items in collections.items():
+        ids = [str(item["id"]) for item in items if item.get("id")]
+        existing = target.metadata_objects_by_ids(
+            resource=collection,
+            root_key=collection,
+            object_ids=ids,
+            fields="id",
+        )
+        existing_ids = {str(item["id"]) for item in existing if item.get("id")}
+        result[collection] = [
+            deepcopy(item)
+            for item in items
+            if item.get("id") and str(item["id"]) not in existing_ids
+        ]
+    return result
+
+
 def _target_payload(
     context: TransferContext, data_values: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1735,6 +2816,340 @@ def _target_payload(
             f"Target Data Set has no {scheme.upper()} for the configured mapping strategy."
         )
     return {"dataSet": selector, "dataValues": data_values}
+
+
+def _normalise_source_category_option_combos(
+    source: DHIS2Client,
+    context: TransferContext,
+    data_values: list[dict[str, Any]],
+    *,
+    ignored_data_elements: set[str] | None = None,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Replace stale source COC UIDs only when an exact current equivalent exists.
+
+    DHIS2 can retain historical data values after a Data Element CategoryCombo was
+    replaced.  The export API still returns those old CategoryOptionCombo UIDs, while
+    a current Data Set import rejects them with E8024.  Matching on the complete set of
+    CategoryOption UIDs preserves the value semantics without changing metadata.
+    """
+    report: dict[str, Any] = {
+        "checked": False,
+        "historicalCombinationCount": 0,
+        "remappedValueCount": 0,
+        "mappings": [],
+    }
+    if not data_values:
+        return data_values, report
+
+    data_element_scheme = context.job.id_schemes.data_elements
+    combo_scheme = context.job.id_schemes.category_option_combos
+    data_elements = _metadata_by_key(
+        context.source_data_elements,
+        data_element_scheme,
+    )
+    current_combo_ids = sorted(
+        {
+            combo_id
+            for item in context.source_data_elements
+            if (combo_id := _reference_uid(item.get("categoryCombo")))
+        }
+    )
+    if not current_combo_ids:
+        return data_values, report
+
+    _emit_progress(
+        progress,
+        "source.category_option_combos.audit.start",
+        dataValues=len(data_values),
+    )
+    current_combos = source.category_option_combos_for_category_combos(
+        current_combo_ids
+    )
+    identifier_field = "id" if combo_scheme == "uid" else "code"
+    current_by_identifier = {
+        str(item[identifier_field]): item
+        for item in current_combos
+        if item.get(identifier_field)
+    }
+
+    historical_usage: Counter[tuple[str, str, str]] = Counter()
+    missing_data_elements: Counter[str] = Counter()
+    ignored = ignored_data_elements or set()
+    for value in data_values:
+        data_element_key = str(value.get("dataElement") or "")
+        if data_element_key in ignored:
+            continue
+        element = data_elements.get(data_element_key)
+        if element is None:
+            missing_data_elements[data_element_key or "<missing>"] += 1
+            continue
+        expected_combo_id = _reference_uid(element.get("categoryCombo"))
+        value_combo = value.get("categoryOptionCombo")
+        if not expected_combo_id or not value_combo:
+            continue
+        value_combo_key = str(value_combo)
+        current = current_by_identifier.get(value_combo_key)
+        if current is not None and _reference_uid(
+            current.get("categoryCombo")
+        ) == expected_combo_id:
+            continue
+        historical_usage[
+            (data_element_key, value_combo_key, expected_combo_id)
+        ] += 1
+
+    if missing_data_elements:
+        preview = ", ".join(
+            f"{key} ({count} values)"
+            for key, count in missing_data_elements.most_common(10)
+        )
+        raise PipelineError(
+            "Source values reference Data Elements outside the configured source Data Set: "
+            + preview
+        )
+
+    report["checked"] = True
+    if not historical_usage:
+        _emit_progress(
+            progress,
+            "source.category_option_combos.audit.done",
+            historicalCombinations=0,
+            remappedValues=0,
+        )
+        return data_values, report
+
+    if combo_scheme != "uid":
+        raise PipelineError(
+            "Historical CategoryOptionCombo reconciliation currently requires "
+            "mapping.category_option_combos: uid."
+        )
+
+    historical_ids = sorted({item[1] for item in historical_usage})
+    historical_objects = source.metadata_objects_by_ids(
+        resource="categoryOptionCombos",
+        root_key="categoryOptionCombos",
+        object_ids=historical_ids,
+        fields=(
+            "id,code,name,categoryCombo[id,code,name],"
+            "categoryOptions[id,code,name]"
+        ),
+    )
+    historical_by_id = {
+        str(item["id"]): item for item in historical_objects if item.get("id")
+    }
+
+    current_by_semantics: dict[
+        str, dict[tuple[str, ...], dict[str, Any]]
+    ] = defaultdict(dict)
+    for item in current_combos:
+        parent_id = _reference_uid(item.get("categoryCombo"))
+        identifier = item.get(identifier_field)
+        if not parent_id or not identifier:
+            continue
+        semantics = tuple(sorted(_reference_ids(item.get("categoryOptions"))))
+        existing = current_by_semantics[parent_id].get(semantics)
+        if existing is not None and existing.get(identifier_field) != identifier:
+            raise PipelineError(
+                "Source metadata contains duplicate current CategoryOptionCombos for "
+                f"CategoryCombo {parent_id} and options {semantics}."
+            )
+        current_by_semantics[parent_id][semantics] = item
+
+    replacements: dict[tuple[str, str], str] = {}
+    replacement_counts: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
+    unresolved: list[str] = []
+    for (data_element_key, historical_id, expected_combo_id), count in sorted(
+        historical_usage.items()
+    ):
+        historical = historical_by_id.get(historical_id)
+        if historical is None:
+            unresolved.append(
+                f"{historical_id} for Data Element {data_element_key}: object not found on X"
+            )
+            continue
+        semantics = tuple(sorted(_reference_ids(historical.get("categoryOptions"))))
+        replacement = current_by_semantics.get(expected_combo_id, {}).get(semantics)
+        replacement_id = replacement.get(identifier_field) if replacement else None
+        if not replacement_id:
+            option_names = sorted(
+                str(item.get("name") or item.get("id"))
+                for item in historical.get("categoryOptions", [])
+                if isinstance(item, dict)
+            )
+            label = ", ".join(option_names) or "no category options"
+            unresolved.append(
+                f"{historical_id} ({label}) for Data Element {data_element_key}: "
+                f"no exact equivalent in current CategoryCombo {expected_combo_id} "
+                f"({count} values)"
+            )
+            continue
+        replacement_key = str(replacement_id)
+        replacements[(data_element_key, historical_id)] = replacement_key
+        replacement_counts[(historical_id, replacement_key, semantics)] += count
+
+    if unresolved:
+        raise PipelineError(
+            "Source values use historical CategoryOptionCombos that cannot be mapped "
+            "losslessly to the Data Elements' current CategoryCombos. Transfer stopped "
+            "before metadata or data commit: "
+            + "; ".join(unresolved[:10])
+        )
+
+    destination_pairs = {
+        (data_element, replacement)
+        for (data_element, _historical), replacement in replacements.items()
+    }
+    seen_destination_keys: dict[tuple[str, ...], str] = {}
+    collisions: Counter[tuple[str, ...]] = Counter()
+    for value in data_values:
+        data_element_key = str(value.get("dataElement") or "")
+        source_combo_key = str(value.get("categoryOptionCombo") or "")
+        effective_combo_key = replacements.get(
+            (data_element_key, source_combo_key),
+            source_combo_key,
+        )
+        if (data_element_key, effective_combo_key) not in destination_pairs:
+            continue
+        effective_key = tuple(
+            str(child or "")
+            for child in (
+                data_element_key,
+                value.get("period"),
+                value.get("orgUnit"),
+                effective_combo_key,
+                value.get("attributeOptionCombo"),
+            )
+        )
+        previous_combo = seen_destination_keys.get(effective_key)
+        if previous_combo is not None:
+            collisions[effective_key] += 1
+        else:
+            seen_destination_keys[effective_key] = source_combo_key
+
+    if collisions:
+        preview = "; ".join(
+            f"dataElement={key[0]}, period={key[1]}, orgUnit={key[2]}, "
+            f"categoryOptionCombo={key[3]} ({count + 1} values)"
+            for key, count in collisions.most_common(10)
+        )
+        raise PipelineError(
+            "Historical CategoryOptionCombo remapping would create duplicate data value "
+            f"keys, so the transfer was blocked before commit: {preview}"
+        )
+
+    for value in data_values:
+        key = (
+            str(value.get("dataElement") or ""),
+            str(value.get("categoryOptionCombo") or ""),
+        )
+        replacement = replacements.get(key)
+        if replacement is not None:
+            value["categoryOptionCombo"] = replacement
+
+    mappings = [
+        {
+            "source": source_id,
+            "target": target_id,
+            "categoryOptions": list(options),
+            "dataValues": count,
+        }
+        for (source_id, target_id, options), count in sorted(
+            replacement_counts.items()
+        )
+    ]
+    remapped_count = sum(replacement_counts.values())
+    report.update(
+        {
+            "historicalCombinationCount": len(replacement_counts),
+            "remappedValueCount": remapped_count,
+            "mappings": mappings,
+        }
+    )
+    _emit_progress(
+        progress,
+        "source.category_option_combos.audit.done",
+        historicalCombinations=len(replacement_counts),
+        remappedValues=remapped_count,
+    )
+    return data_values, report
+
+
+def _validate_target_category_option_combos(
+    target: DHIS2Client,
+    context: TransferContext,
+    data_values: list[dict[str, Any]],
+    *,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """Ensure every value COC exists under the target Data Element current combo."""
+    if not data_values or context.target_data_set is None:
+        return
+    data_element_scheme = context.job.id_schemes.data_elements
+    combo_scheme = context.job.id_schemes.category_option_combos
+    data_elements = _metadata_by_key(
+        context.target_data_elements,
+        data_element_scheme,
+    )
+    current_combo_ids = sorted(
+        {
+            combo_id
+            for item in context.target_data_elements
+            if (combo_id := _reference_uid(item.get("categoryCombo")))
+        }
+    )
+    if not current_combo_ids:
+        return
+
+    _emit_progress(progress, "target.category_option_combos.audit.start")
+    target_combos = target.category_option_combos_for_category_combos(
+        current_combo_ids
+    )
+    identifier_field = "id" if combo_scheme == "uid" else "code"
+    target_by_identifier = {
+        str(item[identifier_field]): item
+        for item in target_combos
+        if item.get(identifier_field)
+    }
+    conflicts: Counter[tuple[str, str, str]] = Counter()
+    for value in data_values:
+        data_element_key = str(value.get("dataElement") or "")
+        value_combo_key = str(value.get("categoryOptionCombo") or "")
+        if not value_combo_key:
+            continue
+        element = data_elements.get(data_element_key)
+        expected_combo_id = (
+            _reference_uid(element.get("categoryCombo")) if element else None
+        )
+        target_combo = target_by_identifier.get(value_combo_key)
+        actual_combo_id = (
+            _reference_uid(target_combo.get("categoryCombo"))
+            if target_combo
+            else None
+        )
+        if not expected_combo_id or actual_combo_id != expected_combo_id:
+            conflicts[
+                (
+                    data_element_key or "<missing>",
+                    value_combo_key,
+                    expected_combo_id or "<missing>",
+                )
+            ] += 1
+
+    if conflicts:
+        preview = "; ".join(
+            f"Data Element {data_element}, CategoryOptionCombo {combo}, "
+            f"expected CategoryCombo {expected} ({count} values)"
+            for (data_element, combo, expected), count in conflicts.most_common(10)
+        )
+        raise PipelineError(
+            "Target CategoryOptionCombo preflight failed; DHIS2 would reject these values "
+            f"with E8024: {preview}"
+        )
+    _emit_progress(
+        progress,
+        "target.category_option_combos.audit.done",
+        categoryOptionCombinations=len(target_by_identifier),
+    )
 
 
 def _chunk_payload(payload: dict[str, Any], chunk_size: int) -> list[dict[str, Any]]:
@@ -1771,7 +3186,7 @@ def _review_payload(
         "end": context.end,
         "metadataMode": scenario.metadata.mode,
         "metadataBootstrapRequired": context.metadata_bootstrap_required,
-        "stateDirectory": str(scenario.state_dir),
+        "stateDirectory": str(scenario.job_state_dir(context.job.id)),
     }
 
 
@@ -1942,7 +3357,12 @@ def _emit_progress(
 
 def _write_json(path: Path, payload: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
     return path
 
 

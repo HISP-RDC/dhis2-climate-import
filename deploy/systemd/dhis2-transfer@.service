@@ -1,0 +1,29 @@
+[Unit]
+Description=Transfert DHIS2 X vers Y — job %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=meleck
+Group=meleck
+WorkingDirectory=/opt/dhis2-climate-import
+Environment=PYTHONPATH=/opt/dhis2-climate-import/src
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStartPre=/usr/bin/test -r /opt/dhis2-climate-import/.env
+ExecStart=/opt/dhis2-climate-import/.venv/bin/python -m dhis2_climate_import --env-file /opt/dhis2-climate-import/.env transfer --instances /opt/dhis2-climate-import/config/instances.yaml --scenario /opt/dhis2-climate-import/config/scenarios/dhis2-x-to-y.yaml run %i --apply
+
+# Exit 2 is permanent (configuration, permissions, incompatibility). Exit 75 is
+# transient and is restarted after the internal retry policy is exhausted.
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=60s
+TimeoutStartSec=infinity
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dhis2-transfer-%i
+
+[Install]
+WantedBy=multi-user.target
