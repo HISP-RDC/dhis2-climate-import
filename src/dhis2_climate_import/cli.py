@@ -638,6 +638,14 @@ def cmd_transfer_run_window(args: argparse.Namespace) -> None:
             "sourceDataValueCount": result["sourceDataValueCount"],
             "targetDataValueCount": result["targetDataValueCount"],
             "counts": result["counts"],
+            "invalidDataValueQuarantine": result.get(
+                "invalidDataValueQuarantine",
+                {
+                    "errorCode": "E8120",
+                    "quarantinedDataValueCount": 0,
+                    "artifact": None,
+                },
+            ),
             "timelinessQuarantine": result["timelinessQuarantine"],
             "dataValidationPendingMetadataCommit": result[
                 "dataValidationPendingMetadataCommit"
@@ -734,20 +742,53 @@ def cmd_transfer_reconcile_metadata(args: argparse.Namespace) -> None:
         purpose=f"canonical metadata for {scenario.id}/{args.job_id}",
         transient_when_busy=True,
     ):
-        result = reconcile_target_metadata(
-            scenario,
-            source,
-            target,
-            job_id=args.job_id,
-            apply=args.apply,
-            start=args.start,
-            end=args.end,
-            start_period=args.start_period,
-            end_period=args.end_period,
-            years_back=args.years_back,
-            as_of=args.as_of,
-            progress=_transfer_progress,
-        )
+        job = scenario.get_job(args.job_id)
+        policy = job.organisation_units.synchronization
+        organisation_units = None
+        if policy.enabled and policy.run_before_transfer:
+            organisation_units = reconcile_target_organisation_units(
+                scenario,
+                source,
+                target,
+                job_id=args.job_id,
+                apply=args.apply,
+                progress=_transfer_progress,
+            )
+        if (
+            not args.apply
+            and organisation_units is not None
+            and organisation_units.get("requiresChanges")
+        ):
+            result = {
+                "scenario": scenario.id,
+                "job": args.job_id,
+                "dryRun": True,
+                "status": "organisation_unit_changes_required",
+                "requiresChanges": True,
+                "committed": False,
+                "organisationUnits": organisation_units,
+                "nextStep": (
+                    "Run reconcile-metadata with --apply, or run the transfer with "
+                    "--apply; organisation units will be committed before metadata."
+                ),
+            }
+        else:
+            result = reconcile_target_metadata(
+                scenario,
+                source,
+                target,
+                job_id=args.job_id,
+                apply=args.apply,
+                start=args.start,
+                end=args.end,
+                start_period=args.start_period,
+                end_period=args.end_period,
+                years_back=args.years_back,
+                as_of=args.as_of,
+                progress=_transfer_progress,
+            )
+            if organisation_units is not None:
+                result["organisationUnits"] = organisation_units
     _print_json(result)
 
 
@@ -772,20 +813,62 @@ def cmd_transfer_reconcile_organisation_units(args: argparse.Namespace) -> None:
 
 
 def cmd_transfer_repair_metadata(args: argparse.Namespace) -> None:
-    _env, scenario, source, target = _transfer_runtime(args)
-    result = repair_target_metadata(
-        scenario,
-        source,
-        target,
-        job_id=args.job_id,
-        apply=args.apply,
-        start=args.start,
-        end=args.end,
-        start_period=args.start_period,
-        end_period=args.end_period,
-        years_back=args.years_back,
-        as_of=args.as_of,
+    _env, scenario, source, target = _transfer_runtime(
+        args, progress=_transfer_progress
     )
+    with exclusive_lock(
+        scenario.state_dir / "locks" / "metadata.lock",
+        purpose=f"metadata repair for {scenario.id}/{args.job_id}",
+        transient_when_busy=True,
+    ):
+        job = scenario.get_job(args.job_id)
+        policy = job.organisation_units.synchronization
+        organisation_units = None
+        if policy.enabled and policy.run_before_transfer:
+            organisation_units = reconcile_target_organisation_units(
+                scenario,
+                source,
+                target,
+                job_id=args.job_id,
+                apply=args.apply,
+                progress=_transfer_progress,
+            )
+        if (
+            not args.apply
+            and organisation_units is not None
+            and organisation_units.get("requiresChanges")
+        ):
+            _print_json(
+                {
+                    "scenario": scenario.id,
+                    "job": args.job_id,
+                    "dryRun": True,
+                    "status": "organisation_unit_changes_required",
+                    "requiresChanges": True,
+                    "committed": False,
+                    "organisationUnits": organisation_units,
+                    "nextStep": (
+                        "Run repair-metadata with --apply, or run the transfer with "
+                        "--apply; organisation units will be committed first."
+                    ),
+                }
+            )
+            return
+        result = repair_target_metadata(
+            scenario,
+            source,
+            target,
+            job_id=args.job_id,
+            apply=args.apply,
+            start=args.start,
+            end=args.end,
+            start_period=args.start_period,
+            end_period=args.end_period,
+            years_back=args.years_back,
+            as_of=args.as_of,
+        )
+        if organisation_units is not None:
+            result["organisationUnits"] = organisation_units
     if result["status"] == "not_required":
         _print_json(result)
         return
@@ -798,6 +881,7 @@ def cmd_transfer_repair_metadata(args: argparse.Namespace) -> None:
             "status": result["status"],
             "repair": result["repair"],
             "structure": {
+                "required": result["structure"].get("required", True),
                 "validated": result["structure"]["validated"],
                 "committed": result["structure"]["committed"],
             },

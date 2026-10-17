@@ -42,6 +42,11 @@ class CliErrorFormattingTests(unittest.TestCase):
                 "sourceDataValueCount": 120374,
                 "targetDataValueCount": 105374,
                 "counts": {"updated": 105374},
+                "invalidDataValueQuarantine": {
+                    "errorCode": "E8120",
+                    "quarantinedDataValueCount": 1,
+                    "artifact": "e8120.json",
+                },
                 "timelinessQuarantine": {
                     "errorCode": "E8031",
                     "quarantinedDataValueCount": 15000,
@@ -68,6 +73,10 @@ class CliErrorFormattingTests(unittest.TestCase):
             payload = print_json.call_args.args[0]
             self.assertEqual(payload["status"], "success_with_quarantine")
             self.assertEqual(payload["targetDataValueCount"], 105374)
+            self.assertEqual(
+                payload["invalidDataValueQuarantine"]["quarantinedDataValueCount"],
+                1,
+            )
             self.assertEqual(
                 payload["timelinessQuarantine"]["quarantinedDataValueCount"],
                 15000,

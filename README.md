@@ -230,6 +230,12 @@ With `exclude`, target validation also quarantines only values rejected with DHI
 exact `OU + period` rows under `runs/<transfer-run>/data-value-quarantine/e8031.json`. It does not
 alter target opening/closing dates, and any mixed conflict remains blocking.
 
+Source rows with an absent, null, or whitespace-only `value` are quarantined before the target
+dry-run because DHIS2 would reject them with `E8120`. Numeric zero and boolean false are preserved.
+The exact rows are written to `runs/<transfer-run>/data-value-quarantine/e8120.json`, exposed as
+`invalidDataValueQuarantine`, and included in child and parent counts. A window containing only
+invalid values remains blocked.
+
 Prepare profiles and a scenario:
 
 ```sh
@@ -284,6 +290,12 @@ the target DataSet assignments under the same metadata lock. Caches,
 artifacts, reports, and the SQLite journal are isolated per job under
 `state/<target-profile>/<scenario>/jobs/<job>/`.
 
+The standalone `reconcile-metadata` command follows the same ordering. If its dry-run finds a safe
+missing organisation unit, it returns `organisation_unit_changes_required`; only `--apply` creates
+the hierarchy before continuing. This shared scenario policy applies to every job. Under UID
+mapping, a missing target code is audited as a warning; two different non-empty codes, or different
+labels, remain blocking.
+
 `transfer run` splits the requested range according to `transfer.execution.period_batch_size`.
 Each window runs in a child process by default, so Linux reclaims its memory before the next one.
 Successful windows are checkpointed in SQLite and skipped on restart unless `--force` is supplied.
@@ -315,12 +327,15 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
 The lower-level `repair-metadata` command remains available for auditing the narrowly supported
 legacy case; incompatible objects containing values are never overwritten automatically.
 
-The repair accepts only matching UIDs and identity fields, empty target CategoryCombos, Data
-Elements with no target Data Set membership, and no raw or deleted target values between 1900 and
-2100 under the target account's organisation-unit roots. It first updates CategoryCombo structure,
-then validates and commits CategoryOptionCombos and Data Element assignments. A dry-run validates
-the first stage without mutation; the second stage necessarily remains pending until the first
-stage has been committed. Source, structure, assignment, rollback-evidence, and report artifacts
+The repair accepts only matching UIDs and identity fields, empty or already-compatible target
+CategoryCombos, Data Elements with no target Data Set membership, and no raw or deleted target
+values between 1900 and 2100 under the target account's organisation-unit roots. It first updates
+CategoryCombo structure,
+then validates and commits CategoryOptionCombos, referenced OptionSets/Options, and Data Element
+assignments. Existing OptionSet dependencies are reused only after a semantic compatibility check.
+A dry-run validates the first stage without mutation; the second stage necessarily remains pending
+until the first stage has been committed. A rerun after a partial first-stage success resumes at the
+assignment stage. Source, structure, assignment, rollback-evidence, progress, and report artifacts
 are retained under the scenario state directory.
 
 With `identity_strategy: preserve_uid`, target discovery first uses `target_data_set`, then falls

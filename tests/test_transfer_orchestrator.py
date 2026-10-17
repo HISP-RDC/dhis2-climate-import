@@ -301,7 +301,12 @@ class TransferOrchestratorTests(unittest.TestCase):
                 return {
                     "status": "success_with_quarantine",
                     "sourceDataValueCount": 10,
-                    "counts": {"imported": 7},
+                    "counts": {"imported": 5},
+                    "invalidDataValueQuarantine": {
+                        "errorCode": "E8120",
+                        "quarantinedDataValueCount": 2,
+                        "artifact": "e8120.json",
+                    },
                     "timelinessQuarantine": {
                         "errorCode": "E8031",
                         "quarantinedDataValueCount": 3,
@@ -334,7 +339,11 @@ class TransferOrchestratorTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "success_with_quarantine")
             self.assertEqual(result["sourceDataValueCount"], 10)
-            self.assertEqual(result["targetDataValueCount"], 7)
+            self.assertEqual(result["targetDataValueCount"], 5)
+            self.assertEqual(
+                result["invalidDataValueQuarantine"]["quarantinedDataValueCount"],
+                2,
+            )
             self.assertEqual(
                 result["timelinessQuarantine"]["quarantinedDataValueCount"],
                 3,

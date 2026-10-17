@@ -48,6 +48,7 @@ Le pipeline sait :
 - planifier et créer explicitement les unités absentes avec toute leur chaîne de parents ;
 - créer un Data Set cible manquant avec un paquet minimal de dépendances ;
 - réutiliser les dépendances déjà présentes sur Y sans les mettre à jour implicitement ;
+- transporter les `OptionSet` et leurs `Options` référencés par les Data Elements réparés ;
 - bloquer un transfert lorsque les Data Elements existants sont incompatibles ;
 - réparer explicitement un cas limité de CategoryCombo incomplet avec `repair-metadata` ;
 - découper les requêtes source par unités d’organisation et périodes DHIS2 ;
@@ -64,7 +65,8 @@ Le pipeline sait :
 - conserver les anciennes sémantiques de catégories dans des Data Elements historiques versionnés ;
 - isoler une collision d’UID historique dans un graphe cloné sans modifier l’objet existant sur Y ;
 - sérialiser les jobs, les changements de métadonnées et la concurrence globale ;
-- isoler le cache, le journal, les rapports et les artefacts par job.
+- isoler le cache, le journal, les rapports et les artefacts par job ;
+- mettre en quarantaine les valeurs source absentes ou vides avant la validation DHIS2.
 
 ### 3.2 Limites assumées
 
@@ -296,6 +298,7 @@ target:
 | Data Element compatible mais non rattaché au Data Set | Rattacher au Data Set |
 | Même UID, CategoryCombo cible par défaut, aucune valeur | Réparation sécurisée possible |
 | Même code mais UID différent | Bloquer et demander un mapping explicite |
+| Même UID, code présent sur X mais absent sur Y | Continuer avec un avertissement ; l’UID reste l’identité |
 | `valueType` ou `domainType` différent | Bloquer |
 | CategoryCombo différent avec valeurs existantes | Bloquer |
 | UID d’un graphe strictement historique déjà incompatible sur Y | Cloner tout le graphe sous de nouveaux UID si la stratégie vaut `clone` |
@@ -334,6 +337,19 @@ PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
   reconcile-metadata hospital_service --apply
 ```
+
+Cette commande exécute d’abord la réconciliation des unités d’organisation lorsque
+`run_before_transfer: true`. En `--dry-run`, une unité sûre mais absente produit le statut
+`organisation_unit_changes_required` : elle est seulement validée, jamais créée. En `--apply`, la
+hiérarchie est créée avant la réconciliation des métadonnées. Cette séquence est héritée par tous
+les jobs et ne dépend pas de `hospital_service`.
+
+Une réparation de Data Element inclut aussi la fermeture de ses dépendances `OptionSet -> Options`.
+Un objet absent est créé ; un objet déjà présent n’est réutilisé que si son UID, son identité, son
+type et ses membres sont compatibles. Une différence reste bloquante. Si une première tentative a
+déjà validé et commis le CategoryCombo avant d’échouer sur les affectations, l’exécution suivante
+reconnaît la structure compatible et reprend directement la validation des affectations. Chaque
+étape est inscrite dans `<job>.repair.progress.json`.
 
 ### 8.5 Synchronisation de la hiérarchie des unités d’organisation
 
@@ -444,6 +460,18 @@ lot. L’audit complet se trouve dans
 bloqué afin de ne masquer aucune incompatibilité. Une fenêtre dont 100 % des valeurs seraient
 retirées reste également bloquée, car elle ne constituerait pas un transfert réussi.
 
+L’artefact E8031 est réécrit immédiatement après chaque exclusion. Il reste donc disponible même
+si un chunk ultérieur échoue avec un autre conflit.
+
+### 8.7 Valeurs source absentes ou vides (`E8120`)
+
+Avant le dry-run cible, le pipeline retire uniquement les lignes dont `value` est absent, `null` ou
+composé d’espaces. La valeur numérique `0` et le booléen `false` restent valides. Les lignes retirées
+sont conservées dans `runs/<transfer-run>/data-value-quarantine/e8120.json`, exposées dans
+`invalidDataValueQuarantine`, et donnent le statut `success_with_quarantine`. Si toutes les valeurs
+de la fenêtre sont invalides, la fenêtre est bloquée au lieu d’être enregistrée comme un succès
+vide.
+
 La création automatique d’objets absents peut être autorisée par le YAML. Les mises à jour d’objets
 existants restent soumises aux critères `safe_repair`. Un objet contenant des valeurs ou utilisé
 ailleurs n’est jamais modifié automatiquement.
@@ -517,6 +545,9 @@ state/<target>/<scenario>/jobs/<job>/
       repaired.json
       blocked.json
       rollback-evidence.json
+    data-value-quarantine/
+      e8031.json
+      e8120.json
     windows/
       2017-01__2017-03/
         report.json

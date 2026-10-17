@@ -386,6 +386,106 @@ class TransferTests(unittest.TestCase):
                     current_run_id="transfer-test",
                 )
 
+    def test_e8031_audit_survives_a_later_validation_conflict(self) -> None:
+        class LaterConflictTarget:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def import_data_value_set(self, payload, **kwargs):
+                self.calls += 1
+                error_code = "E8031" if self.calls == 1 else "E8120"
+                raise HttpRequestError(
+                    "POST",
+                    "https://y.example.org/api/dataValueSets",
+                    409,
+                    json.dumps(
+                        {
+                            "response": {
+                                "conflicts": [
+                                    {"errorCode": error_code, "indexes": [0]}
+                                ]
+                            }
+                        }
+                    ),
+                )
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+                organisation_unit_run_before_transfer=True,
+                organisation_unit_conflict_policy="exclude",
+            )
+            state_dir = scenario.job_state_dir("weekly_climate")
+            context = SimpleNamespace(job=scenario.get_job("weekly_climate"))
+            with self.assertRaises(HttpRequestError):
+                _validate_target_chunks(
+                    LaterConflictTarget(),
+                    [
+                        {
+                            "dataValues": [
+                                {"orgUnit": "ClosedOu001", "period": "201701"},
+                                {"orgUnit": "OpenOrg0001", "period": "201701"},
+                            ]
+                        }
+                    ],
+                    context=context,
+                    state_dir=state_dir,
+                    current_run_id="transfer-test",
+                )
+
+            artifact = (
+                state_dir
+                / "runs"
+                / "transfer-test"
+                / "data-value-quarantine"
+                / "e8031.json"
+            )
+            self.assertTrue(artifact.exists())
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual(payload["quarantinedDataValueCount"], 1)
+
+    def test_run_quarantines_empty_values_but_preserves_numeric_zero(self) -> None:
+        class Source(FakeTransferClient):
+            def export_data_values(self, **kwargs):
+                return {
+                    "dataValues": [
+                        {
+                            "dataElement": "DataEl00001",
+                            "period": "2026W01",
+                            "orgUnit": "OrgUnit00001",
+                            "value": "   ",
+                        },
+                        {
+                            "dataElement": "DataEl00002",
+                            "period": "2026W01",
+                            "orgUnit": "OrgUnit00001",
+                            "value": 0,
+                        },
+                    ]
+                }
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(Path(tmp), chunk_size=5000)
+            report = run_transfer(
+                scenario,
+                Source("https://x.example.org"),
+                FakeTransferClient(
+                    "https://y.example.org",
+                    target_has_dataset=True,
+                ),
+                job_id="weekly_climate",
+                apply=False,
+            )
+
+            quarantine = report["invalidDataValueQuarantine"]
+            self.assertEqual(report["status"], "success_with_quarantine")
+            self.assertEqual(report["sourceDataValueCount"], 2)
+            self.assertEqual(report["targetDataValueCount"], 1)
+            self.assertEqual(quarantine["quarantinedDataValueCount"], 1)
+            self.assertTrue(Path(quarantine["artifact"]).exists())
+
     def test_metadata_bootstrap_keeps_only_effective_org_unit_selection(self) -> None:
         package = {
             "dataSets": [
@@ -967,6 +1067,36 @@ class TransferTests(unittest.TestCase):
                     job_id="weekly_climate",
                     apply=False,
                 )
+
+    def test_reconcile_warns_when_uid_matches_but_target_codes_are_absent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(Path(tmp), chunk_size=5000)
+            source = FakeTransferClient("https://x.example.org")
+            target = FakeTransferClient(
+                "https://y.example.org",
+                target_has_dataset=True,
+            )
+            target.data_set = DataSetRef(
+                id="DataSet0001",
+                code=None,
+                name="Climate Weekly",
+                period_type="Weekly",
+            )
+            for item in target.elements:
+                item["code"] = None
+            target.global_target_elements = target.elements
+
+            result = reconcile_target_metadata(
+                scenario,
+                source,
+                target,
+                job_id="weekly_climate",
+                apply=False,
+            )
+
+            self.assertEqual(result["blocked"], [])
+            self.assertEqual(len(result["identityWarnings"]), 3)
+            self.assertIn("UID identity remains authoritative", result["identityWarnings"][0])
 
     def test_reconcile_validates_creation_of_missing_data_element(self) -> None:
         class MissingTarget(FakeTransferClient):
@@ -1629,6 +1759,67 @@ class TransferTests(unittest.TestCase):
                     job_id="weekly_climate",
                 )
 
+    def test_review_reports_a_safe_missing_org_unit_plan_instead_of_blocking(self) -> None:
+        root = {
+            "id": "RootUnit001",
+            "code": "ROOT",
+            "name": "Country",
+            "shortName": "Country",
+            "openingDate": "2000-01-01",
+            "path": "/RootUnit001",
+            "level": 1,
+        }
+        child = {
+            "id": "OrgUnit00001",
+            "code": "OU-1",
+            "name": "Zone 1",
+            "shortName": "Zone 1",
+            "openingDate": "2000-01-01",
+            "parent": {"id": "RootUnit001"},
+            "path": "/RootUnit001/OrgUnit00001",
+            "level": 2,
+        }
+
+        class Source(FakeTransferClient):
+            def organisation_units_for_data_set(self, data_set_id):
+                return [child]
+
+            def metadata_objects_by_ids(self, **kwargs):
+                wanted = set(kwargs["object_ids"])
+                return [item for item in (root, child) if item["id"] in wanted]
+
+        class Target(FakeTransferClient):
+            def __init__(self):
+                super().__init__("https://y.example.org", target_units=[root])
+
+            def metadata_objects_by_ids(self, **kwargs):
+                if kwargs["resource"] != "organisationUnits":
+                    return []
+                wanted = set(kwargs["object_ids"])
+                return [item for item in self.target_units if item["id"] in wanted]
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                organisation_unit_synchronization=True,
+                organisation_unit_run_before_transfer=True,
+                organisation_unit_conflict_policy="exclude",
+            )
+            result = review_transfer(
+                scenario,
+                Source("https://x.example.org"),
+                Target(),
+                job_id="weekly_climate",
+            )
+
+            self.assertEqual(result["status"], "organisation_unit_changes_required")
+            self.assertEqual(
+                result["organisationUnits"]["organisationUnitsToCreate"],
+                ["OrgUnit00001"],
+            )
+            self.assertIn("--apply", result["nextStep"])
+
     def test_review_accepts_different_uid_when_mapping_organisation_units_by_code(self) -> None:
         with TemporaryDirectory() as tmp:
             scenario = _scenario(
@@ -1830,6 +2021,7 @@ class TransferTests(unittest.TestCase):
                         "domainType": "AGGREGATE",
                         "aggregationType": "SUM",
                         "categoryCombo": {"id": "Combo000001"},
+                        "optionSet": {"id": "OptionSet001"},
                     }
                 ]
 
@@ -1863,6 +2055,23 @@ class TransferTests(unittest.TestCase):
                             "name": "Féminin",
                             "categoryCombo": {"id": "Combo000001"},
                             "categoryOptions": [{"id": "Option00001"}],
+                        }
+                    ],
+                    "options": [
+                        {
+                            "id": "SetOption001",
+                            "code": "OBS",
+                            "name": "Observation",
+                            "sortOrder": 1,
+                        }
+                    ],
+                    "optionSets": [
+                        {
+                            "id": "OptionSet001",
+                            "code": "OBS_SET",
+                            "name": "Observations",
+                            "valueType": "TEXT",
+                            "options": [{"id": "SetOption001"}],
                         }
                     ],
                     "dataElements": self.elements,
@@ -1958,11 +2167,17 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(report["status"], "validated")
             self.assertEqual(report["repair"]["categoryCombosToUpdate"], 1)
             self.assertEqual(report["repair"]["categoryOptionCombosToCreate"], 1)
+            self.assertEqual(report["repair"]["optionSets"]["referenced"], 1)
             self.assertEqual(report["repair"]["dataElementsToUpdate"], 1)
             self.assertTrue(
                 report["assignments"]["validationPendingStructureCommit"]
             )
             self.assertEqual(target.metadata_calls, [False])
+            assignment = json.loads(
+                Path(report["assignments"]["artifact"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(assignment["optionSets"][0]["id"], "OptionSet001")
+            self.assertEqual(assignment["options"][0]["id"], "SetOption001")
 
             apply_target = RepairTarget()
             apply_report = repair_target_metadata(
@@ -1979,6 +2194,93 @@ class TransferTests(unittest.TestCase):
             )
             self.assertTrue(apply_report["assignments"]["validated"])
             self.assertTrue(apply_report["assignments"]["committed"])
+
+            resumed_target = RepairTarget()
+            resumed_target.objects["categoryCombos"][0]["categories"] = [
+                {"id": "Category001"}
+            ]
+            resumed_report = repair_target_metadata(
+                scenario,
+                RepairSource(),
+                resumed_target,
+                job_id="weekly_climate",
+                apply=False,
+            )
+            self.assertFalse(resumed_report["structure"]["required"])
+            self.assertTrue(resumed_report["assignments"]["validated"])
+            self.assertFalse(
+                resumed_report["assignments"]["validationPendingStructureCommit"]
+            )
+            self.assertEqual(resumed_target.metadata_calls, [False])
+
+            incompatible_option_set_target = RepairTarget()
+            incompatible_option_set_target.objects["categoryCombos"][0]["categories"] = [
+                {"id": "Category001"}
+            ]
+            incompatible_option_set_target.objects["optionSets"] = [
+                {
+                    "id": "OptionSet001",
+                    "code": "OBS_SET",
+                    "name": "Observations",
+                    "valueType": "NUMBER",
+                    "options": [{"id": "SetOption001"}],
+                }
+            ]
+            incompatible_option_set_target.objects["options"] = [
+                {
+                    "id": "SetOption001",
+                    "code": "OBS",
+                    "name": "Observation",
+                    "sortOrder": 1,
+                }
+            ]
+            with self.assertRaisesRegex(
+                PipelineError,
+                "incompatible OptionSet dependencies",
+            ):
+                repair_target_metadata(
+                    scenario,
+                    RepairSource(),
+                    incompatible_option_set_target,
+                    job_id="weekly_climate",
+                    apply=False,
+                )
+
+            class FailingAssignmentTarget(RepairTarget):
+                def __init__(self):
+                    super().__init__()
+                    self.objects["categoryCombos"][0]["categories"] = [
+                        {"id": "Category001"}
+                    ]
+
+                def import_metadata(self, payload, *, commit, **kwargs):
+                    if payload.get("dataElements"):
+                        raise HttpRequestError(
+                            "POST",
+                            "https://y.example.org/api/metadata",
+                            409,
+                            '{"response":{"errorCode":"E5002"}}',
+                        )
+                    return super().import_metadata(payload, commit=commit, **kwargs)
+
+            with self.assertRaises(HttpRequestError):
+                repair_target_metadata(
+                    scenario,
+                    RepairSource(),
+                    FailingAssignmentTarget(),
+                    job_id="weekly_climate",
+                    apply=False,
+                )
+            progress_path = (
+                scenario.job_state_dir("weekly_climate")
+                / "artifacts"
+                / "metadata"
+                / "weekly_climate.repair.progress.json"
+            )
+            progress_payload = json.loads(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(progress_payload["lastStage"], "assignment_validation")
+            self.assertEqual(progress_payload["status"], "failed")
+            self.assertIn("E5002", progress_payload["stages"][-1]["error"])
 
             with self.assertRaisesRegex(PipelineError, "raw or deleted target data value"):
                 repair_target_metadata(
