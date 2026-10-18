@@ -10,6 +10,7 @@ from dhis2_climate_import.http import HttpRequestError
 from dhis2_climate_import.transfer import (
     TransferContext,
     _data_set_membership_package,
+    _import_target_chunks,
     _normalise_source_category_option_combos,
     _prepare_metadata_package,
     _remove_existing_metadata_objects,
@@ -205,6 +206,185 @@ class FakeTransferClient:
 
 
 class TransferTests(unittest.TestCase):
+    def test_target_validation_timeout_splits_only_the_failing_chunk(self) -> None:
+        class SlowTarget:
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def import_data_value_set(self, payload, **kwargs):
+                size = len(payload["dataValues"])
+                self.calls.append(size)
+                if size > 2:
+                    raise HttpRequestError(
+                        "POST",
+                        "https://y.example.org/api/dataValueSets",
+                        None,
+                        "The read operation timed out",
+                    )
+                return {
+                    "status": "SUCCESS",
+                    "importCount": {"imported": size},
+                }
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=4,
+                adaptive_minimum_chunk_size=2,
+                adaptive_retry_before_split=0,
+            )
+            context = SimpleNamespace(job=scenario.get_job("weekly_climate"))
+            target = SlowTarget()
+            values = [
+                {"orgUnit": "OpenOrg0001", "period": "201701", "value": str(i)}
+                for i in range(4)
+            ]
+
+            responses, accepted, report = _validate_target_chunks(
+                target,
+                [{"dataSet": "DataSet0001", "dataValues": values}],
+                context=context,
+                state_dir=scenario.job_state_dir("weekly_climate"),
+                current_run_id="adaptive-validation",
+            )
+
+            self.assertEqual(target.calls, [4, 2, 2])
+            self.assertEqual(len(responses), 2)
+            self.assertEqual([len(item["dataValues"]) for item in accepted], [2, 2])
+            self.assertEqual(report["adaptiveChunking"]["splits"], 1)
+            self.assertEqual(report["adaptiveChunking"]["smallestChunkSize"], 2)
+
+    def test_target_import_timeout_splits_and_checkpoints_children(self) -> None:
+        class SlowTarget:
+            base_url = "https://y.example.org"
+
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def import_data_value_set(self, payload, **kwargs):
+                size = len(payload["dataValues"])
+                self.calls.append(size)
+                if size > 2:
+                    raise HttpRequestError(
+                        "POST",
+                        "https://y.example.org/api/dataValueSets",
+                        None,
+                        "The read operation timed out",
+                    )
+                return {
+                    "status": "SUCCESS",
+                    "importCount": {"imported": size},
+                }
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=4,
+                adaptive_minimum_chunk_size=2,
+                adaptive_retry_before_split=0,
+            )
+            context = SimpleNamespace(
+                job=scenario.get_job("weekly_climate"),
+                target_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Climate Weekly",
+                    period_type="Weekly",
+                ),
+                start="2017-01-01",
+                end="2017-01-31",
+            )
+            target = SlowTarget()
+            values = [
+                {"orgUnit": "OpenOrg0001", "period": "201701", "value": str(i)}
+                for i in range(4)
+            ]
+
+            responses, report = _import_target_chunks(
+                target,
+                [{"dataSet": "DataSet0001", "dataValues": values}],
+                context=context,
+                state_dir=scenario.job_state_dir("weekly_climate"),
+                resume_checkpoints=True,
+                progress=None,
+            )
+
+            self.assertEqual(target.calls, [4, 2, 2])
+            self.assertEqual(len(responses), 2)
+            self.assertEqual(report["splits"], 1)
+            checkpoint = Path(report["checkpoint"])
+            self.assertTrue(checkpoint.exists())
+            payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["completedChunks"]), 2)
+
+    def test_confirmed_target_chunks_resume_without_another_post(self) -> None:
+        class Target:
+            base_url = "https://y.example.org"
+
+            def __init__(self, *, reject_calls: bool = False) -> None:
+                self.calls = 0
+                self.reject_calls = reject_calls
+
+            def import_data_value_set(self, payload, **kwargs):
+                self.calls += 1
+                if self.reject_calls:
+                    raise AssertionError("checkpointed chunk must not be posted again")
+                return {
+                    "status": "SUCCESS",
+                    "importCount": {"imported": len(payload["dataValues"])},
+                }
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(Path(tmp), chunk_size=2)
+            context = SimpleNamespace(
+                job=scenario.get_job("weekly_climate"),
+                target_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Climate Weekly",
+                    period_type="Weekly",
+                ),
+                start="2017-01-01",
+                end="2017-01-31",
+            )
+            chunks = [
+                {
+                    "dataSet": "DataSet0001",
+                    "dataValues": [
+                        {
+                            "dataElement": "DataEl00001",
+                            "orgUnit": "OpenOrg0001",
+                            "period": "201701",
+                            "value": "1",
+                        }
+                    ],
+                }
+            ]
+            first = Target()
+            _import_target_chunks(
+                first,
+                chunks,
+                context=context,
+                state_dir=scenario.job_state_dir("weekly_climate"),
+                resume_checkpoints=True,
+                progress=None,
+            )
+            resumed = Target(reject_calls=True)
+            responses, report = _import_target_chunks(
+                resumed,
+                chunks,
+                context=context,
+                state_dir=scenario.job_state_dir("weekly_climate"),
+                resume_checkpoints=True,
+                progress=None,
+            )
+
+            self.assertEqual(first.calls, 1)
+            self.assertEqual(resumed.calls, 0)
+            self.assertTrue(responses[0]["checkpoint"])
+            self.assertEqual(report["resumedChunks"], 1)
+            self.assertEqual(report["resumedDataValues"], 1)
+
     def test_e8031_values_are_quarantined_and_remaining_values_are_revalidated(
         self,
     ) -> None:
@@ -2332,6 +2512,8 @@ def _scenario(
     organisation_unit_conflict_policy: str = "block",
     organisation_unit_require_same_code: bool = True,
     organisation_unit_exclusions: tuple[tuple[str, str], ...] = (),
+    adaptive_minimum_chunk_size: int | None = None,
+    adaptive_retry_before_split: int | None = None,
 ):
     path = root / "config" / "scenarios" / "x-to-y.yaml"
     path.parent.mkdir(parents=True)
@@ -2382,6 +2564,12 @@ mapping:
 transfer:
   import_strategy: CREATE_AND_UPDATE
   chunk_size: {chunk_size}
+  adaptive_chunking:
+    minimum_chunk_size: {adaptive_minimum_chunk_size or min(500, chunk_size)}
+    retry_before_split: {
+        adaptive_retry_before_split if adaptive_retry_before_split is not None else 1
+    }
+    backoff_seconds: 0.001
   {f"source_period_batch_size: {source_period_batch_size}" if source_period_batch_size else ""}
   include_deleted: false
 state:

@@ -71,6 +71,13 @@ mapping:
 transfer:
   import_strategy: CREATE_AND_UPDATE
   chunk_size: 5000
+  # Start fast, then halve only the target chunk that times out. This policy is
+  # inherited by every job in the scenario.
+  adaptive_chunking:
+    enabled: true
+    minimum_chunk_size: 500
+    retry_before_split: 1
+    backoff_seconds: 10
   preheat_cache: true
   include_deleted: false
   preserve_comments: true
@@ -81,6 +88,7 @@ transfer:
   execution:
     process_isolation: true
     resume: true
+    resume_chunks: true
     stop_on_error: true
 
 execution:
@@ -94,8 +102,8 @@ jobs:
     source_data_set: CCH_CLIMATE_WEATHER
     target_data_set: CCH_CLIMATE_WEATHER
     period_type: week
-    default_start_period: 2019-W01
-    default_end_period: 2026-W40
+    default_start_period: 2017-W01
+    default_end_period: 2020-W52
     data_elements:
       discovery: linked_to_dataset
   - id: sigl_fosa
@@ -103,7 +111,7 @@ jobs:
     target_data_set: oTgCLoG5OkY
     period_type: month
     default_start_period: 2019-01
-    default_end_period: 2026-10
+    default_end_period: 2022-12
     data_elements:
       discovery: linked_to_dataset
     transfer:
@@ -121,8 +129,8 @@ jobs:
     source_data_set: OeWrFwkFMvf
     target_data_set: OeWrFwkFMvf
     period_type: month
-    default_start_period: 2019-01
-    default_end_period: 2026-09
+    default_start_period: 2019-04
+    default_end_period: 2022-12
     data_elements:
       discovery: linked_to_dataset
     transfer:

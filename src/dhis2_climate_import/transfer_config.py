@@ -191,10 +191,19 @@ class RetryPolicy:
 
 
 @dataclass(frozen=True)
+class AdaptiveChunkingPolicy:
+    enabled: bool = True
+    minimum_chunk_size: int = 500
+    retry_before_split: int = 1
+    backoff_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
 class WindowExecutionPolicy:
     period_batch_size: int = 1
     process_isolation: bool = True
     resume: bool = True
+    resume_chunks: bool = True
     stop_on_error: bool = True
 
 
@@ -207,6 +216,7 @@ class TransferSettings:
     include_deleted: bool = False
     preserve_comments: bool = True
     retry: RetryPolicy = RetryPolicy()
+    adaptive_chunking: AdaptiveChunkingPolicy = AdaptiveChunkingPolicy()
     execution: WindowExecutionPolicy = WindowExecutionPolicy()
 
 
@@ -528,6 +538,16 @@ def _parse_job(
             f"jobs.{job_id}.transfer.retry",
         ),
     }
+    adaptive_chunking_raw = {
+        **_mapping(
+            default_transfer.get("adaptive_chunking", {}),
+            "transfer.adaptive_chunking",
+        ),
+        **_mapping(
+            job_transfer_raw.get("adaptive_chunking", {}),
+            f"jobs.{job_id}.transfer.adaptive_chunking",
+        ),
+    }
     execution_raw = {
         **_mapping(default_transfer.get("execution", {}), "transfer.execution"),
         **_mapping(
@@ -535,9 +555,10 @@ def _parse_job(
             f"jobs.{job_id}.transfer.execution",
         ),
     }
+    chunk_size = _positive_int(transfer_raw.get("chunk_size", 5000), "chunk_size")
     transfer = TransferSettings(
         import_strategy=str(transfer_raw.get("import_strategy", "CREATE_AND_UPDATE")).upper(),
-        chunk_size=_positive_int(transfer_raw.get("chunk_size", 5000), "chunk_size"),
+        chunk_size=chunk_size,
         source_period_batch_size=_positive_int(
             transfer_raw.get(
                 "source_period_batch_size",
@@ -562,6 +583,24 @@ def _parse_job(
                 f"jobs.{job_id}.transfer.retry.max_delay_seconds",
             ),
         ),
+        adaptive_chunking=AdaptiveChunkingPolicy(
+            enabled=_boolean(adaptive_chunking_raw.get("enabled", True)),
+            minimum_chunk_size=_positive_int(
+                adaptive_chunking_raw.get(
+                    "minimum_chunk_size",
+                    min(500, chunk_size),
+                ),
+                f"jobs.{job_id}.transfer.adaptive_chunking.minimum_chunk_size",
+            ),
+            retry_before_split=_non_negative_int(
+                adaptive_chunking_raw.get("retry_before_split", 1),
+                f"jobs.{job_id}.transfer.adaptive_chunking.retry_before_split",
+            ),
+            backoff_seconds=_positive_float(
+                adaptive_chunking_raw.get("backoff_seconds", 10),
+                f"jobs.{job_id}.transfer.adaptive_chunking.backoff_seconds",
+            ),
+        ),
         execution=WindowExecutionPolicy(
             period_batch_size=_positive_int(
                 execution_raw.get(
@@ -574,6 +613,7 @@ def _parse_job(
                 execution_raw.get("process_isolation", True)
             ),
             resume=_boolean(execution_raw.get("resume", True)),
+            resume_chunks=_boolean(execution_raw.get("resume_chunks", True)),
             stop_on_error=_boolean(execution_raw.get("stop_on_error", True)),
         ),
     )
@@ -581,6 +621,14 @@ def _parse_job(
         raise PipelineError(
             f"jobs.{job_id}.transfer.retry.max_delay_seconds must be greater than or "
             "equal to initial_delay_seconds."
+        )
+    if (
+        transfer.adaptive_chunking.enabled
+        and transfer.adaptive_chunking.minimum_chunk_size > transfer.chunk_size
+    ):
+        raise PipelineError(
+            f"jobs.{job_id}.transfer.adaptive_chunking.minimum_chunk_size must be "
+            "less than or equal to chunk_size."
         )
     if transfer.import_strategy not in {"CREATE", "UPDATE", "CREATE_AND_UPDATE"}:
         raise PipelineError(
@@ -747,6 +795,18 @@ def _positive_int(value: Any, label: str) -> int:
         raise PipelineError(f"Configuration field '{label}' must be an integer.") from exc
     if result <= 0:
         raise PipelineError(f"Configuration field '{label}' must be greater than zero.")
+    return result
+
+
+def _non_negative_int(value: Any, label: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PipelineError(f"Configuration field '{label}' must be an integer.") from exc
+    if result < 0:
+        raise PipelineError(
+            f"Configuration field '{label}' must be greater than or equal to zero."
+        )
     return result
 
 

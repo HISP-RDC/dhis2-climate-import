@@ -53,6 +53,12 @@ source:
 target:
   instance: y
 transfer:
+  chunk_size: 4000
+  adaptive_chunking:
+    enabled: true
+    minimum_chunk_size: 250
+    retry_before_split: 2
+    backoff_seconds: 3
   retry:
     attempts: 7
     initial_delay_seconds: 2
@@ -60,6 +66,7 @@ transfer:
   execution:
     process_isolation: false
     resume: false
+    resume_chunks: false
     stop_on_error: false
 jobs:
   - id: monthly
@@ -77,10 +84,45 @@ jobs:
             job = load_transfer_scenario(path).get_job("monthly")
 
         self.assertEqual(job.transfer.retry.attempts, 7)
+        self.assertTrue(job.transfer.adaptive_chunking.enabled)
+        self.assertEqual(job.transfer.adaptive_chunking.minimum_chunk_size, 250)
+        self.assertEqual(job.transfer.adaptive_chunking.retry_before_split, 2)
+        self.assertEqual(job.transfer.adaptive_chunking.backoff_seconds, 3)
         self.assertEqual(job.transfer.execution.period_batch_size, 6)
         self.assertFalse(job.transfer.execution.process_isolation)
         self.assertFalse(job.transfer.execution.resume)
+        self.assertFalse(job.transfer.execution.resume_chunks)
         self.assertFalse(job.transfer.execution.stop_on_error)
+
+    def test_rejects_adaptive_minimum_larger_than_initial_chunk(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config" / "scenarios" / "invalid-chunks.yaml"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                """
+schema_version: 2
+id: invalid-chunks
+source:
+  instance: x
+target:
+  instance: y
+transfer:
+  chunk_size: 100
+  adaptive_chunking:
+    minimum_chunk_size: 200
+jobs:
+  - id: monthly
+    source_data_set: DataSet0001
+    target_data_set: DataSet0001
+    period_type: month
+    default_start_period: 2026-01
+    default_end_period: 2026-01
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(PipelineError, "minimum_chunk_size"):
+                load_transfer_scenario(path)
 
     def test_loads_basic_and_pat_instance_profiles_without_secrets_in_yaml(self) -> None:
         with TemporaryDirectory() as tmp:

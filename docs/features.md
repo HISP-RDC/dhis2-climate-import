@@ -200,6 +200,13 @@ Une tranche `success` n’est pas rejouée lors d’une reprise normale. Une tra
 selon la politique de retry. Une tranche `running` laissée par un arrêt brutal est déclarée
 interrompue avant sa reprise.
 
+Avec `transfer.execution.resume_chunks: true`, chaque réponse d’import réel réussie possède aussi
+un checkpoint de contenu. Les manifests sont écrits atomiquement dans
+`state/<cible>/<scenario>/jobs/<job>/checkpoints/data-values/`. Après un arrêt ou un timeout, un
+chunk strictement identique déjà confirmé est ignoré, même si sa tranche n’avait pas eu le temps de
+se terminer. Un chunk ayant expiré avec `dryRun=false` n’est jamais considéré comme confirmé : son
+résultat est ambigu et il est rejoué avec `CREATE_AND_UPDATE`.
+
 La reprise doit être explicite dans les logs :
 
 ```text
@@ -233,6 +240,31 @@ transfer:
     initial_delay_seconds: 5
     max_delay_seconds: 120
 ```
+
+Pour les POST de valeurs sur Y, la tolérance est d’abord appliquée au chunk concerné, avant de
+relancer toute la tranche :
+
+```yaml
+transfer:
+  chunk_size: 5000
+  adaptive_chunking:
+    enabled: true
+    minimum_chunk_size: 500
+    retry_before_split: 1
+    backoff_seconds: 10
+  execution:
+    resume_chunks: true
+```
+
+Après le nombre de retries locaux configuré, seul le lot en échec est divisé en deux. La même
+logique s’applique à la validation et à l’import : `5000 -> 2500 -> 1250 -> 625`, jusqu’au seuil
+minimal. Les timeouts, resets, 429 et erreurs de passerelle/Cloudflare déclenchent cette adaptation.
+Les conflits fonctionnels DHIS2 ne sont jamais masqués ou subdivisés. Le rapport final conserve le
+nombre de retries, subdivisions, valeurs reprises et le chemin du checkpoint.
+
+Le template systemd limite aussi chaque unité à trois démarrages sur six heures. Si même le lot
+minimal continue d’échouer, la boucle finit donc par s’arrêter et reste visible dans le journal.
+`systemctl reset-failed` réarme volontairement l’unité après diagnostic.
 
 Le succès d’un `review` prouve que la connexion fonctionne au moment du test. Il ne garantit pas
 qu’une erreur réseau transitoire ne réapparaîtra jamais. L’objectif est de reprendre proprement,

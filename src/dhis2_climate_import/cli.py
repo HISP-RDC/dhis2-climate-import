@@ -232,6 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     transfer_window.add_argument("--keep-payload", action="store_true")
     transfer_window.add_argument("--parent-run-id", required=True)
     transfer_window.add_argument("--window-id", required=True)
+    transfer_window.add_argument("--disable-chunk-resume", action="store_true")
     transfer_window.set_defaults(func=cmd_transfer_run_window)
 
     return parser
@@ -627,6 +628,7 @@ def cmd_transfer_run_window(args: argparse.Namespace) -> None:
         start=args.start,
         end=args.end,
         progress=progress,
+        resume_chunk_checkpoints=not getattr(args, "disable_chunk_resume", False),
     )
     _print_json(
         {
@@ -647,6 +649,7 @@ def cmd_transfer_run_window(args: argparse.Namespace) -> None:
                 },
             ),
             "timelinessQuarantine": result["timelinessQuarantine"],
+            "adaptiveChunking": result.get("adaptiveChunking", {}),
             "dataValidationPendingMetadataCommit": result[
                 "dataValidationPendingMetadataCommit"
             ],
@@ -695,6 +698,8 @@ def _subprocess_window_runner(args: argparse.Namespace) -> Callable[
         ]
         if args.keep_payload:
             command.append("--keep-payload")
+        if getattr(args, "force", False):
+            command.append("--disable-chunk-resume")
         process = subprocess.Popen(
             command,
             text=True,
@@ -1202,6 +1207,15 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         ),
         "target.dry_run.start": "Début de la validation des valeurs cible",
         "target.dry_run.chunk.start": "Validation d’un lot cible",
+        "target.dry_run.chunk.retry": (
+            "Nouvelle tentative du lot de validation cible"
+        ),
+        "target.dry_run.chunk.split": (
+            "Lot de validation cible subdivisé après timeout"
+        ),
+        "target.dry_run.chunk.minimum_failed": (
+            "Lot minimal de validation cible toujours en échec"
+        ),
         "target.dry_run.chunk.done": "Lot cible validé",
         "target.timeliness.quarantine": (
             "Valeurs hors période d’activité mises en quarantaine"
@@ -1209,6 +1223,13 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "target.dry_run.done": "Validation des valeurs cible terminée",
         "target.import.start": "Début de l’import réel des valeurs",
         "target.import.chunk.start": "Import d’un lot cible",
+        "target.import.chunk.retry": "Nouvelle tentative du lot d’import cible",
+        "target.import.chunk.split": "Lot d’import cible subdivisé après timeout",
+        "target.import.chunk.minimum_failed": (
+            "Lot minimal d’import cible toujours en échec"
+        ),
+        "target.import.chunk.resume": "Lot cible déjà importé, reprise au checkpoint",
+        "target.import.chunk.checkpoint": "Checkpoint du lot cible enregistré",
         "target.import.chunk.done": "Lot cible importé",
         "target.import.done": "Import réel terminé",
         "orchestrator.slot.acquired": "Créneau d’exécution acquis",

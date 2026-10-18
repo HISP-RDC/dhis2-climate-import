@@ -71,6 +71,13 @@ mapping:
 transfer:
   import_strategy: CREATE_AND_UPDATE
   chunk_size: 5000
+  # A timeout/reset/gateway error retries the affected target chunk, then halves
+  # only that chunk down to this minimum. Applies to every job by inheritance.
+  adaptive_chunking:
+    enabled: true
+    minimum_chunk_size: 500
+    retry_before_split: 1
+    backoff_seconds: 10
   # Number of DHIS2 periods per source request. Defaults are 31 daily,
   # 13 weekly, 1 monthly, and 1 yearly period when omitted.
   source_period_batch_size: 13
@@ -86,6 +93,8 @@ transfer:
     # and may be overridden per job.
     process_isolation: true
     resume: true
+    # Confirmed apply chunks are persisted and skipped after a process restart.
+    resume_chunks: true
     stop_on_error: true
 
 execution:

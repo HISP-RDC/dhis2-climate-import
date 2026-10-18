@@ -328,6 +328,7 @@ def _orchestrate_locked(
         target,
         job_id=job_id,
         apply=apply,
+        force=force,
         keep_payload=keep_payload,
         progress=progress,
     )
@@ -536,6 +537,7 @@ def _orchestrate_locked(
                         "reportPath": result.get("reportPath"),
                         "invalidDataValueQuarantine": invalid_value_quarantine,
                         "timelinessQuarantine": timeliness_quarantine,
+                        "adaptiveChunking": result.get("adaptiveChunking", {}),
                         "durationSeconds": round(
                             time.monotonic() - attempt_started, 2
                         ),
@@ -762,6 +764,7 @@ def _inline_runner(
     *,
     job_id: str,
     apply: bool,
+    force: bool,
     keep_payload: bool,
     progress: ProgressCallback | None,
 ) -> WindowRunner:
@@ -784,6 +787,7 @@ def _inline_runner(
             start=start,
             end=end,
             progress=progress,
+            resume_chunk_checkpoints=not force,
         )
 
     return run

@@ -726,6 +726,7 @@ def run_transfer(
     years_back: int | None = None,
     as_of: str | None = None,
     progress: ProgressCallback | None = None,
+    resume_chunk_checkpoints: bool | None = None,
 ) -> dict[str, Any]:
     _emit_progress(progress, "transfer.start", job=job_id, apply=apply)
     _emit_progress(progress, "context.resolve.start")
@@ -782,6 +783,11 @@ def run_transfer(
     current_run_id = run_id(f"transfer-{scenario.id}-{context.job.id}")
     source_count = 0
     empty_counts = {"imported": 0, "updated": 0, "ignored": 0, "deleted": 0}
+    chunk_resume_enabled = context.job.transfer.execution.resume_chunks and (
+        not force
+        if resume_chunk_checkpoints is None
+        else resume_chunk_checkpoints
+    )
     try:
         metadata_report: dict[str, Any] = {
             "required": context.metadata_bootstrap_required,
@@ -967,6 +973,21 @@ def run_transfer(
         dry_run_responses: list[dict[str, Any]] = []
         apply_responses: list[dict[str, Any]] = []
         validated_chunk_count = 0
+        adaptive_validation_report: dict[str, Any] = {
+            "enabled": context.job.transfer.adaptive_chunking.enabled,
+            "retries": 0,
+            "splits": 0,
+            "smallestChunkSize": None,
+        }
+        adaptive_import_report: dict[str, Any] = {
+            "enabled": context.job.transfer.adaptive_chunking.enabled,
+            "retries": 0,
+            "splits": 0,
+            "smallestChunkSize": None,
+            "resumedChunks": 0,
+            "resumedDataValues": 0,
+            "checkpoint": None,
+        }
         timeliness_quarantine_report: dict[str, Any] = {
             "enabled": (
                 context.job.organisation_units.synchronization.conflict_policy
@@ -1007,6 +1028,9 @@ def run_transfer(
                 progress=progress,
             )
             validated_chunk_count = len(chunks)
+            adaptive_validation_report = dict(
+                timeliness_quarantine_report.get("adaptiveChunking") or {}
+            )
             if apply:
                 target_value_count = sum(
                     len(chunk["dataValues"]) for chunk in chunks
@@ -1017,39 +1041,21 @@ def run_transfer(
                     chunks=len(chunks),
                     dataValues=target_value_count,
                 )
-                for index, chunk in enumerate(chunks, start=1):
-                    chunk_started = time.monotonic()
-                    _emit_progress(
-                        progress,
-                        "target.import.chunk.start",
-                        chunk=f"{index}/{len(chunks)}",
-                        dataValues=len(chunk["dataValues"]),
-                    )
-                    response = target.import_data_value_set(
-                        chunk,
-                        dry_run=False,
-                        import_strategy=context.job.transfer.import_strategy,
-                        preheat_cache=context.job.transfer.preheat_cache,
-                        async_mode=False,
-                        id_schemes=context.job.id_schemes.api_params(),
-                    )
-                    _assert_success_response(
-                        response, f"Target data import chunk {index}", allow_warning=True
-                    )
-                    conflicts = extract_conflicts(response)
-                    if conflicts:
-                        raise PipelineError(
-                            f"Target data import chunk {index} reported conflicts: "
-                            f"{json.dumps(conflicts, sort_keys=True)[:1000]}"
-                        )
-                    apply_responses.append({"chunk": index, "response": response})
-                    _emit_progress(
-                        progress,
-                        "target.import.chunk.done",
-                        chunk=f"{index}/{len(chunks)}",
-                        durationSeconds=round(time.monotonic() - chunk_started, 2),
-                    )
-                _emit_progress(progress, "target.import.done", chunks=len(chunks))
+                apply_responses, adaptive_import_report = _import_target_chunks(
+                    target,
+                    chunks,
+                    context=context,
+                    state_dir=state_dir,
+                    resume_checkpoints=chunk_resume_enabled,
+                    progress=progress,
+                )
+                _emit_progress(
+                    progress,
+                    "target.import.done",
+                    chunks=len(chunks),
+                    requestChunks=len(apply_responses),
+                    resumedChunks=adaptive_import_report["resumedChunks"],
+                )
         elif apply:
             raise PipelineError("Target Data Set is unavailable after metadata bootstrap.")
 
@@ -1096,6 +1102,13 @@ def run_transfer(
             "categoryOptionCombos": category_option_combo_report,
             "invalidDataValueQuarantine": invalid_data_value_report,
             "timelinessQuarantine": timeliness_quarantine_report,
+            "adaptiveChunking": {
+                "configuration": asdict(
+                    context.job.transfer.adaptive_chunking
+                ),
+                "validation": adaptive_validation_report,
+                "import": adaptive_import_report,
+            },
             "organisationUnitExclusions": _organisation_unit_exclusion_payload(
                 context.job
             ),
@@ -4713,7 +4726,7 @@ def _validate_target_chunks(
     current_run_id: str,
     progress: ProgressCallback | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Dry-run value chunks and quarantine only DHIS2 E8031 indexes when opted in.
+    """Dry-run chunks, adaptively split transient failures, and quarantine E8031.
 
     E8031 is returned when an organisation unit is not active for the supplied
     period.  DHIS2 is authoritative here: using the indexes from its validation
@@ -4725,6 +4738,15 @@ def _validate_target_chunks(
     responses: list[dict[str, Any]] = []
     accepted_chunks: list[dict[str, Any]] = []
     quarantined: list[dict[str, Any]] = []
+    adaptive = context.job.transfer.adaptive_chunking
+    adaptive_stats: dict[str, Any] = {
+        "enabled": adaptive.enabled,
+        "minimumChunkSize": adaptive.minimum_chunk_size,
+        "retryBeforeSplit": adaptive.retry_before_split,
+        "retries": 0,
+        "splits": 0,
+        "smallestChunkSize": None,
+    }
     original_chunk_count = len(chunks)
     original_value_count = sum(
         len(chunk.get("dataValues", []))
@@ -4752,44 +4774,125 @@ def _validate_target_chunks(
             chunk=f"{index}/{original_chunk_count}",
             dataValues=len(values),
         )
+        quarantined_before = len(quarantined)
+        chunk_responses, chunk_candidates = _validate_target_chunk_adaptive(
+            target,
+            original_chunk,
+            values=values,
+            original_indexes=original_indexes,
+            original_chunk_index=index,
+            original_chunk_count=original_chunk_count,
+            context=context,
+            exclusion_enabled=exclusion_enabled,
+            quarantined=quarantined,
+            state_dir=state_dir,
+            current_run_id=current_run_id,
+            original_value_count=original_value_count,
+            adaptive_stats=adaptive_stats,
+            progress=progress,
+        )
+        responses.extend(chunk_responses)
+        accepted_chunks.extend(chunk_candidates)
+        quarantined_in_chunk = len(quarantined) - quarantined_before
+        accepted_in_chunk = sum(
+            len(candidate.get("dataValues", [])) for candidate in chunk_candidates
+        )
 
-        while values:
-            candidate = {**original_chunk, "dataValues": values}
-            try:
-                response = target.import_data_value_set(
-                    candidate,
-                    dry_run=True,
-                    import_strategy=context.job.transfer.import_strategy,
-                    preheat_cache=context.job.transfer.preheat_cache,
-                    async_mode=False,
-                    id_schemes=context.job.id_schemes.api_params(),
-                )
-            except HttpRequestError as exc:
-                rejected_indexes = _exclusive_e8031_indexes(
-                    exc.body,
-                    value_count=len(values),
-                )
-                if (
-                    not exclusion_enabled
-                    or exc.status_code != 409
-                    or rejected_indexes is None
-                ):
-                    raise
+        _emit_progress(
+            progress,
+            "target.dry_run.chunk.done",
+            chunk=f"{index}/{original_chunk_count}",
+            acceptedDataValues=accepted_in_chunk,
+            quarantinedDataValues=quarantined_in_chunk,
+            requestChunks=len(chunk_candidates),
+            durationSeconds=round(time.monotonic() - chunk_started, 2),
+        )
+
+    report = _timeliness_quarantine_report(
+        quarantined,
+        enabled=exclusion_enabled,
+        state_dir=state_dir,
+        current_run_id=current_run_id,
+        source_data_value_count=original_value_count,
+    )
+    if (
+        original_value_count
+        and int(report["quarantinedDataValueCount"]) == original_value_count
+    ):
+        raise PipelineError(
+            "E8031 quarantine would remove every source data value in this execution "
+            f"window. Transfer blocked. Audit: {report['artifact']}"
+        )
+    report["adaptiveChunking"] = adaptive_stats
+    _emit_progress(
+        progress,
+        "target.dry_run.done",
+        chunks=original_chunk_count,
+        acceptedChunks=len(accepted_chunks),
+        acceptedDataValues=original_value_count
+        - int(report["quarantinedDataValueCount"]),
+        quarantinedDataValues=report["quarantinedDataValueCount"],
+    )
+    return responses, accepted_chunks, report
+
+
+def _validate_target_chunk_adaptive(
+    target: DHIS2Client,
+    payload: dict[str, Any],
+    *,
+    values: list[dict[str, Any]],
+    original_indexes: list[int],
+    original_chunk_index: int,
+    original_chunk_count: int,
+    context: TransferContext,
+    exclusion_enabled: bool,
+    quarantined: list[dict[str, Any]],
+    state_dir: Path,
+    current_run_id: str,
+    original_value_count: int,
+    adaptive_stats: dict[str, Any],
+    progress: ProgressCallback | None,
+    split_depth: int = 0,
+    part: str = "root",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not values:
+        return [], []
+    retry = 0
+    adaptive = context.job.transfer.adaptive_chunking
+    while values:
+        candidate = {**payload, "dataValues": values}
+        try:
+            response = target.import_data_value_set(
+                candidate,
+                dry_run=True,
+                import_strategy=context.job.transfer.import_strategy,
+                preheat_cache=context.job.transfer.preheat_cache,
+                async_mode=False,
+                id_schemes=context.job.id_schemes.api_params(),
+            )
+        except HttpRequestError as exc:
+            rejected_indexes = _exclusive_e8031_indexes(
+                exc.body,
+                value_count=len(values),
+            )
+            if (
+                exclusion_enabled
+                and exc.status_code == 409
+                and rejected_indexes is not None
+            ):
                 rejected = set(rejected_indexes)
                 for candidate_index in rejected_indexes:
-                    value = values[candidate_index]
                     quarantined.append(
                         {
-                            "chunk": index,
+                            "chunk": original_chunk_index,
                             "index": original_indexes[candidate_index],
                             "reason": (
                                 "Target organisation unit is not active for the "
                                 "data value period"
                             ),
-                            "dataValue": value,
+                            "dataValue": values[candidate_index],
                         }
                     )
-                quarantined_in_chunk += len(rejected_indexes)
                 values = [
                     value
                     for candidate_index, value in enumerate(values)
@@ -4810,61 +4913,405 @@ def _validate_target_chunks(
                 _emit_progress(
                     progress,
                     "target.timeliness.quarantine",
-                    chunk=f"{index}/{original_chunk_count}",
+                    chunk=f"{original_chunk_index}/{original_chunk_count}",
+                    part=part,
                     errorCode="E8031",
                     quarantinedDataValues=len(rejected_indexes),
                     remainingDataValues=len(values),
                     artifact=partial_report["artifact"],
                 )
+                retry = 0
                 continue
-
-            _assert_success_response(
-                response, f"Target data dry-run chunk {index}", allow_warning=True
-            )
-            conflicts = extract_conflicts(response)
-            if conflicts:
-                raise PipelineError(
-                    f"Target data dry-run chunk {index} reported conflicts: "
-                    f"{json.dumps(conflicts, sort_keys=True)[:1000]}"
+            if not adaptive.enabled or not _is_adaptive_chunk_error(exc):
+                raise
+            if retry < adaptive.retry_before_split:
+                retry += 1
+                adaptive_stats["retries"] += 1
+                delay = adaptive.backoff_seconds * retry
+                _emit_progress(
+                    progress,
+                    "target.dry_run.chunk.retry",
+                    chunk=f"{original_chunk_index}/{original_chunk_count}",
+                    part=part,
+                    attempt=retry,
+                    dataValues=len(values),
+                    delaySeconds=delay,
                 )
-            responses.append({"chunk": index, "response": response})
-            accepted_chunks.append(candidate)
-            break
+                time.sleep(delay)
+                continue
+            if len(values) // 2 < adaptive.minimum_chunk_size:
+                _emit_progress(
+                    progress,
+                    "target.dry_run.chunk.minimum_failed",
+                    chunk=f"{original_chunk_index}/{original_chunk_count}",
+                    part=part,
+                    dataValues=len(values),
+                    minimumChunkSize=adaptive.minimum_chunk_size,
+                )
+                raise
+            midpoint = len(values) // 2
+            adaptive_stats["splits"] += 1
+            _emit_progress(
+                progress,
+                "target.dry_run.chunk.split",
+                chunk=f"{original_chunk_index}/{original_chunk_count}",
+                part=part,
+                dataValues=len(values),
+                leftDataValues=midpoint,
+                rightDataValues=len(values) - midpoint,
+                splitDepth=split_depth + 1,
+            )
+            child_responses: list[dict[str, Any]] = []
+            child_candidates: list[dict[str, Any]] = []
+            for suffix, child_values, child_indexes in (
+                ("L", values[:midpoint], original_indexes[:midpoint]),
+                ("R", values[midpoint:], original_indexes[midpoint:]),
+            ):
+                responses, candidates = _validate_target_chunk_adaptive(
+                    target,
+                    payload,
+                    values=child_values,
+                    original_indexes=child_indexes,
+                    original_chunk_index=original_chunk_index,
+                    original_chunk_count=original_chunk_count,
+                    context=context,
+                    exclusion_enabled=exclusion_enabled,
+                    quarantined=quarantined,
+                    state_dir=state_dir,
+                    current_run_id=current_run_id,
+                    original_value_count=original_value_count,
+                    adaptive_stats=adaptive_stats,
+                    progress=progress,
+                    split_depth=split_depth + 1,
+                    part=f"{part}.{suffix}",
+                )
+                child_responses.extend(responses)
+                child_candidates.extend(candidates)
+            return child_responses, child_candidates
 
+        _assert_success_response(
+            response,
+            f"Target data dry-run chunk {original_chunk_index} ({part})",
+            allow_warning=True,
+        )
+        conflicts = extract_conflicts(response)
+        if conflicts:
+            raise PipelineError(
+                f"Target data dry-run chunk {original_chunk_index} ({part}) reported "
+                f"conflicts: {json.dumps(conflicts, sort_keys=True)[:1000]}"
+            )
+        smallest = adaptive_stats.get("smallestChunkSize")
+        adaptive_stats["smallestChunkSize"] = (
+            len(values) if smallest is None else min(int(smallest), len(values))
+        )
+        return [
+            {
+                "chunk": original_chunk_index,
+                "part": part,
+                "response": response,
+            }
+        ], [candidate]
+    return [], []
+
+
+def _import_target_chunks(
+    target: DHIS2Client,
+    chunks: list[dict[str, Any]],
+    *,
+    context: TransferContext,
+    state_dir: Path,
+    resume_checkpoints: bool,
+    progress: ProgressCallback | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    adaptive = context.job.transfer.adaptive_chunking
+    checkpoint_path, checkpoint = _load_chunk_checkpoint(
+        state_dir,
+        target,
+        context,
+        enabled=resume_checkpoints,
+    )
+    stats: dict[str, Any] = {
+        "enabled": adaptive.enabled,
+        "minimumChunkSize": adaptive.minimum_chunk_size,
+        "retryBeforeSplit": adaptive.retry_before_split,
+        "retries": 0,
+        "splits": 0,
+        "smallestChunkSize": None,
+        "resumedChunks": 0,
+        "resumedDataValues": 0,
+        "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+    }
+    responses: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_started = time.monotonic()
+        values = chunk.get("dataValues")
+        if not isinstance(values, list):
+            raise PipelineError(f"Target data import chunk {index} has no dataValues list.")
         _emit_progress(
             progress,
-            "target.dry_run.chunk.done",
-            chunk=f"{index}/{original_chunk_count}",
-            acceptedDataValues=len(values),
-            quarantinedDataValues=quarantined_in_chunk,
+            "target.import.chunk.start",
+            chunk=f"{index}/{len(chunks)}",
+            dataValues=len(values),
+        )
+        chunk_responses = _import_target_chunk_adaptive(
+            target,
+            chunk,
+            original_chunk_index=index,
+            original_chunk_count=len(chunks),
+            context=context,
+            checkpoint_path=checkpoint_path,
+            checkpoint=checkpoint,
+            stats=stats,
+            progress=progress,
+        )
+        responses.extend(chunk_responses)
+        _emit_progress(
+            progress,
+            "target.import.chunk.done",
+            chunk=f"{index}/{len(chunks)}",
+            requestChunks=len(chunk_responses),
+            dataValues=len(values),
             durationSeconds=round(time.monotonic() - chunk_started, 2),
         )
+    return responses, stats
 
-    report = _timeliness_quarantine_report(
-        quarantined,
-        enabled=exclusion_enabled,
-        state_dir=state_dir,
-        current_run_id=current_run_id,
-        source_data_value_count=original_value_count,
-    )
-    if (
-        original_value_count
-        and int(report["quarantinedDataValueCount"]) == original_value_count
-    ):
+
+def _import_target_chunk_adaptive(
+    target: DHIS2Client,
+    payload: dict[str, Any],
+    *,
+    original_chunk_index: int,
+    original_chunk_count: int,
+    context: TransferContext,
+    checkpoint_path: Path | None,
+    checkpoint: dict[str, Any],
+    stats: dict[str, Any],
+    progress: ProgressCallback | None,
+    split_depth: int = 0,
+    part: str = "root",
+) -> list[dict[str, Any]]:
+    values = payload.get("dataValues")
+    if not isinstance(values, list):
         raise PipelineError(
-            "E8031 quarantine would remove every source data value in this execution "
-            f"window. Transfer blocked. Audit: {report['artifact']}"
+            f"Target data import chunk {original_chunk_index} ({part}) has no "
+            "dataValues list."
         )
-    _emit_progress(
-        progress,
-        "target.dry_run.done",
-        chunks=original_chunk_count,
-        acceptedChunks=len(accepted_chunks),
-        acceptedDataValues=original_value_count
-        - int(report["quarantinedDataValueCount"]),
-        quarantinedDataValues=report["quarantinedDataValueCount"],
+    if not values:
+        return []
+    chunk_hash = _data_value_chunk_hash(payload)
+    completed = checkpoint.get("completedChunks") or {}
+    saved = completed.get(chunk_hash) if isinstance(completed, dict) else None
+    if isinstance(saved, dict):
+        stats["resumedChunks"] += 1
+        stats["resumedDataValues"] += len(values)
+        _emit_progress(
+            progress,
+            "target.import.chunk.resume",
+            chunk=f"{original_chunk_index}/{original_chunk_count}",
+            part=part,
+            dataValues=len(values),
+            checkpoint=str(checkpoint_path),
+        )
+        response = saved.get("response")
+        if not isinstance(response, dict):
+            response = {
+                "status": "SUCCESS",
+                "importCount": {
+                    "imported": 0,
+                    "updated": 0,
+                    "ignored": len(values),
+                    "deleted": 0,
+                },
+            }
+        return [
+            {
+                "chunk": original_chunk_index,
+                "part": part,
+                "checkpoint": True,
+                "response": response,
+            }
+        ]
+
+    adaptive = context.job.transfer.adaptive_chunking
+    retry = 0
+    while True:
+        try:
+            response = target.import_data_value_set(
+                payload,
+                dry_run=False,
+                import_strategy=context.job.transfer.import_strategy,
+                preheat_cache=context.job.transfer.preheat_cache,
+                async_mode=False,
+                id_schemes=context.job.id_schemes.api_params(),
+            )
+        except HttpRequestError as exc:
+            if not adaptive.enabled or not _is_adaptive_chunk_error(exc):
+                raise
+            if retry < adaptive.retry_before_split:
+                retry += 1
+                stats["retries"] += 1
+                delay = adaptive.backoff_seconds * retry
+                _emit_progress(
+                    progress,
+                    "target.import.chunk.retry",
+                    chunk=f"{original_chunk_index}/{original_chunk_count}",
+                    part=part,
+                    attempt=retry,
+                    dataValues=len(values),
+                    delaySeconds=delay,
+                    outcome="unknown",
+                )
+                time.sleep(delay)
+                continue
+            if len(values) // 2 < adaptive.minimum_chunk_size:
+                _emit_progress(
+                    progress,
+                    "target.import.chunk.minimum_failed",
+                    chunk=f"{original_chunk_index}/{original_chunk_count}",
+                    part=part,
+                    dataValues=len(values),
+                    minimumChunkSize=adaptive.minimum_chunk_size,
+                    outcome="unknown",
+                )
+                raise
+            midpoint = len(values) // 2
+            stats["splits"] += 1
+            _emit_progress(
+                progress,
+                "target.import.chunk.split",
+                chunk=f"{original_chunk_index}/{original_chunk_count}",
+                part=part,
+                dataValues=len(values),
+                leftDataValues=midpoint,
+                rightDataValues=len(values) - midpoint,
+                splitDepth=split_depth + 1,
+                outcome="unknown_replayed_with_create_and_update",
+            )
+            responses: list[dict[str, Any]] = []
+            for suffix, child_values in (
+                ("L", values[:midpoint]),
+                ("R", values[midpoint:]),
+            ):
+                child_payload = {**payload, "dataValues": child_values}
+                responses.extend(
+                    _import_target_chunk_adaptive(
+                        target,
+                        child_payload,
+                        original_chunk_index=original_chunk_index,
+                        original_chunk_count=original_chunk_count,
+                        context=context,
+                        checkpoint_path=checkpoint_path,
+                        checkpoint=checkpoint,
+                        stats=stats,
+                        progress=progress,
+                        split_depth=split_depth + 1,
+                        part=f"{part}.{suffix}",
+                    )
+                )
+            return responses
+
+        _assert_success_response(
+            response,
+            f"Target data import chunk {original_chunk_index} ({part})",
+            allow_warning=True,
+        )
+        conflicts = extract_conflicts(response)
+        if conflicts:
+            raise PipelineError(
+                f"Target data import chunk {original_chunk_index} ({part}) reported "
+                f"conflicts: {json.dumps(conflicts, sort_keys=True)[:1000]}"
+            )
+        smallest = stats.get("smallestChunkSize")
+        stats["smallestChunkSize"] = (
+            len(values) if smallest is None else min(int(smallest), len(values))
+        )
+        if checkpoint_path is not None:
+            completed = checkpoint.setdefault("completedChunks", {})
+            completed[chunk_hash] = {
+                "dataValueCount": len(values),
+                "completedAtEpoch": int(time.time()),
+                "response": response,
+            }
+            _write_json(checkpoint_path, checkpoint)
+            _emit_progress(
+                progress,
+                "target.import.chunk.checkpoint",
+                chunk=f"{original_chunk_index}/{original_chunk_count}",
+                part=part,
+                dataValues=len(values),
+                checkpoint=str(checkpoint_path),
+            )
+        return [
+            {
+                "chunk": original_chunk_index,
+                "part": part,
+                "checkpoint": False,
+                "response": response,
+            }
+        ]
+
+
+def _load_chunk_checkpoint(
+    state_dir: Path,
+    target: DHIS2Client,
+    context: TransferContext,
+    *,
+    enabled: bool,
+) -> tuple[Path | None, dict[str, Any]]:
+    if not enabled:
+        return None, {}
+    scope = {
+        "schemaVersion": 1,
+        "job": context.job.id,
+        "target": target.base_url,
+        "targetDataSet": (
+            context.target_data_set.id
+            if context.target_data_set is not None
+            else context.job.target_data_set
+        ),
+        "start": context.start,
+        "end": context.end,
+        "importStrategy": context.job.transfer.import_strategy,
+    }
+    scope_hash = hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    path = (
+        state_dir
+        / "checkpoints"
+        / "data-values"
+        / f"{context.start}__{context.end}__{scope_hash[:16]}.json"
     )
-    return responses, accepted_chunks, report
+    if not path.exists():
+        return path, {**scope, "scopeHash": scope_hash, "completedChunks": {}}
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PipelineError(f"Chunk checkpoint is unreadable: {path}") from exc
+    if not isinstance(checkpoint, dict) or checkpoint.get("scopeHash") != scope_hash:
+        raise PipelineError(f"Chunk checkpoint scope is incompatible: {path}")
+    if not isinstance(checkpoint.get("completedChunks"), dict):
+        raise PipelineError(f"Chunk checkpoint has invalid completedChunks: {path}")
+    return path, checkpoint
+
+
+def _data_value_chunk_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _is_adaptive_chunk_error(exc: HttpRequestError) -> bool:
+    text = f"{exc.body} {exc}".lower()
+    return exc.status_code in {429, 502, 503, 504, 520, 522, 524} or any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "cloudflare",
+            "connection reset",
+        )
+    )
 
 
 def _exclusive_e8031_indexes(body: str, *, value_count: int) -> list[int] | None:

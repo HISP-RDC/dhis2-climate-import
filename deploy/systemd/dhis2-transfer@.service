@@ -2,6 +2,10 @@
 Description=Transfert DHIS2 X vers Y — job %i
 Wants=network-online.target
 After=network-online.target
+# Prevent a permanently slow target from creating an endless restart storm.
+# The application still performs its own bounded retries and adaptive splitting.
+StartLimitIntervalSec=6h
+StartLimitBurst=3
 
 [Service]
 Type=oneshot

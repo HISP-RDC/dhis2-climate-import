@@ -405,11 +405,21 @@ Transient failures (timeouts, resets, 429, 502/503/504 and common Cloudflare gat
 the configured retry policy and exit as `75` after exhaustion. Configuration, permissions and
 metadata incompatibilities exit as `2` without blind retries.
 
+Target value POSTs use adaptive chunking before a whole execution window is retried. A failing
+chunk is retried locally, then halved down to `transfer.adaptive_chunking.minimum_chunk_size`.
+Confirmed apply chunks are recorded under `checkpoints/data-values/` and skipped when an identical
+window is resumed. A timed-out `dryRun=false` request remains deliberately unconfirmed and is
+replayed with the idempotent `CREATE_AND_UPDATE` strategy. The systemd template additionally caps
+restart storms at three starts per six hours.
+
 Every source request is logged to stderr with its date window, organisation-unit count, duration,
 and cumulative value count. If DHIS2, nginx, or Cloudflare returns a timeout/gateway error, the
 pipeline automatically halves the period range and then the organisation-unit batch. A failure at
 the minimum size (one DHIS2 period and one organisation unit) is reported with a concise diagnostic;
 in that case inspect source performance or increase `DHIS2_TIMEOUT_SECONDS` in `.env`.
+
+For proxied targets, start with `DHIS2_TIMEOUT_SECONDS=120`. This setting is global to the instance
+clients; adaptive chunking remains global to the scenario and does not need a per-job override.
 
 With metadata strategy `CREATE`, dependencies reported by DHIS2 as already existing (`E5000`) are
 removed from the commit package and reused by UID. They are never updated implicitly. The full source

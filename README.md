@@ -350,6 +350,13 @@ gateway response subdivides the failing request until it succeeds or reaches one
 unit. `transfer run` prints timestamped progress to stderr and keeps the final JSON summary on
 stdout.
 
+Target validation/import has the equivalent protection. `transfer.adaptive_chunking` retries only
+the failing POST and halves its values down to a configurable minimum. With
+`transfer.execution.resume_chunks: true`, confirmed apply chunks are checkpointed by payload hash;
+an interrupted window skips identical completed chunks on its next attempt. Ambiguous timed-out
+imports are safely replayed under `CREATE_AND_UPDATE`, while DHIS2 data conflicts still stop the
+transfer. The policy is declared once in the global `transfer` block and is inherited by every job.
+
 Historical source values whose old CategoryOptionCombo has an exact equivalent are remapped by
 their complete CategoryOption UID set. When no lossless equivalent exists, the optional
 `historical_data_elements.strategy: versioned` policy creates a deterministic historical Data
@@ -380,7 +387,10 @@ sudo journalctl -fu dhis2-transfer@hospital_service.service
 
 The service never uses `--force`. Exit code `2` is permanent; exit code `75` is transient and can
 be restarted by systemd after the pipeline's own retries. A per-job lock, a target metadata lock
-and `execution.max_parallel_jobs` prevent unsafe concurrency.
+and `execution.max_parallel_jobs` prevent unsafe concurrency. The service template permits at most
+three starts per six hours, preventing an unavailable target from causing an endless restart loop.
+After correcting the cause, use `sudo systemctl reset-failed dhis2-transfer@<job>.service` before
+starting it again.
 
 ## Commands
 
