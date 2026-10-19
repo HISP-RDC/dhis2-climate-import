@@ -1371,6 +1371,175 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(report["rewrittenValueCount"], 1)
             self.assertIn(historical_id, {item["id"] for item in target.linked})
 
+    def test_versions_exact_historical_equivalent_when_remap_would_collide(self) -> None:
+        class ExactCollisionSource(_HistoricalSource):
+            def category_option_combos_for_category_combos(
+                self, category_combo_ids: list[str]
+            ) -> list[dict]:
+                items = {
+                    "CurrentCC01": [
+                        {
+                            "id": "CurrentC001",
+                            "name": ">=5 ans",
+                            "categoryCombo": {"id": "CurrentCC01"},
+                            "categoryOptions": [{"id": "SharedOpt01"}],
+                        }
+                    ],
+                    "HistoricCC1": [
+                        {
+                            "id": "HistoricC01",
+                            "name": ">=5 ans",
+                            "categoryCombo": {"id": "HistoricCC1"},
+                            "categoryOptions": [{"id": "SharedOpt01"}],
+                        }
+                    ],
+                }
+                return [
+                    item
+                    for uid in category_combo_ids
+                    for item in items.get(uid, [])
+                ]
+
+            def metadata_objects_by_ids(
+                self,
+                *,
+                resource: str,
+                root_key: str,
+                object_ids: list[str],
+                fields: str,
+            ) -> list[dict]:
+                objects = {
+                    "categoryOptionCombos": (
+                        self.category_option_combos_for_category_combos(
+                            ["HistoricCC1"]
+                        )
+                    ),
+                    "categoryCombos": [
+                        {
+                            "id": "HistoricCC1",
+                            "code": "HIST_CC",
+                            "name": "Ancien âge",
+                            "dataDimensionType": "DISAGGREGATION",
+                            "categories": [{"id": "HistoricCat"}],
+                        }
+                    ],
+                    "categories": [
+                        {
+                            "id": "HistoricCat",
+                            "code": "HIST_CAT",
+                            "name": "Ancien âge",
+                            "shortName": "Ancien âge",
+                            "dataDimensionType": "DISAGGREGATION",
+                            "categoryOptions": [{"id": "SharedOpt01"}],
+                        }
+                    ],
+                    "categoryOptions": [
+                        {
+                            "id": "SharedOpt01",
+                            "code": "AGE_5_PLUS",
+                            "name": ">=5 ans",
+                            "shortName": ">=5 ans",
+                        }
+                    ],
+                    "dataElements": [
+                        {
+                            "id": "DataEl00001",
+                            "code": "HOSP_ADM",
+                            "name": "Admissions",
+                            "shortName": "Admissions",
+                            "valueType": "INTEGER",
+                            "domainType": "AGGREGATE",
+                            "aggregationType": "SUM",
+                        }
+                    ],
+                }
+                return [
+                    item
+                    for item in objects.get(resource, [])
+                    if item.get("id") in object_ids
+                ]
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                period_type="month",
+                default_start_period="2026-01",
+                default_end_period="2026-01",
+            )
+            canonical = {
+                "id": "DataEl00001",
+                "code": "HOSP_ADM",
+                "name": "Admissions",
+                "valueType": "INTEGER",
+                "domainType": "AGGREGATE",
+                "aggregationType": "SUM",
+                "categoryCombo": {"id": "CurrentCC01"},
+            }
+            context = TransferContext(
+                job=scenario.get_job("weekly_climate"),
+                source_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                target_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                source_data_elements=(canonical,),
+                target_data_elements=(canonical,),
+                source_organisation_units=(),
+                target_organisation_units=(),
+                start="2026-01-01",
+                end="2026-01-31",
+                metadata_bootstrap_required=False,
+            )
+            target = _HistoricalTarget()
+            target.linked = [canonical]
+            values = [
+                {
+                    "dataElement": "DataEl00001",
+                    "period": "202601",
+                    "orgUnit": "OrgUnit00001",
+                    "categoryOptionCombo": "CurrentC001",
+                    "attributeOptionCombo": "AttrOpt0001",
+                    "value": "28",
+                },
+                {
+                    "dataElement": "DataEl00001",
+                    "period": "202601",
+                    "orgUnit": "OrgUnit00001",
+                    "categoryOptionCombo": "HistoricC01",
+                    "attributeOptionCombo": "AttrOpt0001",
+                    "value": "47",
+                },
+            ]
+
+            rewritten, report = _version_unmappable_historical_values(
+                ExactCollisionSource(),
+                target,
+                scenario,
+                context,
+                values,
+                apply=True,
+            )
+
+            historical_id = report["mappings"][0]["targetDataElement"]
+            self.assertEqual(rewritten[0]["dataElement"], "DataEl00001")
+            self.assertEqual(rewritten[0]["categoryOptionCombo"], "CurrentC001")
+            self.assertEqual(rewritten[0]["value"], "28")
+            self.assertEqual(rewritten[1]["dataElement"], historical_id)
+            self.assertEqual(rewritten[1]["categoryOptionCombo"], "HistoricC01")
+            self.assertEqual(rewritten[1]["value"], "47")
+            self.assertEqual(report["rewrittenValueCount"], 1)
+            self.assertEqual(report["exactEquivalentValueCount"], 0)
+            self.assertEqual(report["exactEquivalentCollisionValueCount"], 1)
+            self.assertEqual(report["exactEquivalentCollisionGroupCount"], 1)
+
     def test_clones_historical_category_graph_when_target_uid_is_incompatible(self) -> None:
         with TemporaryDirectory() as tmp:
             scenario = _scenario(

@@ -3773,21 +3773,96 @@ def _version_unmappable_historical_values(
             + ", ".join(missing_combos[:10])
         )
 
-    current_by_semantics: dict[str, set[tuple[str, ...]]] = defaultdict(set)
+    current_by_semantics: dict[str, dict[tuple[str, ...], str]] = defaultdict(dict)
     for combo in current_combos:
         parent_id = _reference_uid(combo.get("categoryCombo"))
-        if parent_id:
-            current_by_semantics[parent_id].add(
-                tuple(sorted(_reference_ids(combo.get("categoryOptions"))))
+        combo_id = str(combo.get("id") or "")
+        if not parent_id or not combo_id:
+            continue
+        semantics = tuple(sorted(_reference_ids(combo.get("categoryOptions"))))
+        existing = current_by_semantics[parent_id].get(semantics)
+        if existing is not None and existing != combo_id:
+            raise PipelineError(
+                "Source metadata contains duplicate current CategoryOptionCombos for "
+                f"CategoryCombo {parent_id} and options {semantics}."
             )
+        current_by_semantics[parent_id][semantics] = combo_id
+
+    exact_candidates: dict[tuple[str, str], tuple[str, str]] = {}
+    for (element_id, combo_id, expected_combo), _count in stale_usage.items():
+        historical = historical_by_id[combo_id]
+        semantics = tuple(sorted(_reference_ids(historical.get("categoryOptions"))))
+        replacement_id = current_by_semantics.get(expected_combo, {}).get(semantics)
+        if not replacement_id:
+            continue
+        historical_parent = _reference_uid(historical.get("categoryCombo"))
+        if not historical_parent:
+            raise PipelineError(
+                f"Historical CategoryOptionCombo {combo_id} has no parent CategoryCombo."
+            )
+        exact_candidates[(element_id, combo_id)] = (
+            replacement_id,
+            historical_parent,
+        )
+
+    # An exact semantic replacement is normally preferable, but it is not lossless
+    # when a current value already occupies the resulting DHIS2 key.  Keep the stale
+    # value on a versioned historical Data Element in that case so neither value wins
+    # arbitrarily.
+    exact_destination_pairs = {
+        (element_id, replacement_id)
+        for (element_id, _historical_id), (
+            replacement_id,
+            _historical_parent,
+        ) in exact_candidates.items()
+    }
+    exact_seen_destination_keys: dict[
+        tuple[str, ...], tuple[str, str] | None
+    ] = {}
+    exact_collision_keys: set[tuple[str, ...]] = set()
+    exact_collisions: set[tuple[str, str]] = set()
+    for value in data_values:
+        element_id = str(value.get("dataElement") or "")
+        source_combo_id = str(value.get("categoryOptionCombo") or "")
+        source_pair = (element_id, source_combo_id)
+        candidate = exact_candidates.get(source_pair)
+        if candidate is None and source_pair not in exact_destination_pairs:
+            continue
+        effective_combo_id = candidate[0] if candidate else source_combo_id
+        effective_key = tuple(
+            str(child or "")
+            for child in (
+                element_id,
+                value.get("period"),
+                value.get("orgUnit"),
+                effective_combo_id,
+                value.get("attributeOptionCombo"),
+            )
+        )
+        candidate_pair = source_pair if candidate else None
+        if effective_key not in exact_seen_destination_keys:
+            exact_seen_destination_keys[effective_key] = candidate_pair
+            continue
+        previous_candidate = exact_seen_destination_keys[effective_key]
+        if previous_candidate is None and candidate_pair is None:
+            continue
+        exact_collision_keys.add(effective_key)
+        if previous_candidate is not None:
+            exact_collisions.add(previous_candidate)
+        if candidate_pair is not None:
+            exact_collisions.add(candidate_pair)
+    exact_collision_groups = len(exact_collision_keys)
+    del exact_seen_destination_keys
 
     version_usage: Counter[tuple[str, str]] = Counter()
     combo_to_version: dict[tuple[str, str], str] = {}
     exact_equivalents = 0
+    exact_collision_values = 0
     for (element_id, combo_id, expected_combo), count in stale_usage.items():
         historical = historical_by_id[combo_id]
         semantics = tuple(sorted(_reference_ids(historical.get("categoryOptions"))))
-        if semantics in current_by_semantics.get(expected_combo, set()):
+        exact_candidate = exact_candidates.get((element_id, combo_id))
+        if exact_candidate and (element_id, combo_id) not in exact_collisions:
             exact_equivalents += count
             continue
         historical_parent = _reference_uid(historical.get("categoryCombo"))
@@ -3797,11 +3872,19 @@ def _version_unmappable_historical_values(
             )
         version_usage[(element_id, historical_parent)] += count
         combo_to_version[(element_id, combo_id)] = historical_parent
+        if exact_candidate:
+            exact_collision_values += count
 
+    report.update(
+        {
+            "exactEquivalentValueCount": exact_equivalents,
+            "exactEquivalentCollisionValueCount": exact_collision_values,
+            "exactEquivalentCollisionGroupCount": exact_collision_groups,
+        }
+    )
     # Exact equivalents are deliberately left untouched here and are handled by
     # _normalise_source_category_option_combos after this phase.
     if not version_usage:
-        report["exactEquivalentValueCount"] = exact_equivalents
         _emit_progress(
             progress,
             "historical_data_elements.audit.done",
@@ -4178,6 +4261,8 @@ def _version_unmappable_historical_values(
             "validationArtifact": str(artifact_dir / "validation.json"),
             "commitArtifact": str(commit_path),
             "exactEquivalentValueCount": exact_equivalents,
+            "exactEquivalentCollisionValueCount": exact_collision_values,
+            "exactEquivalentCollisionGroupCount": exact_collision_groups,
         }
     )
     _emit_progress(
