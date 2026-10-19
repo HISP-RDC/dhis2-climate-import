@@ -632,15 +632,18 @@ peuvent ensuite fonctionner en parallèle si la limite globale l’autorise.
 
 ### 10.3 Concurrence recommandée
 
-La valeur initiale recommandée est :
+La valeur opérationnelle recommandée est :
 
 ```yaml
 execution:
-  max_parallel_jobs: 1
+  max_parallel_jobs: 2
 ```
 
-Une valeur de `2` pourra être testée après mesure de la charge sur X, Y, Cloudflare, la mémoire et
-la base de données. Une concurrence illimitée est exclue.
+Les services peuvent tous être démarrés au même moment. Deux jobs travaillent réellement en
+parallèle et les suivants attendent un créneau sans échouer. Les phases de métadonnées restent
+sérialisées, puis les transferts de valeurs reprennent en parallèle. Une valeur supérieure à `2`
+doit être testée après mesure de la charge sur X, Y, Cloudflare, la mémoire et la base de données ;
+une concurrence illimitée reste exclue.
 
 ## 11. Flux implémenté de bout en bout
 
@@ -766,7 +769,7 @@ rapport global success/partial/failed
 - garder des tranches d’un à trois mois pour les Data Sets mensuels volumineux ;
 - ne pas utiliser `--force` dans systemd ;
 - conserver les rapports et le journal SQLite par job ;
-- commencer avec `execution.max_parallel_jobs: 1` ;
+- commencer avec `execution.max_parallel_jobs: 2`, puis mesurer la mémoire et les temps de réponse ;
 - considérer une erreur réseau réussie au retry comme un incident transitoire, pas comme une preuve
   qu’elle ne reviendra jamais.
 

@@ -51,7 +51,16 @@ def orchestrate_transfer(
     job = scenario.get_job(job_id)
     state_dir = scenario.job_state_dir(job_id)
     state_dir.mkdir(parents=True, exist_ok=True)
-    with concurrency_slot(scenario.state_dir, maximum=scenario.max_parallel_jobs) as slot:
+    _emit(
+        progress,
+        "orchestrator.slot.wait",
+        maximum=scenario.max_parallel_jobs,
+    )
+    with concurrency_slot(
+        scenario.state_dir,
+        maximum=scenario.max_parallel_jobs,
+        wait_when_busy=True,
+    ) as slot:
         _emit(progress, "orchestrator.slot.acquired", slot=slot)
         with exclusive_lock(
             scenario.state_dir / "locks" / f"job-{job_id}.lock",
@@ -110,7 +119,7 @@ def _orchestrate_locked(
         with exclusive_lock(
             scenario.state_dir / "locks" / "metadata.lock",
             purpose=f"target metadata for {scenario.id}/{job_id}",
-            transient_when_busy=True,
+            wait_when_busy=True,
         ):
             if (
                 reconcile_organisation_units

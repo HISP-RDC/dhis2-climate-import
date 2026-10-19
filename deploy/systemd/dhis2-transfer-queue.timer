@@ -1,0 +1,11 @@
+[Unit]
+Description=Planification de la file séquentielle des transferts DHIS2
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 Africa/Kinshasa
+Persistent=true
+RandomizedDelaySec=10m
+Unit=dhis2-transfer-queue.service
+
+[Install]
+WantedBy=timers.target

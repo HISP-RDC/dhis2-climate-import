@@ -39,7 +39,14 @@ Open Climate Service is a separate service from DHIS2. Our pipeline expects it a
 
 ```sh
 CLIMATE_SERVICE_BASE_URL=http://127.0.0.1:9000
+CLIMATE_SERVICE_HTTP_TIMEOUT_SECONDS=60
+CLIMATE_SERVICE_POLL_SECONDS=5
+CLIMATE_SERVICE_JOB_TIMEOUT_SECONDS=86400
 ```
+
+Dataset ingestion is submitted with `Prefer: respond-async`. The command then polls the
+native OCS job and displays persisted progress, so a long CDS request does not depend on a
+single long-lived HTTP connection.
 
 Fast local setup from the official OCS repository:
 
@@ -81,6 +88,11 @@ The web interface is available at:
 
 Start with CHIRPS3 daily precipitation if you only want to test OCS quickly. ERA5-Land can require
 additional data-source credentials depending on the configured source.
+
+For a production server, use the single-worker OCS service and the sequential weekly pipeline in
+`deploy/systemd/`. The complete installation, historical backfill and timer procedure is documented
+in [weekly-climate-ocs.md](weekly-climate-ocs.md#déploiement-systemd-sur-le-serveur). Do not combine
+the OCS internal scheduler with `dhis2-climate-pipeline.timer` for the same datasets.
 
 ## 3. Check DHIS2
 
@@ -437,6 +449,9 @@ sudo cp deploy/systemd/dhis2-transfer@.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dhis2-transfer@hospital_service.timer
 sudo systemctl enable --now dhis2-transfer@sigl_fosa.timer
+sudo systemctl enable --now dhis2-transfer@weekly_climate.timer
+sudo systemctl enable --now dhis2-transfer@service_base.timer
+sudo systemctl enable --now dhis2-transfer@relevant_epidemiological_data.timer
 systemctl list-timers 'dhis2-transfer@*'
 ```
 
@@ -450,6 +465,48 @@ sudo journalctl -fu dhis2-transfer@hospital_service.service
 
 The template intentionally omits `--force`. The YAML setting `execution.max_parallel_jobs` limits
 heavy jobs globally, while a per-job lock and one target-metadata lock prevent conflicting runs.
+With `max_parallel_jobs: 2`, all services may be started together: two transfers run and additional
+services wait for a slot instead of failing. Metadata writes wait for the metadata lock and remain
+serialized even while value transfers from different jobs run in parallel.
+
+### Sequential systemd queue
+
+Do not enable every per-job timer when strict ordering is required: timers are independent and use
+the configured parallel slots. Install the queue controller instead to deliberately serialize all
+jobs:
+
+```sh
+sudo cp deploy/systemd/dhis2-transfer@.service /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer-queue.service /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer-queue.timer /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer-queue.env.example /etc/default/dhis2-transfer-queue
+sudo systemctl daemon-reload
+
+sudo systemctl disable --now 'dhis2-transfer@hospital_service.timer' \
+  'dhis2-transfer@sigl_fosa.timer' \
+  'dhis2-transfer@weekly_climate.timer' \
+  'dhis2-transfer@service_base.timer' \
+  'dhis2-transfer@relevant_epidemiological_data.timer'
+
+sudo systemctl enable dhis2-transfer-queue.timer
+sudo systemctl start --no-block dhis2-transfer-queue.service
+sudo journalctl -fu dhis2-transfer-queue.service
+```
+
+The ordered list is configured in `/etc/default/dhis2-transfer-queue`:
+
+```sh
+DHIS2_TRANSFER_JOBS="hospital_service sigl_fosa weekly_climate service_base relevant_epidemiological_data"
+DHIS2_TRANSFER_CONTINUE_ON_FAILURE=true
+DHIS2_TRANSFER_QUEUE_POLL_SECONDS=15
+```
+
+The first entry is also a gate. If its service is already active, the queue waits for that existing
+execution and starts the second entry only after it stops. A transfer uses its normal internal
+retries and systemd restart limit before being declared failed. With continuation enabled, the
+queue records the failure and proceeds, but exits non-zero at the end to preserve an observable
+failure status. Follow the controller with `journalctl -fu dhis2-transfer-queue.service` and keep
+using `journalctl -fu dhis2-transfer@<job>.service` for detailed transfer progress.
 
 ### Repair partial target metadata
 

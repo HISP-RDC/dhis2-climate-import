@@ -2,11 +2,11 @@
 
 dhis2:
   org_unit_level: 3
-  # Optional but recommended: code or UID of the DHIS2 climate data set.
-  # When set, cache-data-elements only stores data elements attached to these data sets.
-  climate_data_set: CCH_CLIMATE_WEATHER
+  # Y has no code on this Data Set, so its UID is the stable selector.
+  # cache-data-elements only stores Data Elements attached to this Data Set.
+  climate_data_set: mck6wRvBafz
   climate_data_sets:
-    - CCH_CLIMATE_WEATHER
+    - mck6wRvBafz
   cache_max_age_hours: 168
   page_size: 500
   chunk_size: 5000
@@ -20,66 +20,114 @@ open_climate_service:
   publish: true
 
 imports:
-  - id: temperature_max_weekly_era5_land
-    label: Max air temperature (ERA5-Land)
-    # OCS built-in ERA5-Land templates currently cover mean temperature. Keep this
-    # dataset_id aligned with the custom OCS dataset/workflow that reproduces the
-    # Climate App max-temperature calculation before running an import.
-    dataset_id: era5land_temperature_max_weekly
-    # Use the actual weekly DHIS2 data set code/UID from this instance. The error
-    # trace showed CCH_CLIMATE_WEATHER, so that remains the default until confirmed.
-    data_set: CCH_CLIMATE_WEATHER
-    data_element: ERA5_LAND_TEMPERATURE_MAX
-    period_type: week
-    method: max
-    expected_units: celsius
-    # The org unit level is intentionally runtime-driven. Use --org-unit-level
-    # on review/aggregate/import after caching the matching level.
-    default_start_period: 2026-W09
-    default_end_period: 2026-W31
+  # Target mappings refreshed from Y on 2026-10-18. Y's Data Elements currently
+  # have no codes, so every mapping deliberately uses a UID. All source dataset IDs
+  # below are weekly OCS publication contracts; they must exist in OCS before import.
 
-  - id: precipitation_daily
-    dataset_id: chirps3_precipitation_daily
-    data_element: CCH_PRECIP_CHIRPS_DAILY
-    period_type: day
+  - id: precipitation_weekly_chirps
+    label: Precipitation (CHIRPS)
+    dataset_id: chirps3_precipitation_weekly
+    data_set: mck6wRvBafz
+    data_element: DZte8CXJ6zJ
+    period_type: week
     method: mean
     expected_units: mm
-    default_start: 2024-01-01
-    default_end: 2024-01-31
 
   - id: precipitation_weekly_era5_land
     label: Precipitation (ERA5-Land)
-    # Climate App shows this as weekly data derived from the ERA5-Land precipitation source.
-    dataset_id: era5land_precipitation_daily
-    data_set: CCH_CLIMATE_WEATHER
-    data_element: era5_land_precipitation
+    dataset_id: era5land_precipitation_weekly
+    data_set: mck6wRvBafz
+    data_element: RMaMv7SrUYd
     period_type: week
     method: mean
     expected_units: mm
 
-  - id: temperature_daily
-    dataset_id: era5land_temperature_daily
-    data_element: CCH_TEMP_ERA5_DAILY
-    period_type: day
+  - id: temperature_mean_weekly_era5_land
+    label: Mean air temperature (ERA5-Land)
+    dataset_id: era5land_temperature_weekly
+    data_set: mck6wRvBafz
+    data_element: Pjd8Rn6mTb0
+    period_type: week
     method: mean
-    expected_units: celsius
-    default_start: 2024-01-01
-    default_end: 2024-01-31
+    expected_units: degC
 
-  - id: temperature_daily_from_hourly
-    dataset_id: era5land_temperature_daily_from_hourly
-    data_element: CCH_TEMP_ERA5_FROM_HOURLY_DAILY
-    period_type: day
+  - id: temperature_max_weekly_era5_land
+    label: Maximum air temperature (ERA5-Land)
+    dataset_id: era5land_temperature_max_weekly
+    data_set: mck6wRvBafz
+    data_element: BDIuhHdQEDI
+    period_type: week
     method: mean
-    expected_units: celsius
-    default_start: 2024-01-01
-    default_end: 2024-01-31
+    expected_units: degC
 
-  - id: temperature_monthly
-    dataset_id: era5land_temperature_monthly
-    data_element: CCH_TEMP_ERA5_MONTHLY
-    period_type: month
+  - id: temperature_min_weekly_era5_land
+    label: Minimum air temperature (ERA5-Land)
+    dataset_id: era5land_temperature_min_weekly
+    data_set: mck6wRvBafz
+    data_element: QZilZRiGNvB
+    period_type: week
     method: mean
-    expected_units: celsius
-    default_start: 2024-01-01
-    default_end: 2024-12-31
+    expected_units: degC
+
+  - id: dewpoint_temperature_weekly_era5_land
+    label: Dewpoint temperature (ERA5-Land)
+    dataset_id: era5land_dewpoint_temperature_weekly
+    data_set: mck6wRvBafz
+    data_element: CLbMVtinuoV
+    period_type: week
+    method: mean
+    expected_units: degC
+
+  - id: relative_humidity_weekly_era5_land
+    label: Relative humidity (ERA5-Land)
+    dataset_id: era5land_relative_humidity_weekly
+    data_set: mck6wRvBafz
+    data_element: hsQg4SfG5pO
+    period_type: week
+    method: mean
+    expected_units: "%"
+
+  - id: heat_stress_weekly_era5_heat
+    label: Mean heat stress (ERA5-HEAT UTCI)
+    dataset_id: era5heat_utci_weekly
+    data_set: mck6wRvBafz
+    data_element: X0Tq9B9meJU
+    period_type: week
+    method: mean
+    expected_units: degC
+
+  - id: heat_stress_max_weekly_era5_heat
+    label: Maximum heat stress (ERA5-HEAT UTCI)
+    dataset_id: era5heat_utci_max_weekly
+    data_set: mck6wRvBafz
+    data_element: BmszSzqKgFb
+    period_type: week
+    method: mean
+    expected_units: degC
+
+  - id: heat_stress_min_weekly_era5_heat
+    label: Minimum heat stress (ERA5-HEAT UTCI)
+    dataset_id: era5heat_utci_min_weekly
+    data_set: mck6wRvBafz
+    data_element: N5ENtQKKQcj
+    period_type: week
+    method: mean
+    expected_units: degC
+
+  - id: vegetation_ndvi_weekly
+    label: Normalized Difference Vegetation Index (MODIS)
+    dataset_id: modis_ndvi_weekly
+    data_set: mck6wRvBafz
+    data_element: BC3vgSOKONN
+    period_type: week
+    method: mean
+    expected_units: "1"
+
+  - id: vegetation_evi_weekly
+    label: Enhanced Vegetation Index (MODIS)
+    dataset_id: modis_evi_weekly
+    data_set: mck6wRvBafz
+    data_element: dl1JTXinsIM
+    period_type: week
+    method: mean
+    expected_units: "1"

@@ -1,0 +1,38 @@
+[Unit]
+Description=Pipeline hebdomadaire Open Climate Service vers DHIS2
+Wants=network-online.target
+After=network-online.target open-climate-service.service
+Requires=open-climate-service.service
+# Bound automatic retries when OCS, CDS or DHIS2 remains unavailable.
+StartLimitIntervalSec=6h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=meleck
+Group=meleck
+WorkingDirectory=/opt/dhis2-climate-import
+Environment=PYTHONPATH=/opt/dhis2-climate-import/src
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/default/dhis2-climate-pipeline
+UMask=0077
+
+ExecStartPre=/usr/bin/test -r /opt/dhis2-climate-import/.env
+ExecStartPre=/usr/bin/test -r /opt/dhis2-climate-import/config/import-pipeline.yaml
+ExecStartPre=/usr/bin/test -x /opt/dhis2-climate-import/.venv/bin/python
+ExecStartPre=/usr/bin/curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-connrefused --max-time 15 http://127.0.0.1:9000/extent
+ExecStart=/usr/bin/bash /opt/dhis2-climate-import/deploy/systemd/dhis2-climate-pipeline.sh
+
+# Exit 2 is a permanent configuration/data error. Exit 75 represents a
+# temporary OCS, source or network failure and is retried by systemd.
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5min
+TimeoutStartSec=infinity
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dhis2-climate-pipeline
+
+[Install]
+WantedBy=multi-user.target

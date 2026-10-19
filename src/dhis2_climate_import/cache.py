@@ -27,24 +27,35 @@ def write_org_units_cache(
     level: int,
     source_base_url: str,
     organisation_units: list[dict[str, Any]],
+    skip_missing_geometry: bool = False,
 ) -> tuple[Path, Path]:
     missing_geometry = [
         str(unit.get("id") or "<unknown>")
         for unit in organisation_units
         if not unit.get("geometry")
     ]
-    if missing_geometry:
+    if missing_geometry and not skip_missing_geometry:
         preview = ", ".join(missing_geometry[:10])
         raise PipelineError(
             "Cannot write org unit cache because level "
             f"{level} contains units without geometry: {preview}"
         )
 
+    cached_units = (
+        [unit for unit in organisation_units if unit.get("geometry")]
+        if skip_missing_geometry
+        else organisation_units
+    )
+    if not cached_units:
+        raise PipelineError(
+            f"Cannot write org unit cache because level {level} contains no units with geometry."
+        )
+
     geojson_path, manifest_path = org_unit_cache_paths(root_dir, level)
     geojson_path.parent.mkdir(parents=True, exist_ok=True)
     collection = {
         "type": "FeatureCollection",
-        "features": [_org_unit_to_feature(unit, level) for unit in organisation_units],
+        "features": [_org_unit_to_feature(unit, level) for unit in cached_units],
     }
     _write_json(geojson_path, collection)
     geojson_hash = sha256_file(geojson_path)
@@ -52,7 +63,10 @@ def write_org_units_cache(
         "generatedAt": utc_now(),
         "source": source_base_url,
         "level": level,
-        "count": len(organisation_units),
+        "count": len(cached_units),
+        "sourceCount": len(organisation_units),
+        "excludedWithoutGeometry": len(missing_geometry),
+        "excludedOrganisationUnitIds": missing_geometry,
         "fields": ["id", "code", "name", "path", "level", "geometry"],
         "geojson": geojson_path.name,
         "geojsonSha256": geojson_hash,

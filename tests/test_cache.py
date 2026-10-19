@@ -47,6 +47,32 @@ class CacheTests(unittest.TestCase):
                     organisation_units=[{"id": "OuLevel3001", "level": 3}],
                 )
 
+    def test_can_audit_and_skip_units_without_geometry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_org_units_cache(
+                root_dir=root,
+                level=3,
+                source_base_url="https://dhis2.example.org",
+                organisation_units=[
+                    {
+                        "id": "OuWithGeom1",
+                        "name": "With geometry",
+                        "level": 3,
+                        "geometry": {"type": "Point", "coordinates": [12.0, -3.0]},
+                    },
+                    {"id": "OuWithout01", "name": "Without geometry", "level": 3},
+                ],
+                skip_missing_geometry=True,
+            )
+            geojson, manifest = load_org_units_cache(root_dir=root, level=3, max_age_hours=1)
+
+        self.assertEqual(manifest["count"], 1)
+        self.assertEqual(manifest["sourceCount"], 2)
+        self.assertEqual(manifest["excludedWithoutGeometry"], 1)
+        self.assertEqual(manifest["excludedOrganisationUnitIds"], ["OuWithout01"])
+        self.assertEqual([feature["id"] for feature in geojson["features"]], ["OuWithGeom1"])
+
     def test_resolves_data_element_by_code_or_uid(self) -> None:
         elements = [{"id": "DataEl00001", "code": "CCH_PRECIP", "name": "Rain"}]
         self.assertEqual(resolve_data_element(elements, "CCH_PRECIP")["id"], "DataEl00001")

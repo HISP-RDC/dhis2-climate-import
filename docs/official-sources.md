@@ -1,6 +1,6 @@
 # Official Sources
 
-Derniere revue: 2026-08-27.
+Derniere revue: 2026-10-19.
 
 Ce projet doit rester aligne sur les sources officielles, surtout avant tout import vers une
 instance DHIS2 de production.
@@ -24,12 +24,12 @@ instance DHIS2 de production.
 
 ## Notes for v1
 
-- V1 supports precipitation and temperature imports with Open Climate Service built-in datasets.
+- V1 supports precipitation, temperature, dew point, relative humidity, UTCI, NDVI and EVI.
 - The Climate App metadata guide maps max air temperature to `ERA5_LAND_TEMPERATURE_MAX` /
   `CCH - Max air temperature (ERA5-Land)`.
 - Climate App imports should use the DHIS2 data set matching the period type, for example weekly
   imports from a weekly data set.
-- Humidity and NDVI are phase 2 items because they need either an OCS custom dataset/plugin or
-  a DHIS2 Climate Tools flow.
+- The instance plugin in `open-climate-service/plugins/datasets/drc_weekly.py` provides the
+  custom weekly OCS datasets required for humidity, UTCI, NDVI and EVI.
 - The target for validation is DHIS2 2.37+ on a non-production instance.
 - Exact endpoint behavior must be checked against the target DHIS2 version before production use.

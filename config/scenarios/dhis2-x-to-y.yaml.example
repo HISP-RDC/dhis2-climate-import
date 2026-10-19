@@ -98,7 +98,9 @@ transfer:
     stop_on_error: true
 
 execution:
-  max_parallel_jobs: 1
+  # Two value transfers may run concurrently. Additional jobs wait for a slot
+  # instead of failing and entering a systemd restart loop.
+  max_parallel_jobs: 2
 
 state:
   directory: state

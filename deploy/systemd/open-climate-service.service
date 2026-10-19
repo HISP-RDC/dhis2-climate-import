@@ -1,0 +1,36 @@
+[Unit]
+Description=Open Climate Service DRC
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=30min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=meleck
+Group=meleck
+WorkingDirectory=/opt/open-climate-service
+EnvironmentFile=/opt/open-climate-service/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=CLIMATE_SERVICE_CONFIG=/opt/open-climate-service/climate-service.yaml
+UMask=0077
+
+ExecStartPre=/usr/bin/test -r /opt/open-climate-service/.env
+ExecStartPre=/usr/bin/test -r /opt/open-climate-service/climate-service.yaml
+ExecStartPre=/usr/bin/test -x /opt/open-climate-service/.venv/bin/uvicorn
+ExecStart=/opt/open-climate-service/.venv/bin/uvicorn open_climate_service.main:app --host 127.0.0.1 --port 9000 --workers 1
+
+# OCS uses process-local write coordination. Keep one writable process and let
+# systemd restart that process instead of adding multiple Uvicorn workers. OCS
+# can still use worker threads and Dask across the server's CPU cores.
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=300s
+KillSignal=SIGINT
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=open-climate-service
+
+[Install]
+WantedBy=multi-user.target

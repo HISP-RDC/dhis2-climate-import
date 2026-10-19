@@ -82,6 +82,14 @@ def build_parser() -> argparse.ArgumentParser:
     org_units = subparsers.add_parser("cache-org-units", help="Cache DHIS2 org units as GeoJSON.")
     org_units.add_argument("--level", type=int, default=None)
     org_units.add_argument("--refresh", action="store_true")
+    org_units.add_argument(
+        "--skip-missing-geometry",
+        action="store_true",
+        help=(
+            "Exclude organisation units without geometry and record their UIDs in the "
+            "cache manifest. By default, any missing geometry blocks cache creation."
+        ),
+    )
     org_units.set_defaults(func=cmd_cache_org_units)
 
     data_elements = subparsers.add_parser("cache-data-elements", help="Cache DHIS2 data elements.")
@@ -310,17 +318,24 @@ def cmd_cache_org_units(args: argparse.Namespace) -> None:
 
     dhis2 = DHIS2Client.from_env(env)
     units = dhis2.organisation_units_level(level=level, page_size=config.dhis2.page_size)
+    missing_geometry = [
+        str(unit.get("id") or "<unknown>") for unit in units if not unit.get("geometry")
+    ]
     written_geojson, written_manifest = write_org_units_cache(
         root_dir=config.root_dir,
         level=level,
         source_base_url=dhis2.base_url,
         organisation_units=units,
+        skip_missing_geometry=args.skip_missing_geometry,
     )
     _print_json(
         {
             "status": "written",
             "level": level,
-            "count": len(units),
+            "count": len(units) - len(missing_geometry),
+            "sourceCount": len(units),
+            "excludedWithoutGeometry": len(missing_geometry),
+            "excludedOrganisationUnitIds": missing_geometry,
             "geojson": str(written_geojson),
             "manifest": str(written_manifest),
         }
@@ -382,6 +397,7 @@ def cmd_ingest_dataset(args: argparse.Namespace) -> None:
         end=end,
         overwrite=args.overwrite,
         publish=config.open_climate_service.publish if args.publish is None else args.publish,
+        progress=_transfer_progress,
     )
     _print_json(response)
 
@@ -1127,6 +1143,9 @@ def _window_phase(event: str) -> str | None:
 
 def _transfer_progress(event: str, details: dict[str, Any]) -> None:
     labels = {
+        "ocs.ingestion.queued": "Ingestion OCS mise en file",
+        "ocs.ingestion.progress": "Progression de l’ingestion OCS",
+        "ocs.ingestion.done": "Ingestion OCS terminée",
         "instances.check.start": "Vérification des connexions X et Y",
         "instances.source.done": "Connexion source X validée",
         "instances.target.done": "Connexion cible Y validée",
@@ -1232,6 +1251,7 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "target.import.chunk.checkpoint": "Checkpoint du lot cible enregistré",
         "target.import.chunk.done": "Lot cible importé",
         "target.import.done": "Import réel terminé",
+        "orchestrator.slot.wait": "Attente d’un créneau d’exécution",
         "orchestrator.slot.acquired": "Créneau d’exécution acquis",
         "orchestrator.interrupted.recovered": (
             "Anciennes tranches interrompues reclassées"

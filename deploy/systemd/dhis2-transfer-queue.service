@@ -1,0 +1,22 @@
+[Unit]
+Description=File séquentielle des transferts DHIS2 X vers Y
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The first entry also acts as a gate when that job is already running: the
+# queue joins it and waits before starting the remaining jobs.
+Environment="DHIS2_TRANSFER_JOBS=hospital_service sigl_fosa weekly_climate service_base relevant_epidemiological_data"
+Environment=DHIS2_TRANSFER_CONTINUE_ON_FAILURE=true
+Environment=DHIS2_TRANSFER_QUEUE_POLL_SECONDS=15
+EnvironmentFile=-/etc/default/dhis2-transfer-queue
+ExecStart=/usr/bin/bash /opt/dhis2-climate-import/deploy/systemd/dhis2-transfer-queue.sh
+TimeoutStartSec=infinity
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dhis2-transfer-queue
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Planification hebdomadaire du pipeline climat OCS vers DHIS2
+
+[Timer]
+OnCalendar=Mon *-*-* 03:00:00 Africa/Kinshasa
+Persistent=true
+RandomizedDelaySec=10m
+Unit=dhis2-climate-pipeline.service
+
+[Install]
+WantedBy=timers.target

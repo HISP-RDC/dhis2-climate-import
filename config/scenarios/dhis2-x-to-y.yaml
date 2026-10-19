@@ -92,7 +92,9 @@ transfer:
     stop_on_error: true
 
 execution:
-  max_parallel_jobs: 1
+  # Deux transferts de valeurs peuvent travailler en parallèle. Les jobs
+  # supplémentaires attendent un créneau au lieu d'échouer.
+  max_parallel_jobs: 2
 
 state:
   directory: state
@@ -144,25 +146,25 @@ jobs:
         process_isolation: true
         resume: true
         stop_on_error: true
-  # - id: population_as
-  #   source_data_set: mV0r6yDCZy3
-  #   target_data_set: mV0r6yDCZy3
-  #   period_type: month
-  #   default_start_period: 2019-01
-  #   default_end_period: 2026-10
-  #   data_elements:
-  #     discovery: linked_to_dataset
-  #   transfer:
-  #     # Export one DHIS2 month per source request; timeout responses are then
-  #     # subdivided automatically by organisation unit.
-  #     source_period_batch_size: 1
-  #     execution:
-  #       # Une tranche trimestrielle garde la mémoire bornée; chaque tranche
-  #       # s'exécute dans un nouveau processus.
-  #       period_batch_size: 3
-  #       process_isolation: true
-  #       resume: true
-  #       stop_on_error: true
+  - id: service_base
+    source_data_set: pMbC0FJPkcm
+    target_data_set: pMbC0FJPkcm
+    period_type: month
+    default_start_period: 2019-01
+    default_end_period: 2019-12
+    data_elements:
+      discovery: linked_to_dataset
+    transfer:
+      # Export one DHIS2 month per source request; timeout responses are then
+      # subdivided automatically by organisation unit.
+      source_period_batch_size: 1
+      execution:
+        # Une tranche trimestrielle garde la mémoire bornée; chaque tranche
+        # s'exécute dans un nouveau processus.
+        period_batch_size: 3
+        process_isolation: true
+        resume: true
+        stop_on_error: true
   - id: relevant_epidemiological_data
     source_data_set: Fo5ux0Ja21i
     target_data_set: Fo5ux0Ja21i

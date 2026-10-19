@@ -3833,7 +3833,7 @@ def _version_unmappable_historical_values(
     with exclusive_lock(
         scenario.state_dir / "locks" / "metadata.lock",
         purpose=f"historical metadata for {scenario.id}/{context.job.id}",
-        transient_when_busy=True,
+        wait_when_busy=True,
     ):
         non_empty_package = {key: value for key, value in package.items() if value}
         if non_empty_package:

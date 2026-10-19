@@ -2,13 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from pathlib import Path
 from typing import Any
 
 from .cache import (
     load_data_elements_cache_payload,
     load_org_units_cache,
-    org_unit_cache_paths,
     resolve_data_element,
 )
 from .config import ImportJobConfig, PipelineConfig
@@ -36,7 +34,7 @@ class ResolvedImport:
     org_unit_count: int
     expected_org_units_with_geometry: int | None
     expected_data_values: int | None
-    org_units_geojson_path: Path
+    org_units_geojson: dict[str, Any]
     org_units_manifest: dict[str, Any]
     start: str
     end: str
@@ -113,7 +111,6 @@ def resolve_import_context(
             f"{org_unit_count}. Refresh/check: cache-org-units --level {resolved_org_unit_level}"
         )
     resolved_period_labels = period_labels_between(resolved_start, resolved_end, job.period_type)
-    org_units_geojson_path, _ = org_unit_cache_paths(config.root_dir, resolved_org_unit_level)
     context = ResolvedImport(
         job=job,
         data_set=resolved_data_set,
@@ -122,7 +119,7 @@ def resolve_import_context(
         org_unit_count=org_unit_count,
         expected_org_units_with_geometry=resolved_expected_org_units,
         expected_data_values=expected_data_values,
-        org_units_geojson_path=org_units_geojson_path,
+        org_units_geojson=org_units_geojson,
         org_units_manifest=org_units_manifest,
         start=resolved_start,
         end=resolved_end,
@@ -165,7 +162,7 @@ def aggregate_job(
     payload = ocs.aggregate_to_dhis2_json(
         process_id=config.open_climate_service.aggregate_process_id,
         dataset_id=context.job.dataset_id,
-        org_units_geojson_path=context.org_units_geojson_path,
+        geometries=context.org_units_geojson,
         data_element_id=str(context.data_element["id"]),
         period_type=context.job.period_type,
         start=context.start,
@@ -232,7 +229,7 @@ def import_job(
         payload = ocs.aggregate_to_dhis2_json(
             process_id=config.open_climate_service.aggregate_process_id,
             dataset_id=context.job.dataset_id,
-            org_units_geojson_path=context.org_units_geojson_path,
+            geometries=context.org_units_geojson,
             data_element_id=str(context.data_element["id"]),
             period_type=context.job.period_type,
             start=context.start,

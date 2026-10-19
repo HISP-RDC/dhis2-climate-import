@@ -1,5 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
+import time
 import unittest
 
 from dhis2_climate_import.errors import TransientPipelineError
@@ -30,6 +32,62 @@ class LockTests(unittest.TestCase):
                 with self.assertRaises(TransientPipelineError):
                     with concurrency_slot(root, maximum=1):
                         self.fail("second concurrency slot must not exist")
+
+    def test_waiting_concurrency_slot_enters_after_release(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            holder_entered = threading.Event()
+
+            def hold_slot() -> None:
+                with concurrency_slot(root, maximum=1):
+                    holder_entered.set()
+                    time.sleep(0.05)
+
+            holder = threading.Thread(target=hold_slot)
+            holder.start()
+            self.assertTrue(holder_entered.wait(timeout=1))
+
+            started_at = time.monotonic()
+            with concurrency_slot(
+                root,
+                maximum=1,
+                wait_when_busy=True,
+                poll_interval_seconds=0.01,
+            ) as slot:
+                self.assertEqual(slot, 0)
+            elapsed = time.monotonic() - started_at
+
+            holder.join(timeout=1)
+            self.assertFalse(holder.is_alive())
+            self.assertGreaterEqual(elapsed, 0.03)
+
+    def test_waiting_exclusive_lock_enters_after_release(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metadata.lock"
+            holder_entered = threading.Event()
+
+            def hold_lock() -> None:
+                with exclusive_lock(path, purpose="first"):
+                    holder_entered.set()
+                    time.sleep(0.05)
+
+            holder = threading.Thread(target=hold_lock)
+            holder.start()
+            self.assertTrue(holder_entered.wait(timeout=1))
+
+            started_at = time.monotonic()
+            with exclusive_lock(
+                path,
+                purpose="second",
+                wait_when_busy=True,
+                poll_interval_seconds=0.01,
+            ):
+                pass
+            elapsed = time.monotonic() - started_at
+
+            holder.join(timeout=1)
+            self.assertFalse(holder.is_alive())
+            self.assertGreaterEqual(elapsed, 0.03)
 
 
 if __name__ == "__main__":

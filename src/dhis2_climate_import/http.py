@@ -86,7 +86,7 @@ class JsonHttpClient:
                 if not _is_retriable(exc.code) or attempt >= self.retries:
                     raise HttpRequestError(method.upper(), url, exc.code, body) from exc
                 time.sleep(self._sleep_seconds(attempt))
-            except URLError as exc:
+            except (URLError, TimeoutError, OSError) as exc:
                 if attempt >= self.retries:
                     raise HttpRequestError(method.upper(), url, None, str(exc)) from exc
                 time.sleep(self._sleep_seconds(attempt))

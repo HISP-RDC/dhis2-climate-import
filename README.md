@@ -174,7 +174,28 @@ The official quick start starts OCS on `http://127.0.0.1:9000`, so this project'
 
 ```env
 CLIMATE_SERVICE_BASE_URL=http://127.0.0.1:9000
+CLIMATE_SERVICE_HTTP_TIMEOUT_SECONDS=60
+CLIMATE_SERVICE_POLL_SECONDS=5
+CLIMATE_SERVICE_JOB_TIMEOUT_SECONDS=86400
 ```
+
+`ingest-dataset` submits the work with OCS native asynchronous jobs and polls their
+persisted progress. Long CDS downloads therefore do not keep one HTTP request open and
+do not fail merely because a download takes more than 60 seconds.
+
+Production-ready systemd units are provided for both processes:
+
+- `deploy/systemd/open-climate-service.service` keeps one writable OCS worker online;
+- `deploy/systemd/dhis2-climate-pipeline.service` runs every configured climate job sequentially;
+- `deploy/systemd/dhis2-climate-pipeline.timer` starts the rolling weekly pipeline;
+- `/etc/default/dhis2-climate-pipeline` controls the jobs, fixed/rolling window, lag and lookback.
+
+The pipeline always performs OCS ingestion, review, DHIS2 dry-run and then real import. It writes a
+checkpoint only after the real import succeeds. Historical windows are split into configurable
+13-week batches by default, so a multi-year backfill never becomes one large OCS request or DHIS2
+apply. See
+[`docs/weekly-climate-ocs.md`](docs/weekly-climate-ocs.md#déploiement-systemd-sur-le-serveur) for
+the complete server installation and first historical backfill.
 
 Ordre recommande sur une instance DHIS2 non-production :
 
@@ -377,7 +398,45 @@ sudo cp deploy/systemd/dhis2-transfer@.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dhis2-transfer@hospital_service.timer
 sudo systemctl enable --now dhis2-transfer@sigl_fosa.timer
+sudo systemctl enable --now dhis2-transfer@weekly_climate.timer
+sudo systemctl enable --now dhis2-transfer@service_base.timer
+sudo systemctl enable --now dhis2-transfer@relevant_epidemiological_data.timer
 ```
+
+This is the parallel mode. With `execution.max_parallel_jobs: 2`, every service can be requested at
+the same time: two jobs run and the remaining jobs wait for a free slot without failing. The queue
+below is optional and must only be used when strict sequential execution is wanted.
+
+The instance timers above are independent. For a strict sequence in which the next Data Set starts
+only after the current one reaches a terminal state, install the queue instead:
+
+```sh
+sudo cp deploy/systemd/dhis2-transfer@.service /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer-queue.service /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer-queue.timer /etc/systemd/system/
+sudo cp deploy/systemd/dhis2-transfer-queue.env.example /etc/default/dhis2-transfer-queue
+sudo systemctl daemon-reload
+
+# Do not keep per-job timers and the queue timer enabled at the same time.
+sudo systemctl disable --now 'dhis2-transfer@hospital_service.timer' \
+  'dhis2-transfer@sigl_fosa.timer' \
+  'dhis2-transfer@weekly_climate.timer' \
+  'dhis2-transfer@service_base.timer' \
+  'dhis2-transfer@relevant_epidemiological_data.timer'
+
+sudo systemctl enable dhis2-transfer-queue.timer
+sudo systemctl start --no-block dhis2-transfer-queue.service
+sudo journalctl -fu dhis2-transfer-queue.service
+```
+
+`DHIS2_TRANSFER_JOBS` in `/etc/default/dhis2-transfer-queue` is the ordered list. The shipped order
+is `hospital_service`, `sigl_fosa`, `weekly_climate`, `service_base`, then
+`relevant_epidemiological_data`. If
+`hospital_service` is already running when the queue starts, the queue joins that service and waits
+for it instead of launching a duplicate. With `DHIS2_TRANSFER_CONTINUE_ON_FAILURE=true`, a failed
+job is audited and the next one is started; the queue itself ends failed so that the incident stays
+visible. Each individual transfer keeps its own journal, retry policy, checkpoints and
+`SyslogIdentifier`.
 
 Follow one job with:
 
@@ -387,7 +446,9 @@ sudo journalctl -fu dhis2-transfer@hospital_service.service
 
 The service never uses `--force`. Exit code `2` is permanent; exit code `75` is transient and can
 be restarted by systemd after the pipeline's own retries. A per-job lock, a target metadata lock
-and `execution.max_parallel_jobs` prevent unsafe concurrency. The service template permits at most
+and `execution.max_parallel_jobs` prevent unsafe concurrency. With a value of `2`, all per-job
+services may be started together: two execute concurrently and the others wait instead of failing.
+Metadata writes remain serialized. The service template permits at most
 three starts per six hours, preventing an unavailable target from causing an endless restart loop.
 After correcting the cause, use `sudo systemctl reset-failed dhis2-transfer@<job>.service` before
 starting it again.
