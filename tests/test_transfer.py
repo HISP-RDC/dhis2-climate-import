@@ -2152,6 +2152,160 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(removed["categoryOptionCombos"], 1)
         self.assertEqual(filtered["dataSets"][0]["id"], "DataSet0001")
 
+    def test_repairs_invalid_category_option_combo_from_unique_generated_name(self) -> None:
+        source_package = {
+            "categoryOptions": [
+                {"id": "AgeOption001", "name": "0 et 11 mois"},
+                {"id": "AgeOption002", "name": "12 et 23 mois"},
+                {"id": "Strategy001", "name": "Fixe"},
+                {"id": "Strategy002", "name": "Avancé"},
+                {"id": "ForeignOpt01", "name": "> 59 mois"},
+            ],
+            "categories": [
+                {
+                    "id": "AgeCategory1",
+                    "name": "Age",
+                    "categoryOptions": [
+                        {"id": "AgeOption001"},
+                        {"id": "AgeOption002"},
+                    ],
+                },
+                {
+                    "id": "StrategyCat",
+                    "name": "Stratégie",
+                    "categoryOptions": [
+                        {"id": "Strategy001"},
+                        {"id": "Strategy002"},
+                    ],
+                },
+            ],
+            "categoryCombos": [
+                {
+                    "id": "CategoryCC1",
+                    "name": "Age et stratégie",
+                    "categories": [
+                        {"id": "AgeCategory1"},
+                        {"id": "StrategyCat"},
+                    ],
+                }
+            ],
+            "categoryOptionCombos": [
+                {
+                    "id": "OptionCombo1",
+                    "name": "0 et 11 mois, Fixe",
+                    "categoryCombo": {"id": "CategoryCC1"},
+                    "categoryOptions": [
+                        {"id": "AgeOption001"},
+                        {"id": "Strategy001"},
+                    ],
+                },
+                {
+                    "id": "OptionCombo2",
+                    "name": "0 et 11 mois, Avancé",
+                    "categoryCombo": {"id": "CategoryCC1"},
+                    "categoryOptions": [
+                        {"id": "AgeOption001"},
+                        {"id": "Strategy002"},
+                    ],
+                },
+                {
+                    "id": "OptionCombo3",
+                    "name": "12 et 23 mois, Fixe",
+                    "categoryCombo": {"id": "CategoryCC1"},
+                    "categoryOptions": [
+                        {"id": "ForeignOpt01"},
+                        {"id": "Strategy001"},
+                    ],
+                },
+                {
+                    "id": "OptionCombo4",
+                    "name": "12 et 23 mois, Avancé",
+                    "categoryCombo": {"id": "CategoryCC1"},
+                    "categoryOptions": [
+                        {"id": "AgeOption002"},
+                        {"id": "Strategy002"},
+                    ],
+                },
+            ],
+        }
+
+        prepared, report = _prepare_metadata_package(source_package)
+
+        repaired = next(
+            item
+            for item in prepared["categoryOptionCombos"]
+            if item["id"] == "OptionCombo3"
+        )
+        self.assertEqual(
+            repaired["categoryOptions"],
+            [{"id": "AgeOption002"}, {"id": "Strategy001"}],
+        )
+        repair_report = report["categoryOptionComboRepairs"]
+        self.assertEqual(repair_report["auditedCategoryCombos"], 1)
+        self.assertEqual(repair_report["repairedCategoryOptionCombos"], 1)
+        self.assertEqual(
+            repair_report["repairs"][0]["categoryOptionCombo"],
+            "OptionCombo3",
+        )
+
+    def test_blocks_ambiguous_invalid_category_option_combo_repair(self) -> None:
+        source_package = {
+            "categoryOptions": [
+                {"id": "AgeOption001", "name": "Enfant"},
+                {"id": "AgeOption002", "name": "Adulte"},
+                {"id": "Strategy001", "name": "Fixe"},
+                {"id": "ForeignOpt01", "name": "Inconnue"},
+            ],
+            "categories": [
+                {
+                    "id": "AgeCategory1",
+                    "categoryOptions": [
+                        {"id": "AgeOption001"},
+                        {"id": "AgeOption002"},
+                    ],
+                },
+                {
+                    "id": "StrategyCat",
+                    "categoryOptions": [{"id": "Strategy001"}],
+                },
+            ],
+            "categoryCombos": [
+                {
+                    "id": "CategoryCC1",
+                    "categories": [
+                        {"id": "AgeCategory1"},
+                        {"id": "StrategyCat"},
+                    ],
+                }
+            ],
+            "categoryOptionCombos": [
+                {
+                    "id": "OptionCombo1",
+                    "name": "Enfant, Fixe",
+                    "categoryCombo": {"id": "CategoryCC1"},
+                    "categoryOptions": [
+                        {"id": "AgeOption001"},
+                        {"id": "Strategy001"},
+                    ],
+                },
+                {
+                    "id": "OptionCombo2",
+                    "name": "Libellé impossible",
+                    "categoryCombo": {"id": "CategoryCC1"},
+                    "categoryOptions": [
+                        {"id": "ForeignOpt01"},
+                        {"id": "Strategy001"},
+                    ],
+                },
+            ],
+        }
+
+        with self.assertRaisesRegex(
+            PipelineError,
+            "cannot be repaired losslessly",
+        ):
+            _prepare_metadata_package(source_package)
+
     def test_metadata_validation_reuses_e5000_objects_without_updating_them(self) -> None:
         class MetadataTarget:
             def __init__(self):

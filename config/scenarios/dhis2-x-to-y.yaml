@@ -94,7 +94,7 @@ transfer:
 execution:
   # Deux transferts de valeurs peuvent travailler en parallèle. Les jobs
   # supplémentaires attendent un créneau au lieu d'échouer.
-  max_parallel_jobs: 2
+  max_parallel_jobs: 3
 
 state:
   directory: state
@@ -112,8 +112,8 @@ jobs:
     source_data_set: oTgCLoG5OkY
     target_data_set: oTgCLoG5OkY
     period_type: month
-    default_start_period: 2019-01
-    default_end_period: 2022-12
+    default_start_period: 2021-01
+    default_end_period: 2021-12
     data_elements:
       discovery: linked_to_dataset
     transfer:

@@ -5,10 +5,13 @@ from copy import deepcopy
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 import hashlib
+from itertools import product
 import json
 from pathlib import Path
+import re
 import time
 from typing import Any
+import unicodedata
 
 from .dhis2 import DHIS2Client, DataSetRef
 from .errors import PipelineError, TransientPipelineError
@@ -3067,13 +3070,230 @@ def _prepare_metadata_package(
         data_set["compulsoryDataElementOperands"] = valid_operands
 
     removed_orphan_combos = _prune_category_option_combos(package)
+    category_option_combo_repairs = _repair_invalid_category_option_combos(package)
     return package, {
         "removedDefaultObjects": {
             key: count for key, count in removed_defaults.items() if count
         },
         "removedIncompatibleCompulsoryOperands": removed_operands,
         "removedOrphanCategoryOptionCombos": removed_orphan_combos,
+        "categoryOptionComboRepairs": category_option_combo_repairs,
     }
+
+
+def _repair_invalid_category_option_combos(
+    package: dict[str, Any],
+) -> dict[str, Any]:
+    """Repair uniquely identifiable stale option references in exported metadata.
+
+    DHIS2 expects the CategoryOptionCombos of a CategoryCombo to be the complete
+    Cartesian product of its Categories.  Some legacy instances contain a combo
+    whose generated name still describes the intended options while one stored
+    CategoryOption reference belongs to an unrelated Category.  Importing such a
+    package fails with E1131.
+
+    A repair is safe only when the combo name uniquely matches one expected product.
+    The CategoryOptionCombo UID is preserved so existing source data values retain
+    their key.  Ambiguous, incomplete, or duplicate graphs are blocked rather than
+    guessed.
+    """
+    category_combos = {
+        str(item["id"]): item
+        for item in package.get("categoryCombos", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    categories = {
+        str(item["id"]): item
+        for item in package.get("categories", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    category_options = {
+        str(item["id"]): item
+        for item in package.get("categoryOptions", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    option_combos = [
+        item
+        for item in package.get("categoryOptionCombos", [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+    combinations_by_parent: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for combination in option_combos:
+        parent_id = _reference_uid(combination.get("categoryCombo"))
+        if parent_id:
+            combinations_by_parent[parent_id].append(combination)
+
+    repairs: list[dict[str, Any]] = []
+    blocked: list[str] = []
+    skipped: list[dict[str, str]] = []
+    audited = 0
+    for parent_id, parent in sorted(category_combos.items()):
+        combinations = combinations_by_parent.get(parent_id, [])
+        if not combinations:
+            continue
+        category_ids = _ordered_reference_ids(parent.get("categories"))
+        if not category_ids:
+            skipped.append(
+                {
+                    "categoryCombo": parent_id,
+                    "reason": "CategoryCombo export has no Category references",
+                }
+            )
+            continue
+
+        options_by_category: list[list[str]] = []
+        incomplete = False
+        for category_id in category_ids:
+            category = categories.get(category_id)
+            if category is None:
+                skipped.append(
+                    {
+                        "categoryCombo": parent_id,
+                        "reason": f"Category {category_id} is absent from the export",
+                    }
+                )
+                incomplete = True
+                continue
+            option_ids = _ordered_reference_ids(category.get("categoryOptions"))
+            missing_options = [
+                option_id for option_id in option_ids if option_id not in category_options
+            ]
+            if not option_ids or missing_options:
+                details = (
+                    ", ".join(missing_options)
+                    if missing_options
+                    else "no CategoryOptions"
+                )
+                skipped.append(
+                    {
+                        "categoryCombo": parent_id,
+                        "reason": f"Category {category_id} export is incomplete: {details}",
+                    }
+                )
+                incomplete = True
+                continue
+            options_by_category.append(option_ids)
+        if incomplete:
+            continue
+        audited += 1
+
+        expected_ordered: dict[frozenset[str], tuple[str, ...]] = {}
+        expected_by_label: dict[str, list[tuple[str, ...]]] = defaultdict(list)
+        for choice in product(*options_by_category):
+            semantics = frozenset(choice)
+            if len(semantics) != len(choice):
+                blocked.append(
+                    f"CategoryCombo {parent_id} reuses the same CategoryOption across "
+                    "multiple Categories"
+                )
+                continue
+            ordered = tuple(choice)
+            existing = expected_ordered.get(semantics)
+            if existing is not None and existing != ordered:
+                blocked.append(
+                    f"CategoryCombo {parent_id} has ambiguous CategoryOption semantics "
+                    f"{sorted(semantics)}"
+                )
+                continue
+            expected_ordered[semantics] = ordered
+            label = _normalise_category_option_combo_label(
+                ", ".join(
+                    str(category_options[option_id].get("name") or option_id)
+                    for option_id in ordered
+                )
+            )
+            expected_by_label[label].append(ordered)
+
+        seen: dict[frozenset[str], str] = {}
+        for combination in combinations:
+            combination_id = str(combination["id"])
+            actual_ids = _ordered_reference_ids(combination.get("categoryOptions"))
+            actual_semantics = frozenset(actual_ids)
+            valid = (
+                len(actual_ids) == len(category_ids)
+                and len(actual_semantics) == len(actual_ids)
+                and actual_semantics in expected_ordered
+            )
+            if not valid:
+                label = _normalise_category_option_combo_label(
+                    str(combination.get("name") or "")
+                )
+                inferred = expected_by_label.get(label, []) if label else []
+                unique_inferred = {
+                    tuple(option_ids) for option_ids in inferred
+                }
+                if len(unique_inferred) != 1:
+                    blocked.append(
+                        f"CategoryOptionCombo {combination_id} of {parent_id} has invalid "
+                        f"options {sorted(actual_semantics)} and its name "
+                        f"{combination.get('name')!r} does not identify one expected "
+                        "combination uniquely"
+                    )
+                    continue
+                repaired_ids = next(iter(unique_inferred))
+                repaired_semantics = frozenset(repaired_ids)
+                combination["categoryOptions"] = [
+                    {"id": option_id} for option_id in repaired_ids
+                ]
+                repairs.append(
+                    {
+                        "categoryOptionCombo": combination_id,
+                        "categoryCombo": parent_id,
+                        "name": combination.get("name"),
+                        "previousCategoryOptions": sorted(actual_semantics),
+                        "repairedCategoryOptions": list(repaired_ids),
+                        "inference": "unique_generated_label_match",
+                    }
+                )
+                actual_semantics = repaired_semantics
+
+            previous = seen.get(actual_semantics)
+            if previous is not None:
+                blocked.append(
+                    f"CategoryOptionCombos {previous} and {combination_id} of {parent_id} "
+                    f"resolve to the same options {sorted(actual_semantics)}"
+                )
+            else:
+                seen[actual_semantics] = combination_id
+
+        missing = sorted(
+            expected_ordered.keys() - seen.keys(),
+            key=lambda item: tuple(sorted(item)),
+        )
+        if missing:
+            preview = [sorted(item) for item in missing[:10]]
+            blocked.append(
+                f"CategoryCombo {parent_id} is missing expected CategoryOptionCombos: "
+                f"{preview}"
+            )
+
+    if blocked:
+        raise PipelineError(
+            "Source metadata contains CategoryOptionCombo structures that cannot be "
+            "repaired losslessly: " + "; ".join(blocked[:10])
+        )
+    return {
+        "auditedCategoryCombos": audited,
+        "skippedCategoryCombos": len(skipped),
+        "skipped": skipped,
+        "repairedCategoryOptionCombos": len(repairs),
+        "repairs": repairs,
+    }
+
+
+def _ordered_reference_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        str(item["id"])
+        for item in value
+        if isinstance(item, dict) and item.get("id")
+    ]
+
+
+def _normalise_category_option_combo_label(value: str) -> str:
+    normalised = unicodedata.normalize("NFKC", value).casefold().strip()
+    return re.sub(r"\s+", " ", normalised)
 
 
 def _validate_metadata_package(
