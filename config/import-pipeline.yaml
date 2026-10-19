@@ -9,8 +9,8 @@ dhis2:
     - mck6wRvBafz
   cache_max_age_hours: 168
   page_size: 500
-  chunk_size: 5000
-  async_threshold: 5000
+  chunk_size: 1000
+  async_threshold: 1000
   import_strategy: CREATE_AND_UPDATE
   preheat_cache: true
   trigger_analytics: false
