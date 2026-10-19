@@ -1371,6 +1371,130 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(report["rewrittenValueCount"], 1)
             self.assertIn(historical_id, {item["id"] for item in target.linked})
 
+    def test_quarantines_historical_values_using_invalid_default_combo(self) -> None:
+        class UnsafeDefaultHistoricalSource(_HistoricalSource):
+            def category_option_combos_for_category_combos(
+                self, category_combo_ids: list[str]
+            ) -> list[dict]:
+                if "CurrentCC01" not in category_combo_ids:
+                    return []
+                return [
+                    {
+                        "id": "CurrentC001",
+                        "name": "Current",
+                        "categoryCombo": {"id": "CurrentCC01"},
+                        "categoryOptions": [{"id": "CurrentOp01"}],
+                    }
+                ]
+
+            def metadata_objects_by_ids(
+                self,
+                *,
+                resource: str,
+                root_key: str,
+                object_ids: list[str],
+                fields: str,
+            ) -> list[dict]:
+                if resource != "categoryOptionCombos":
+                    raise AssertionError(
+                        "Unsafe default metadata must be quarantined before graph export"
+                    )
+                objects = [
+                    {
+                        "id": "BrokenDef01",
+                        "name": "Nombre",
+                        "categoryCombo": {
+                            "id": "OtherDefCmb",
+                            "code": "default",
+                            "name": "default",
+                        },
+                        "categoryOptions": [],
+                    }
+                ]
+                return [item for item in objects if item["id"] in object_ids]
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=5000,
+                period_type="month",
+                default_start_period="2026-01",
+                default_end_period="2026-01",
+            )
+            canonical = {
+                "id": "DataEl00001",
+                "code": "HOSP_ADM",
+                "name": "Admissions",
+                "valueType": "INTEGER",
+                "domainType": "AGGREGATE",
+                "aggregationType": "SUM",
+                "categoryCombo": {"id": "CurrentCC01"},
+            }
+            context = TransferContext(
+                job=scenario.get_job("weekly_climate"),
+                source_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                target_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                source_data_elements=(canonical,),
+                target_data_elements=(canonical,),
+                source_organisation_units=(),
+                target_organisation_units=(),
+                start="2026-01-01",
+                end="2026-01-31",
+                metadata_bootstrap_required=False,
+            )
+            values = [
+                {
+                    "dataElement": "DataEl00001",
+                    "period": "202601",
+                    "orgUnit": "OrgUnit00001",
+                    "categoryOptionCombo": "CurrentC001",
+                    "value": "11",
+                },
+                {
+                    "dataElement": "DataEl00001",
+                    "period": "202601",
+                    "orgUnit": "OrgUnit00001",
+                    "categoryOptionCombo": "BrokenDef01",
+                    "value": "7",
+                },
+            ]
+
+            retained, report = _version_unmappable_historical_values(
+                UnsafeDefaultHistoricalSource(),
+                _HistoricalTarget(),
+                scenario,
+                context,
+                values,
+                apply=True,
+            )
+
+            self.assertEqual(retained, [values[0]])
+            self.assertEqual(report["quarantinedDataValueCount"], 1)
+            quarantine = report["quarantine"]
+            self.assertEqual(quarantine["categoryOptionComboCount"], 1)
+            self.assertEqual(
+                quarantine["groups"][0]["reasons"],
+                [
+                    "source_default_category_combo",
+                    "category_option_combo_without_options",
+                ],
+            )
+            artifact = Path(quarantine["artifact"])
+            self.assertTrue(artifact.exists())
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual(payload["quarantinedDataValueCount"], 1)
+            self.assertEqual(payload["dataValues"], [values[1]])
+
     def test_versions_exact_historical_equivalent_when_remap_would_collide(self) -> None:
         class ExactCollisionSource(_HistoricalSource):
             def category_option_combos_for_category_combos(

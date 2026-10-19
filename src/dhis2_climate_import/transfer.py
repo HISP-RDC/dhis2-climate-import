@@ -1066,11 +1066,15 @@ def run_transfer(
         quarantined_data_value_count = int(
             timeliness_quarantine_report.get("quarantinedDataValueCount") or 0
         )
+        historical_quarantined_data_value_count = int(
+            historical_data_element_report.get("quarantinedDataValueCount") or 0
+        )
         status = (
             "success_with_quarantine"
             if context.detected_organisation_unit_conflicts
             or quarantined_data_value_count
             or invalid_data_value_count
+            or historical_quarantined_data_value_count
             else "success"
         )
         report = {
@@ -1098,6 +1102,7 @@ def run_transfer(
                 source_count
                 - invalid_data_value_count
                 - quarantined_data_value_count
+                - historical_quarantined_data_value_count
             ),
             "chunkCount": validated_chunk_count,
             "metadata": metadata_report,
@@ -3737,6 +3742,14 @@ def _version_unmappable_historical_values(
         "checked": False,
         "created": False,
         "rewrittenValueCount": 0,
+        "quarantinedDataValueCount": 0,
+        "quarantine": {
+            "policy": "unsafe_historical_category_metadata",
+            "quarantinedDataValueCount": 0,
+            "categoryOptionComboCount": 0,
+            "groups": [],
+            "artifact": None,
+        },
         "mappings": [],
         "validationPendingMetadataCommit": False,
     }
@@ -3839,6 +3852,130 @@ def _version_unmappable_historical_values(
             "Historical CategoryOptionCombo objects no longer exist on X: "
             + ", ".join(missing_combos[:10])
         )
+
+    # Some legacy instances contain pseudo-combinations such as ``Nombre``
+    # attached to the system default CategoryCombo, sometimes without any
+    # CategoryOptions.  They cannot be recreated on another DHIS2 instance:
+    # default metadata belongs to the target and CREATE fails with E1110/E1122.
+    # Do not block every otherwise valid value in the window.  Quarantine only
+    # the affected value keys, with their complete payload for later recovery.
+    unsafe_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+    for element_id, combo_id, expected_combo in stale_usage:
+        historical = historical_by_id[combo_id]
+        parent = historical.get("categoryCombo")
+        reasons: list[str] = []
+        if _is_default_metadata_object(parent):
+            reasons.append("source_default_category_combo")
+        if not _reference_ids(historical.get("categoryOptions")):
+            reasons.append("category_option_combo_without_options")
+        if reasons:
+            unsafe_pairs[(element_id, combo_id)] = {
+                "dataElement": element_id,
+                "categoryOptionCombo": combo_id,
+                "categoryOptionComboName": historical.get("name"),
+                "categoryCombo": _reference_uid(parent),
+                "expectedCategoryCombo": expected_combo,
+                "reasons": reasons,
+            }
+
+    if unsafe_pairs:
+        quarantined_values: list[dict[str, Any]] = []
+        retained_values: list[dict[str, Any]] = []
+        for value in data_values:
+            pair = (
+                str(value.get("dataElement") or ""),
+                str(value.get("categoryOptionCombo") or ""),
+            )
+            if pair in unsafe_pairs:
+                quarantined_values.append(value)
+            else:
+                retained_values.append(value)
+
+        group_counts = Counter(
+            (
+                str(value.get("dataElement") or ""),
+                str(value.get("categoryOptionCombo") or ""),
+            )
+            for value in quarantined_values
+        )
+        groups = [
+            {**unsafe_pairs[pair], "dataValues": count}
+            for pair, count in sorted(group_counts.items())
+        ]
+        quarantine_run = run_id(
+            f"historical-quarantine-{scenario.id}-{context.job.id}"
+        )
+        quarantine_artifact = _write_json(
+            scenario.job_state_dir(context.job.id)
+            / "runs"
+            / quarantine_run
+            / "historical-metadata"
+            / "quarantine.json",
+            {
+                "scenario": scenario.id,
+                "job": context.job.id,
+                "sourceDataSet": context.source_data_set.id,
+                "start": context.start,
+                "end": context.end,
+                "policy": "unsafe_historical_category_metadata",
+                "quarantinedDataValueCount": len(quarantined_values),
+                "groups": groups,
+                "dataValues": quarantined_values,
+            },
+        )
+        quarantine_report = {
+            "policy": "unsafe_historical_category_metadata",
+            "quarantinedDataValueCount": len(quarantined_values),
+            "categoryOptionComboCount": len(group_counts),
+            "groups": groups,
+            "artifact": str(quarantine_artifact),
+        }
+        report["quarantinedDataValueCount"] = len(quarantined_values)
+        report["quarantine"] = quarantine_report
+        _emit_progress(
+            progress,
+            "historical_data_elements.quarantine",
+            dataValues=len(quarantined_values),
+            categoryOptionCombos=len(group_counts),
+            remainingDataValues=len(retained_values),
+            artifact=str(quarantine_artifact),
+        )
+        data_values = retained_values
+        unsafe_stale_keys = {
+            key
+            for key in stale_usage
+            if (key[0], key[1]) in unsafe_pairs
+        }
+        stale_usage = Counter(
+            {
+                key: count
+                for key, count in stale_usage.items()
+                if key not in unsafe_stale_keys
+            }
+        )
+        remaining_historical_ids = {
+            combo_id for _element_id, combo_id, _expected_combo in stale_usage
+        }
+        historical_combos = [
+            item
+            for item in historical_combos
+            if str(item.get("id") or "") in remaining_historical_ids
+        ]
+        historical_by_id = {
+            str(item["id"]): item
+            for item in historical_combos
+            if item.get("id")
+        }
+
+    if not stale_usage:
+        _emit_progress(
+            progress,
+            "historical_data_elements.audit.done",
+            versions=0,
+            rewrittenValues=0,
+            quarantinedValues=report["quarantinedDataValueCount"],
+        )
+        return data_values, report
 
     current_by_semantics: dict[str, dict[tuple[str, ...], str]] = defaultdict(dict)
     for combo in current_combos:

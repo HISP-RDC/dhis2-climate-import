@@ -349,6 +349,8 @@ def _orchestrate_locked(
     source_total = 0
     invalid_value_quarantine_total = 0
     invalid_value_quarantine_windows: list[dict[str, Any]] = []
+    historical_value_quarantine_total = 0
+    historical_value_quarantine_windows: list[dict[str, Any]] = []
     timeliness_quarantine_total = 0
     timeliness_quarantine_windows: list[dict[str, Any]] = []
     aggregate_counts = {"imported": 0, "updated": 0, "ignored": 0, "deleted": 0}
@@ -446,6 +448,18 @@ def _orchestrate_locked(
                     invalid_value_count = int(
                         invalid_value_quarantine.get("quarantinedDataValueCount") or 0
                     )
+                    historical_data_elements = (
+                        result.get("historicalDataElements") or {}
+                    )
+                    historical_value_quarantine = (
+                        historical_data_elements.get("quarantine") or {}
+                    )
+                    historical_value_count = int(
+                        historical_value_quarantine.get(
+                            "quarantinedDataValueCount"
+                        )
+                        or 0
+                    )
                     metadata_pending = bool(
                         result.get("dataValidationPendingMetadataCommit")
                         or result.get(
@@ -519,6 +533,16 @@ def _orchestrate_locked(
                                 **invalid_value_quarantine,
                             }
                         )
+                    if historical_value_count:
+                        historical_value_quarantine_total += historical_value_count
+                        historical_value_quarantine_windows.append(
+                            {
+                                "index": index,
+                                "start": window_start,
+                                "end": window_end,
+                                **historical_value_quarantine,
+                            }
+                        )
                     if quarantined_value_count:
                         timeliness_quarantine_total += quarantined_value_count
                         timeliness_quarantine_windows.append(
@@ -537,7 +561,9 @@ def _orchestrate_locked(
                         "end": window_end,
                         "status": (
                             "success_with_quarantine"
-                            if quarantined_value_count or invalid_value_count
+                            if quarantined_value_count
+                            or invalid_value_count
+                            or historical_value_count
                             else "success"
                         ),
                         "attempt": attempt,
@@ -545,6 +571,9 @@ def _orchestrate_locked(
                         "counts": counts,
                         "reportPath": result.get("reportPath"),
                         "invalidDataValueQuarantine": invalid_value_quarantine,
+                        "historicalDataValueQuarantine": (
+                            historical_value_quarantine
+                        ),
                         "timelinessQuarantine": timeliness_quarantine,
                         "adaptiveChunking": result.get("adaptiveChunking", {}),
                         "durationSeconds": round(
@@ -559,7 +588,9 @@ def _orchestrate_locked(
                         window=f"{index}/{len(windows)}",
                         dataValues=source_count,
                         quarantinedDataValues=(
-                            quarantined_value_count + invalid_value_count
+                            quarantined_value_count
+                            + invalid_value_count
+                            + historical_value_count
                         ),
                     )
                     last_error = None
@@ -640,6 +671,7 @@ def _orchestrate_locked(
                     if getattr(context, "detected_organisation_unit_conflicts", ())
                     or timeliness_quarantine_total
                     or invalid_value_quarantine_total
+                    or historical_value_quarantine_total
                     else "success"
                 )
             )
@@ -670,6 +702,7 @@ def _orchestrate_locked(
                 source_total
                 - invalid_value_quarantine_total
                 - timeliness_quarantine_total
+                - historical_value_quarantine_total
             ),
             "counts": aggregate_counts,
             "invalidDataValueQuarantine": {
@@ -677,6 +710,12 @@ def _orchestrate_locked(
                 "quarantinedDataValueCount": invalid_value_quarantine_total,
                 "windowCount": len(invalid_value_quarantine_windows),
                 "windows": invalid_value_quarantine_windows,
+            },
+            "historicalDataValueQuarantine": {
+                "policy": "unsafe_historical_category_metadata",
+                "quarantinedDataValueCount": historical_value_quarantine_total,
+                "windowCount": len(historical_value_quarantine_windows),
+                "windows": historical_value_quarantine_windows,
             },
             "timelinessQuarantine": {
                 "errorCode": "E8031",

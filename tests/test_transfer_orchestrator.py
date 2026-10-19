@@ -85,6 +85,71 @@ class TransferOrchestratorTests(unittest.TestCase):
             self.assertEqual(second["completedWindows"], 0)
             self.assertEqual(second["skippedWindows"], 12)
 
+    def test_aggregates_historical_metadata_quarantine_without_failing_windows(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            scenario = _monthly_scenario(Path(tmp))
+            context = SimpleNamespace(
+                job=scenario.get_job("hospital"),
+                source_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="HOSPITAL",
+                    name="Hospital",
+                    period_type="Monthly",
+                ),
+                start="2017-01-01",
+                end="2019-12-31",
+            )
+            source = SimpleNamespace(base_url="https://x.example.org")
+            target = SimpleNamespace(base_url="https://y.example.org")
+
+            def runner(*_args):
+                return {
+                    "sourceDataValueCount": 10,
+                    "counts": {"imported": 9},
+                    "historicalDataElements": {
+                        "quarantinedDataValueCount": 1,
+                        "quarantine": {
+                            "policy": "unsafe_historical_category_metadata",
+                            "quarantinedDataValueCount": 1,
+                            "artifact": "quarantine.json",
+                        },
+                    },
+                    "reportPath": "window.json",
+                }
+
+            with (
+                patch(
+                    "dhis2_climate_import.transfer_orchestrator.reconcile_target_metadata",
+                    return_value={"requiresChanges": False, "committed": True},
+                ),
+                patch(
+                    "dhis2_climate_import.transfer_orchestrator.resolve_transfer_context",
+                    return_value=context,
+                ),
+            ):
+                result = orchestrate_transfer(
+                    scenario,
+                    source,
+                    target,
+                    job_id="hospital",
+                    apply=True,
+                    window_runner=runner,
+                )
+
+            self.assertEqual(result["status"], "success_with_quarantine")
+            self.assertEqual(result["completedWindows"], 12)
+            self.assertEqual(result["failedWindows"], 0)
+            self.assertEqual(result["sourceDataValueCount"], 120)
+            self.assertEqual(result["targetDataValueCount"], 108)
+            self.assertEqual(
+                result["historicalDataValueQuarantine"][
+                    "quarantinedDataValueCount"
+                ],
+                12,
+            )
+
     def test_metadata_dry_run_stops_before_value_export_when_changes_are_required(self) -> None:
         with TemporaryDirectory() as tmp:
             scenario = _monthly_scenario(Path(tmp))
