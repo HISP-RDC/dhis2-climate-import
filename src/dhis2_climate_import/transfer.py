@@ -3030,6 +3030,16 @@ def _prepare_metadata_package(
         "categoryOptions",
         "categoryCombos",
     )
+    default_object_ids = {
+        collection: {
+            str(item["id"])
+            for item in package.get(collection, [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and _is_default_metadata_object(item)
+        }
+        for collection in default_collections
+    }
     for collection in default_collections:
         items = package.get(collection)
         if not isinstance(items, list):
@@ -3038,9 +3048,20 @@ def _prepare_metadata_package(
         removed_defaults[collection] = len(items) - len(kept)
         package[collection] = kept
 
+    # Default Category metadata is installed and owned by every DHIS2 instance.
+    # It must not be recreated from X on Y.  Omitting an explicit default
+    # CategoryCombo reference lets DHIS2 bind a newly created DataElement or
+    # DataSet to Y's own default object, even when the two instances use
+    # different UIDs.  Keeping the source reference while removing the source
+    # default object makes metadata CREATE fail with E1110/E1122.
+    removed_default_references = _strip_default_category_combo_references(
+        package,
+        default_object_ids.get("categoryCombos", set()),
+    )
+
     data_element_combos = {
         str(item.get("id")): _reference_uid(item.get("categoryCombo"))
-        for item in package.get("dataElements", [])
+        for item in source_package.get("dataElements", [])
         if isinstance(item, dict) and item.get("id")
     }
     option_combo_parents = {
@@ -3048,7 +3069,14 @@ def _prepare_metadata_package(
         for item in package.get("categoryOptionCombos", [])
         if isinstance(item, dict) and item.get("id")
     }
+    removed_orphan_combos = _prune_category_option_combos(package)
+    available_option_combos = {
+        str(item["id"])
+        for item in package.get("categoryOptionCombos", [])
+        if isinstance(item, dict) and item.get("id")
+    }
     removed_operands = 0
+    removed_pruned_combo_operands = 0
     for data_set in package.get("dataSets", []):
         if not isinstance(data_set, dict):
             continue
@@ -3063,22 +3091,61 @@ def _prepare_metadata_package(
             option_combo_id = _reference_uid(operand.get("categoryOptionCombo"))
             element_combo = data_element_combos.get(data_element_id or "")
             option_combo = option_combo_parents.get(option_combo_id or "")
+            if option_combo_id and option_combo_id not in available_option_combos:
+                removed_operands += 1
+                removed_pruned_combo_operands += 1
+                continue
             if element_combo and option_combo and element_combo != option_combo:
                 removed_operands += 1
                 continue
             valid_operands.append(operand)
         data_set["compulsoryDataElementOperands"] = valid_operands
 
-    removed_orphan_combos = _prune_category_option_combos(package)
     category_option_combo_repairs = _repair_invalid_category_option_combos(package)
     return package, {
         "removedDefaultObjects": {
             key: count for key, count in removed_defaults.items() if count
         },
+        "removedDefaultReferences": removed_default_references,
         "removedIncompatibleCompulsoryOperands": removed_operands,
+        "removedPrunedCategoryOptionComboOperands": removed_pruned_combo_operands,
         "removedOrphanCategoryOptionCombos": removed_orphan_combos,
         "categoryOptionComboRepairs": category_option_combo_repairs,
     }
+
+
+def _strip_default_category_combo_references(
+    package: dict[str, Any], default_category_combo_ids: set[str]
+) -> dict[str, int]:
+    """Omit references that DHIS2 must resolve to the target default combo."""
+    if not default_category_combo_ids:
+        return {}
+
+    removed: dict[str, int] = {}
+
+    def strip(item: Any, *, path: str) -> None:
+        if not isinstance(item, dict):
+            return
+        reference = _reference_uid(item.get("categoryCombo"))
+        if reference not in default_category_combo_ids:
+            return
+        item.pop("categoryCombo", None)
+        removed[path] = removed.get(path, 0) + 1
+
+    for data_element in package.get("dataElements", []):
+        strip(data_element, path="dataElements.categoryCombo")
+
+    for data_set in package.get("dataSets", []):
+        if not isinstance(data_set, dict):
+            continue
+        strip(data_set, path="dataSets.categoryCombo")
+        for data_set_element in data_set.get("dataSetElements", []):
+            strip(
+                data_set_element,
+                path="dataSets.dataSetElements.categoryCombo",
+            )
+
+    return removed
 
 
 def _repair_invalid_category_option_combos(

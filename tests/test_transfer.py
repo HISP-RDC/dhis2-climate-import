@@ -2321,6 +2321,77 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(removed["categoryOptionCombos"], 1)
         self.assertEqual(filtered["dataSets"][0]["id"], "DataSet0001")
 
+    def test_prepares_metadata_without_source_default_combo_references(self) -> None:
+        source_package = {
+            "categories": [
+                {"id": "OtherDefCat", "code": "default"},
+            ],
+            "categoryOptions": [
+                {"id": "OtherDefOpt", "code": "default"},
+            ],
+            "categoryCombos": [
+                {
+                    "id": "OtherDefCmb",
+                    "code": "default",
+                    "categories": [{"id": "OtherDefCat"}],
+                },
+            ],
+            "categoryOptionCombos": [
+                {
+                    "id": "BrokenDef01",
+                    "name": "Nombre",
+                    "categoryCombo": {"id": "OtherDefCmb"},
+                    "categoryOptions": [],
+                },
+            ],
+            "dataElements": [
+                {
+                    "id": "DataEl00001",
+                    "categoryCombo": {"id": "OtherDefCmb"},
+                },
+            ],
+            "dataSets": [
+                {
+                    "id": "DataSet0001",
+                    "categoryCombo": {"id": "OtherDefCmb"},
+                    "dataSetElements": [
+                        {
+                            "dataElement": {"id": "DataEl00001"},
+                            "categoryCombo": {"id": "OtherDefCmb"},
+                        },
+                    ],
+                    "compulsoryDataElementOperands": [
+                        {
+                            "dataElement": {"id": "DataEl00001"},
+                            "categoryOptionCombo": {"id": "BrokenDef01"},
+                        },
+                    ],
+                },
+            ],
+        }
+
+        prepared, report = _prepare_metadata_package(source_package)
+
+        self.assertNotIn("categoryCombo", prepared["dataElements"][0])
+        self.assertNotIn("categoryCombo", prepared["dataSets"][0])
+        self.assertNotIn(
+            "categoryCombo",
+            prepared["dataSets"][0]["dataSetElements"][0],
+        )
+        self.assertEqual(prepared["categoryOptionCombos"], [])
+        self.assertEqual(
+            prepared["dataSets"][0]["compulsoryDataElementOperands"], []
+        )
+        self.assertEqual(
+            report["removedDefaultReferences"],
+            {
+                "dataElements.categoryCombo": 1,
+                "dataSets.categoryCombo": 1,
+                "dataSets.dataSetElements.categoryCombo": 1,
+            },
+        )
+        self.assertEqual(report["removedPrunedCategoryOptionComboOperands"], 1)
+
     def test_repairs_invalid_category_option_combo_from_unique_generated_name(self) -> None:
         source_package = {
             "categoryOptions": [
