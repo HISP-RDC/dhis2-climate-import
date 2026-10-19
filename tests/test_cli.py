@@ -9,6 +9,7 @@ from dhis2_climate_import.cli import (
     _dhis2_error_details,
     _check_transfer_instance,
     _format_http_error,
+    _is_transient_http_error,
     build_parser,
     cmd_transfer_reconcile_organisation_units,
     cmd_transfer_reconcile_metadata,
@@ -19,6 +20,16 @@ from dhis2_climate_import.http import HttpRequestError
 
 
 class CliErrorFormattingTests(unittest.TestCase):
+    def test_server_disconnect_uses_temporary_exit_classification(self) -> None:
+        error = HttpRequestError(
+            "POST",
+            "https://example.org/api/dataValueSets",
+            None,
+            "Server disconnected without sending a response.",
+        )
+
+        self.assertTrue(_is_transient_http_error(error))
+
     def test_run_window_forwards_timeliness_quarantine_to_parent(self) -> None:
         with TemporaryDirectory() as tmp:
             scenario = SimpleNamespace(

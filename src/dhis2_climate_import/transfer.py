@@ -3700,6 +3700,9 @@ def _is_timeout_or_gateway_error(exc: HttpRequestError) -> bool:
             "timeout",
             "cloudflare",
             "connection reset",
+            "server disconnected",
+            "remote end closed connection",
+            "remote disconnected",
         )
     )
 
@@ -3713,6 +3716,9 @@ def is_transient_transfer_http_error(exc: HttpRequestError) -> bool:
             "timeout",
             "cloudflare",
             "connection reset",
+            "server disconnected",
+            "remote end closed connection",
+            "remote disconnected",
             "temporary failure in name resolution",
             "name or service not known",
             "nodename nor servname provided",
@@ -5819,6 +5825,9 @@ def _is_adaptive_chunk_error(exc: HttpRequestError) -> bool:
             "timeout",
             "cloudflare",
             "connection reset",
+            "server disconnected",
+            "remote end closed connection",
+            "remote disconnected",
         )
     )
 

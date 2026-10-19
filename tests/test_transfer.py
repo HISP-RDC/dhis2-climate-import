@@ -19,6 +19,7 @@ from dhis2_climate_import.transfer import (
     _validate_target_category_option_combos,
     _validate_metadata_package,
     _version_unmappable_historical_values,
+    is_transient_transfer_http_error,
     reconcile_target_organisation_units,
     reconcile_target_metadata,
     repair_target_metadata,
@@ -316,6 +317,79 @@ class TransferTests(unittest.TestCase):
             self.assertTrue(checkpoint.exists())
             payload = json.loads(checkpoint.read_text(encoding="utf-8"))
             self.assertEqual(len(payload["completedChunks"]), 2)
+
+    def test_target_import_disconnect_retries_then_splits(self) -> None:
+        class DisconnectingTarget:
+            base_url = "https://y.example.org"
+
+            def __init__(self) -> None:
+                self.calls: list[int] = []
+
+            def import_data_value_set(self, payload, **kwargs):
+                size = len(payload["dataValues"])
+                self.calls.append(size)
+                if size > 2:
+                    raise HttpRequestError(
+                        "POST",
+                        "https://y.example.org/api/dataValueSets",
+                        None,
+                        "Server disconnected without sending a response.",
+                    )
+                return {
+                    "status": "SUCCESS",
+                    "importCount": {"imported": size},
+                }
+
+        with TemporaryDirectory() as tmp:
+            scenario = _scenario(
+                Path(tmp),
+                chunk_size=4,
+                adaptive_minimum_chunk_size=2,
+                adaptive_retry_before_split=1,
+            )
+            context = SimpleNamespace(
+                job=scenario.get_job("weekly_climate"),
+                target_data_set=DataSetRef(
+                    id="DataSet0001",
+                    code="CCH_WEEKLY",
+                    name="Climate Weekly",
+                    period_type="Weekly",
+                ),
+                start="2017-01-01",
+                end="2017-01-31",
+            )
+            target = DisconnectingTarget()
+            values = [
+                {"orgUnit": "OpenOrg0001", "period": "201701", "value": str(i)}
+                for i in range(4)
+            ]
+            events: list[tuple[str, dict]] = []
+
+            responses, report = _import_target_chunks(
+                target,
+                [{"dataSet": "DataSet0001", "dataValues": values}],
+                context=context,
+                state_dir=scenario.job_state_dir("weekly_climate"),
+                resume_checkpoints=True,
+                progress=lambda event, details: events.append((event, details)),
+            )
+
+            self.assertEqual(target.calls, [4, 4, 2, 2])
+            self.assertEqual(len(responses), 2)
+            self.assertEqual(report["retries"], 1)
+            self.assertEqual(report["splits"], 1)
+            self.assertIn("target.import.chunk.retry", [event for event, _ in events])
+            self.assertIn("target.import.chunk.split", [event for event, _ in events])
+
+    def test_server_disconnect_is_a_transient_transfer_error(self) -> None:
+        error = HttpRequestError(
+            "POST",
+            "https://y.example.org/api/dataValueSets",
+            None,
+            "Server disconnected without sending a response.",
+        )
+
+        self.assertTrue(is_transient_transfer_http_error(error))
 
     def test_confirmed_target_chunks_resume_without_another_post(self) -> None:
         class Target:
