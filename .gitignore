@@ -7,6 +7,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+coverage.xml
+*.log
+*.tmp
+*.swp
 .DS_Store
 
 # Local climate data, generated caches, reports, and run journals.
@@ -21,3 +26,9 @@ state/
 dist/
 build/
 *.egg-info/
+
+# Local runtime configuration. Commit only the corresponding *.example templates.
+/climate-service.yaml
+/config/import-pipeline.yaml
+/config/instances.yaml
+/config/scenarios/*.yaml

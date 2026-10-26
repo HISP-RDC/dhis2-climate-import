@@ -8,8 +8,19 @@ dependencies = [
     "dhis2-client @ git+https://github.com/dhis2/dhis2-python-client.git@v0.3.1",
 ]
 
+[project.scripts]
+dhis2-climate-import = "dhis2_climate_import.cli:main"
+
+[project.urls]
+Repository = "https://github.com/HISP-RDC/dhis2-climate-import"
+Documentation = "https://github.com/HISP-RDC/dhis2-climate-import/tree/main/docs"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
 [tool.uv]
-package = false
+package = true
 
 [tool.pyright]
 pythonVersion = "3.12"

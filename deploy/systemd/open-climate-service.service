@@ -7,8 +7,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=meleck
-Group=meleck
+User=dhis2-import
+Group=dhis2-import
 WorkingDirectory=/opt/open-climate-service
 EnvironmentFile=/opt/open-climate-service/.env
 Environment=PYTHONUNBUFFERED=1

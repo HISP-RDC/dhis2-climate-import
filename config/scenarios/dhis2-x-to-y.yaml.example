@@ -33,7 +33,7 @@ target:
         # "block" is the conservative default. "clone" preserves an incompatible
         # object on Y and creates an isolated historical category graph instead.
         uid_collision_strategy: clone
-        name_suffix: " — Historique"
+        name_suffix: " — Historical"
 
   organisation_units:
     # Uses the organisation units assigned to the source Data Set. Use

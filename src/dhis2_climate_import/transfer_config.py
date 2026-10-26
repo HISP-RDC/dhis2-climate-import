@@ -105,7 +105,7 @@ class HistoricalDataElementPolicy:
     enabled: bool = True
     strategy: str = "versioned"
     uid_collision_strategy: str = "block"
-    name_suffix: str = " — Historique"
+    name_suffix: str = " — Historical"
 
 
 @dataclass(frozen=True)
@@ -400,7 +400,7 @@ def load_transfer_scenario(path: str | Path) -> TransferScenario:
                 strategy=historical_strategy,
                 uid_collision_strategy=historical_uid_collision_strategy,
                 name_suffix=str(
-                    historical_raw.get("name_suffix", " — Historique")
+                    historical_raw.get("name_suffix", " — Historical")
                 ),
             ),
         ),

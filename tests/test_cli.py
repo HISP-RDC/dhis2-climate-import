@@ -11,6 +11,7 @@ from dhis2_climate_import.cli import (
     _format_http_error,
     _is_transient_http_error,
     build_parser,
+    cmd_list_jobs,
     cmd_transfer_reconcile_organisation_units,
     cmd_transfer_reconcile_metadata,
     cmd_transfer_repair_metadata,
@@ -20,6 +21,19 @@ from dhis2_climate_import.http import HttpRequestError
 
 
 class CliErrorFormattingTests(unittest.TestCase):
+    def test_lists_configured_climate_jobs(self) -> None:
+        args = SimpleNamespace(
+            config="config/import-pipeline.yaml.example",
+            ids_only=False,
+        )
+        with patch("dhis2_climate_import.cli._print_json") as print_json:
+            cmd_list_jobs(args)
+
+        payload = print_json.call_args.args[0]
+        self.assertEqual(payload["count"], 12)
+        self.assertEqual(payload["jobs"][0]["id"], "precipitation_weekly_chirps")
+        self.assertEqual(payload["jobs"][0]["periodType"], "week")
+
     def test_server_disconnect_uses_temporary_exit_classification(self) -> None:
         error = HttpRequestError(
             "POST",

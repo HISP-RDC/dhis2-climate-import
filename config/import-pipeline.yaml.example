@@ -1,12 +1,12 @@
-# Pipeline configuration. Secrets stay in .env.
+# OCS-to-DHIS2 pipeline template. Copy this file to import-pipeline.yaml and
+# replace the sample DHIS2 Data Set and Data Element codes with identifiers
+# available on the target instance. Secrets must remain in .env.
 
 dhis2:
   org_unit_level: 3
-  # Y has no code on this Data Set, so its UID is the stable selector.
-  # cache-data-elements only stores Data Elements attached to this Data Set.
-  climate_data_set: mck6wRvBafz
+  climate_data_set: CCH_WEEKLY
   climate_data_sets:
-    - mck6wRvBafz
+    - CCH_WEEKLY
   cache_max_age_hours: 168
   page_size: 500
   chunk_size: 1000
@@ -20,15 +20,11 @@ open_climate_service:
   publish: true
 
 imports:
-  # Target mappings refreshed from Y on 2026-10-18. Y's Data Elements currently
-  # have no codes, so every mapping deliberately uses a UID. All source dataset IDs
-  # below are weekly OCS publication contracts; they must exist in OCS before import.
-
   - id: precipitation_weekly_chirps
     label: Precipitation (CHIRPS)
     dataset_id: chirps3_precipitation_weekly
-    data_set: mck6wRvBafz
-    data_element: DZte8CXJ6zJ
+    data_set: CCH_WEEKLY
+    data_element: CCH_PRECIPITATION_CHIRPS
     period_type: week
     method: mean
     expected_units: mm
@@ -36,8 +32,8 @@ imports:
   - id: precipitation_weekly_era5_land
     label: Precipitation (ERA5-Land)
     dataset_id: era5land_precipitation_weekly
-    data_set: mck6wRvBafz
-    data_element: RMaMv7SrUYd
+    data_set: CCH_WEEKLY
+    data_element: CCH_PRECIPITATION_ERA5_LAND
     period_type: week
     method: mean
     expected_units: mm
@@ -45,8 +41,8 @@ imports:
   - id: temperature_mean_weekly_era5_land
     label: Mean air temperature (ERA5-Land)
     dataset_id: era5land_temperature_weekly
-    data_set: mck6wRvBafz
-    data_element: Pjd8Rn6mTb0
+    data_set: CCH_WEEKLY
+    data_element: CCH_TEMPERATURE_MEAN_ERA5_LAND
     period_type: week
     method: mean
     expected_units: degC
@@ -54,8 +50,8 @@ imports:
   - id: temperature_max_weekly_era5_land
     label: Maximum air temperature (ERA5-Land)
     dataset_id: era5land_temperature_max_weekly
-    data_set: mck6wRvBafz
-    data_element: BDIuhHdQEDI
+    data_set: CCH_WEEKLY
+    data_element: CCH_TEMPERATURE_MAX_ERA5_LAND
     period_type: week
     method: mean
     expected_units: degC
@@ -63,8 +59,8 @@ imports:
   - id: temperature_min_weekly_era5_land
     label: Minimum air temperature (ERA5-Land)
     dataset_id: era5land_temperature_min_weekly
-    data_set: mck6wRvBafz
-    data_element: QZilZRiGNvB
+    data_set: CCH_WEEKLY
+    data_element: CCH_TEMPERATURE_MIN_ERA5_LAND
     period_type: week
     method: mean
     expected_units: degC
@@ -72,8 +68,8 @@ imports:
   - id: dewpoint_temperature_weekly_era5_land
     label: Dewpoint temperature (ERA5-Land)
     dataset_id: era5land_dewpoint_temperature_weekly
-    data_set: mck6wRvBafz
-    data_element: CLbMVtinuoV
+    data_set: CCH_WEEKLY
+    data_element: CCH_DEWPOINT_TEMPERATURE_ERA5_LAND
     period_type: week
     method: mean
     expected_units: degC
@@ -81,8 +77,8 @@ imports:
   - id: relative_humidity_weekly_era5_land
     label: Relative humidity (ERA5-Land)
     dataset_id: era5land_relative_humidity_weekly
-    data_set: mck6wRvBafz
-    data_element: hsQg4SfG5pO
+    data_set: CCH_WEEKLY
+    data_element: CCH_RELATIVE_HUMIDITY_ERA5_LAND
     period_type: week
     method: mean
     expected_units: "%"
@@ -90,8 +86,8 @@ imports:
   - id: heat_stress_weekly_era5_heat
     label: Mean heat stress (ERA5-HEAT UTCI)
     dataset_id: era5heat_utci_weekly
-    data_set: mck6wRvBafz
-    data_element: X0Tq9B9meJU
+    data_set: CCH_WEEKLY
+    data_element: CCH_HEAT_STRESS_MEAN_ERA5_HEAT
     period_type: week
     method: mean
     expected_units: degC
@@ -99,8 +95,8 @@ imports:
   - id: heat_stress_max_weekly_era5_heat
     label: Maximum heat stress (ERA5-HEAT UTCI)
     dataset_id: era5heat_utci_max_weekly
-    data_set: mck6wRvBafz
-    data_element: BmszSzqKgFb
+    data_set: CCH_WEEKLY
+    data_element: CCH_HEAT_STRESS_MAX_ERA5_HEAT
     period_type: week
     method: mean
     expected_units: degC
@@ -108,8 +104,8 @@ imports:
   - id: heat_stress_min_weekly_era5_heat
     label: Minimum heat stress (ERA5-HEAT UTCI)
     dataset_id: era5heat_utci_min_weekly
-    data_set: mck6wRvBafz
-    data_element: N5ENtQKKQcj
+    data_set: CCH_WEEKLY
+    data_element: CCH_HEAT_STRESS_MIN_ERA5_HEAT
     period_type: week
     method: mean
     expected_units: degC
@@ -117,8 +113,8 @@ imports:
   - id: vegetation_ndvi_weekly
     label: Normalized Difference Vegetation Index (MODIS)
     dataset_id: modis_ndvi_weekly
-    data_set: mck6wRvBafz
-    data_element: BC3vgSOKONN
+    data_set: CCH_WEEKLY
+    data_element: CCH_VEGETATION_NDVI_MODIS
     period_type: week
     method: mean
     expected_units: "1"
@@ -126,8 +122,8 @@ imports:
   - id: vegetation_evi_weekly
     label: Enhanced Vegetation Index (MODIS)
     dataset_id: modis_evi_weekly
-    data_set: mck6wRvBafz
-    data_element: dl1JTXinsIM
+    data_set: CCH_WEEKLY
+    data_element: CCH_VEGETATION_EVI_MODIS
     period_type: week
     method: mean
     expected_units: "1"

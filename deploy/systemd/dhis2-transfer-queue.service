@@ -1,5 +1,5 @@
 [Unit]
-Description=File séquentielle des transferts DHIS2 X vers Y
+Description=Sequential DHIS2 X-to-Y transfer queue
 Wants=network-online.target
 After=network-online.target
 

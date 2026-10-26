@@ -1,5 +1,5 @@
 [Unit]
-Description=Planification hebdomadaire du pipeline climat OCS vers DHIS2
+Description=Scheduled weekly OCS-to-DHIS2 climate pipeline
 
 [Timer]
 OnCalendar=Mon *-*-* 03:00:00 Africa/Kinshasa

@@ -1,5 +1,5 @@
 [Unit]
-Description=Pipeline hebdomadaire Open Climate Service vers DHIS2
+Description=Weekly Open Climate Service to DHIS2 pipeline
 Wants=network-online.target
 After=network-online.target open-climate-service.service
 Requires=open-climate-service.service
@@ -9,8 +9,8 @@ StartLimitBurst=3
 
 [Service]
 Type=oneshot
-User=meleck
-Group=meleck
+User=dhis2-import
+Group=dhis2-import
 WorkingDirectory=/opt/dhis2-climate-import
 Environment=PYTHONPATH=/opt/dhis2-climate-import/src
 Environment=PYTHONUNBUFFERED=1

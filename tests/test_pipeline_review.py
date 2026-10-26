@@ -10,7 +10,7 @@ from dhis2_climate_import.pipeline import review_import
 
 
 class PipelineReviewTests(unittest.TestCase):
-    def test_review_matches_climate_app_zone_de_sante_weekly_example(self) -> None:
+    def test_review_matches_climate_app_health_zone_weekly_example(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config" / "import-pipeline.yaml"
@@ -41,7 +41,7 @@ imports:
                     {
                         "id": "Precip00001",
                         "code": "ERA5_LAND_PRECIPITATION",
-                        "name": "CCH - Precipitations (ERA5-Land)",
+                        "name": "CCH - Precipitation (ERA5-Land)",
                         "dataSetMemberships": [
                             {"id": "WeeklyDataSet", "code": "CCH_WEEKLY", "periodType": "Weekly"}
                         ],
@@ -57,7 +57,7 @@ imports:
                     {
                         "id": f"Zone{i:08d}",
                         "level": 3,
-                        "name": f"Zone de Sante {i}",
+                        "name": f"Health Zone {i}",
                         "path": f"/RDC/Zone{i:08d}",
                         "geometry": {"type": "Point", "coordinates": [20.0, -2.0]},
                     }

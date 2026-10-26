@@ -1,5 +1,5 @@
 [Unit]
-Description=Planification de la file séquentielle des transferts DHIS2
+Description=Scheduled sequential DHIS2 transfer queue
 
 [Timer]
 OnCalendar=*-*-* 02:15:00 Africa/Kinshasa

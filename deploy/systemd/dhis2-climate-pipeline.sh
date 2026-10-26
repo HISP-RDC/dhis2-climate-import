@@ -23,7 +23,7 @@ log() {
 }
 
 fail_configuration() {
-  log "ERREUR: $*"
+  log "ERROR: $*"
   exit 2
 }
 
@@ -32,7 +32,7 @@ validate_boolean() {
   local value="$2"
   case "$value" in
     true|false) ;;
-    *) fail_configuration "${name} doit valoir true ou false." ;;
+    *) fail_configuration "${name} must be true or false." ;;
   esac
 }
 
@@ -40,7 +40,7 @@ validate_non_negative_integer() {
   local name="$1"
   local value="$2"
   case "$value" in
-    ''|*[!0-9]*) fail_configuration "${name} doit être un entier positif ou nul." ;;
+    ''|*[!0-9]*) fail_configuration "${name} must be a non-negative integer." ;;
   esac
 }
 
@@ -57,15 +57,15 @@ resolve_period_window() {
       START_PERIOD="${DHIS2_CLIMATE_START_PERIOD:-}"
       END_PERIOD="${DHIS2_CLIMATE_END_PERIOD:-}"
       [[ -n "$START_PERIOD" ]] || fail_configuration \
-        "DHIS2_CLIMATE_START_PERIOD est obligatoire en mode fixed."
+        "DHIS2_CLIMATE_START_PERIOD is required in fixed mode."
       [[ -n "$END_PERIOD" ]] || fail_configuration \
-        "DHIS2_CLIMATE_END_PERIOD est obligatoire en mode fixed."
+        "DHIS2_CLIMATE_END_PERIOD is required in fixed mode."
       ;;
     rolling)
       validate_non_negative_integer DHIS2_CLIMATE_LOOKBACK_WEEKS "$LOOKBACK_WEEKS"
       validate_non_negative_integer DHIS2_CLIMATE_LAG_WEEKS "$LAG_WEEKS"
       [[ "$LOOKBACK_WEEKS" != "0" ]] || fail_configuration \
-        "DHIS2_CLIMATE_LOOKBACK_WEEKS doit être supérieur à zéro."
+        "DHIS2_CLIMATE_LOOKBACK_WEEKS must be greater than zero."
       local resolved
       resolved="$($DATE_PYTHON_BIN -c '
 from datetime import date, datetime, timedelta
@@ -84,10 +84,10 @@ def period(value):
 
 print(period(start), period(end))
 ' "$LOOKBACK_WEEKS" "$LAG_WEEKS" "$AS_OF")" || fail_configuration \
-        "impossible de calculer la fenêtre hebdomadaire. Vérifiez DHIS2_CLIMATE_AS_OF."
+        "could not calculate the weekly window. Check DHIS2_CLIMATE_AS_OF."
       read -r START_PERIOD END_PERIOD <<< "$resolved"
       ;;
-    *) fail_configuration "DHIS2_CLIMATE_WINDOW_MODE doit valoir rolling ou fixed." ;;
+    *) fail_configuration "DHIS2_CLIMATE_WINDOW_MODE must be rolling or fixed." ;;
   esac
 
   "$DATE_PYTHON_BIN" -c '
@@ -104,13 +104,13 @@ def start(period):
 if start(sys.argv[1]) > start(sys.argv[2]):
     raise ValueError("start period is after end period")
 ' "$START_PERIOD" "$END_PERIOD" || fail_configuration \
-    "fenêtre ISO invalide: ${START_PERIOD} à ${END_PERIOD}."
+    "invalid ISO window: ${START_PERIOD} to ${END_PERIOD}."
 }
 
 build_period_windows() {
   validate_non_negative_integer DHIS2_CLIMATE_PERIOD_BATCH_SIZE "$PERIOD_BATCH_SIZE"
   [[ "$PERIOD_BATCH_SIZE" != "0" ]] || fail_configuration \
-    "DHIS2_CLIMATE_PERIOD_BATCH_SIZE doit être supérieur à zéro."
+    "DHIS2_CLIMATE_PERIOD_BATCH_SIZE must be greater than zero."
 
   WINDOW_STARTS=()
   WINDOW_ENDS=()
@@ -143,7 +143,7 @@ while current <= end:
 ' "$START_PERIOD" "$END_PERIOD" "$PERIOD_BATCH_SIZE")
 
   ((${#WINDOW_STARTS[@]} > 0)) || fail_configuration \
-    "aucune sous-fenêtre calculée pour ${START_PERIOD} à ${END_PERIOD}."
+    "no subwindow was calculated for ${START_PERIOD} to ${END_PERIOD}."
 }
 
 record_failure() {
@@ -159,7 +159,7 @@ record_failure() {
   else
     HAS_TRANSIENT_FAILURE=true
   fi
-  log "Job climat en échec | job=$job | start=$window_start | end=$window_end | stage=$stage | exitStatus=$status"
+  log "Climate job failed | job=$job | start=$window_start | end=$window_end | stage=$stage | exitStatus=$status"
 }
 
 write_checkpoint() {
@@ -171,7 +171,7 @@ write_checkpoint() {
   printf '{"job":"%s","startPeriod":"%s","endPeriod":"%s","completedAt":"%s"}\n' \
     "$job" "$window_start" "$window_end" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$temporary"
   mv "$temporary" "$checkpoint"
-  log "Checkpoint climat enregistré | job=$job | checkpoint=$checkpoint"
+  log "Climate checkpoint recorded | job=$job | checkpoint=$checkpoint"
 }
 
 run_job() {
@@ -183,11 +183,11 @@ run_job() {
   local apply_log
 
   if [[ -f "$checkpoint" ]]; then
-    log "Tranche climat déjà terminée; checkpoint réutilisé | job=$job | start=$window_start | end=$window_end"
+    log "Climate window already completed; checkpoint reused | job=$job | start=$window_start | end=$window_end"
     return 0
   fi
 
-  log "Ingestion OCS démarrée | job=$job | start=$window_start | end=$window_end"
+  log "OCS ingestion started | job=$job | start=$window_start | end=$window_end"
   run_cli ingest-dataset "$job" \
     --start-period "$window_start" \
     --end-period "$window_end" \
@@ -199,7 +199,7 @@ run_job() {
     return 1
   fi
 
-  log "Revue DHIS2 démarrée | job=$job | start=$window_start | end=$window_end"
+  log "DHIS2 review started | job=$job | start=$window_start | end=$window_end"
   run_cli review-import "$job" \
     --start-period "$window_start" \
     --end-period "$window_end"
@@ -210,7 +210,7 @@ run_job() {
     return 1
   fi
 
-  log "Dry-run DHIS2 démarré | job=$job | start=$window_start | end=$window_end"
+  log "DHIS2 dry-run started | job=$job | start=$window_start | end=$window_end"
   run_cli import-dhis2 "$job" \
     --start-period "$window_start" \
     --end-period "$window_end" \
@@ -222,7 +222,7 @@ run_job() {
     return 1
   fi
 
-  log "Import DHIS2 démarré | job=$job | start=$window_start | end=$window_end"
+  log "DHIS2 import started | job=$job | start=$window_start | end=$window_end"
   apply_log="${TEMPORARY_DIR}/${job}__${window_start}__${window_end}.apply.log"
   run_cli import-dhis2 "$job" \
     --start-period "$window_start" \
@@ -231,7 +231,7 @@ run_job() {
   status="${PIPESTATUS[0]}"
   if ((status != 0)); then
     if grep -Fq "This import already succeeded with the same dataset" "$apply_log"; then
-      log "Import DHIS2 déjà confirmé par le journal local | job=$job"
+      log "DHIS2 import already confirmed by the local journal | job=$job"
     else
       LAST_FAILURE_STAGE=apply
       LAST_FAILURE_STATUS=$status
@@ -240,7 +240,7 @@ run_job() {
   fi
 
   write_checkpoint "$job" "$checkpoint" "$window_start" "$window_end"
-  log "Tranche climat terminée | job=$job | start=$window_start | end=$window_end"
+  log "Climate window completed | job=$job | start=$window_start | end=$window_end"
 }
 
 validate_boolean DHIS2_CLIMATE_CONTINUE_ON_FAILURE "$CONTINUE_ON_FAILURE"
@@ -248,17 +248,17 @@ validate_boolean DHIS2_CLIMATE_REFRESH_CACHES "$REFRESH_CACHES"
 validate_boolean DHIS2_CLIMATE_SKIP_MISSING_GEOMETRY "$SKIP_MISSING_GEOMETRY"
 
 read -r -a JOBS <<< "${DHIS2_CLIMATE_JOBS:-}"
-((${#JOBS[@]} > 0)) || fail_configuration "DHIS2_CLIMATE_JOBS ne contient aucun job."
+((${#JOBS[@]} > 0)) || fail_configuration "DHIS2_CLIMATE_JOBS does not contain any jobs."
 for job in "${JOBS[@]}"; do
   [[ "$job" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail_configuration \
-    "identifiant de job non sécurisé: ${job}"
+    "unsafe job identifier: ${job}"
 done
 
 resolve_period_window
 build_period_windows
 mkdir -p "$CHECKPOINT_DIR"
 TEMPORARY_DIR="$(mktemp -d "${STATE_DIR}/run.XXXXXX")" || fail_configuration \
-  "impossible de créer le dossier temporaire dans ${STATE_DIR}."
+  "could not create a temporary directory in ${STATE_DIR}."
 trap 'rm -rf -- "$TEMPORARY_DIR"' EXIT
 
 FAILED_JOBS=()
@@ -268,12 +268,12 @@ HAS_TRANSIENT_FAILURE=false
 LAST_FAILURE_STAGE=
 LAST_FAILURE_STATUS=0
 
-log "Pipeline climat démarré | mode=$WINDOW_MODE | start=$START_PERIOD | end=$END_PERIOD | periodBatchSize=$PERIOD_BATCH_SIZE | windows=${#WINDOW_STARTS[@]} | jobs=${JOBS[*]}"
+log "Climate pipeline started | mode=$WINDOW_MODE | start=$START_PERIOD | end=$END_PERIOD | periodBatchSize=$PERIOD_BATCH_SIZE | windows=${#WINDOW_STARTS[@]} | jobs=${JOBS[*]}"
 
 run_cli check-dhis2
 status=$?
 if ((status != 0)); then
-  log "Pré-vérification DHIS2 en échec | exitStatus=$status"
+  log "DHIS2 pre-flight check failed | exitStatus=$status"
   exit "$status"
 fi
 
@@ -282,19 +282,19 @@ if [[ "$REFRESH_CACHES" == "true" ]]; then
   if [[ "$SKIP_MISSING_GEOMETRY" == "true" ]]; then
     org_unit_args+=(--skip-missing-geometry)
   fi
-  log "Actualisation du cache des unités d’organisation"
+  log "Refreshing the organisation-unit cache"
   run_cli "${org_unit_args[@]}"
   status=$?
   if ((status != 0)); then
-    log "Actualisation du cache des unités d’organisation en échec | exitStatus=$status"
+    log "Organisation-unit cache refresh failed | exitStatus=$status"
     exit "$status"
   fi
 
-  log "Actualisation du cache des Data Elements climat"
+  log "Refreshing the climate Data Element cache"
   run_cli cache-data-elements --refresh
   status=$?
   if ((status != 0)); then
-    log "Actualisation du cache des Data Elements en échec | exitStatus=$status"
+    log "Data Element cache refresh failed | exitStatus=$status"
     exit "$status"
   fi
 fi
@@ -303,13 +303,13 @@ STOP_PIPELINE=false
 for index in "${!JOBS[@]}"; do
   job="${JOBS[$index]}"
   position=$((index + 1))
-  log "Job climat demandé | job=$job | position=$position/${#JOBS[@]} | windows=${#WINDOW_STARTS[@]}"
+  log "Climate job requested | job=$job | position=$position/${#JOBS[@]} | windows=${#WINDOW_STARTS[@]}"
 
   for window_index in "${!WINDOW_STARTS[@]}"; do
     window_start="${WINDOW_STARTS[$window_index]}"
     window_end="${WINDOW_ENDS[$window_index]}"
     window_position=$((window_index + 1))
-    log "Tranche climat demandée | job=$job | window=$window_position/${#WINDOW_STARTS[@]} | start=$window_start | end=$window_end"
+    log "Climate window requested | job=$job | window=$window_position/${#WINDOW_STARTS[@]} | start=$window_start | end=$window_end"
 
     if run_job "$job" "$window_start" "$window_end"; then
       continue
@@ -331,11 +331,11 @@ for index in "${!JOBS[@]}"; do
 done
 
 if ((${#FAILED_JOBS[@]} > 0)); then
-  log "Pipeline climat terminé avec erreur | failedJobs=${FAILED_JOBS[*]} | failures=${FAILED_STAGES[*]}"
+  log "Climate pipeline completed with errors | failedJobs=${FAILED_JOBS[*]} | failures=${FAILED_STAGES[*]}"
   if [[ "$HAS_PERMANENT_FAILURE" == "true" ]]; then
     exit 2
   fi
   exit 75
 fi
 
-log "Pipeline climat terminé avec succès | start=$START_PERIOD | end=$END_PERIOD | jobs=${JOBS[*]}"
+log "Climate pipeline completed successfully | start=$START_PERIOD | end=$END_PERIOD | jobs=${JOBS[*]}"

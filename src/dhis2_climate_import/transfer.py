@@ -15,7 +15,7 @@ import unicodedata
 
 from .dhis2 import DHIS2Client, DataSetRef
 from .errors import PipelineError, TransientPipelineError
-from .http import HttpRequestError
+from .http import HttpRequestError, is_timeout_or_gateway_error, is_transient_http_error
 from .journal import TransferFingerprint, TransferRunJournal
 from .locks import exclusive_lock
 from .periods import (
@@ -192,7 +192,7 @@ def reconcile_target_organisation_units(
         uid = str(unit.get("id") or "")
         path_ids = _organisation_unit_path_ids(unit)
         if not path_ids or path_ids[-1] != uid:
-            path_errors.append(f"{uid or '<sans UID>'} has invalid path {unit.get('path')!r}")
+            path_errors.append(f"{uid or '<missing UID>'} has invalid path {unit.get('path')!r}")
             continue
         hierarchy_ids.update(path_ids)
     if path_errors:
@@ -3692,38 +3692,11 @@ def _split_source_export_request(
 
 
 def _is_timeout_or_gateway_error(exc: HttpRequestError) -> bool:
-    text = f"{exc.body} {exc}".lower()
-    return exc.status_code in {502, 503, 504, 520, 522, 524} or any(
-        marker in text
-        for marker in (
-            "timed out",
-            "timeout",
-            "cloudflare",
-            "connection reset",
-            "server disconnected",
-            "remote end closed connection",
-            "remote disconnected",
-        )
-    )
+    return is_timeout_or_gateway_error(exc)
 
 
 def is_transient_transfer_http_error(exc: HttpRequestError) -> bool:
-    text = f"{exc.body} {exc}".lower()
-    return exc.status_code in {429, 502, 503, 504, 520, 522, 524} or any(
-        marker in text
-        for marker in (
-            "timed out",
-            "timeout",
-            "cloudflare",
-            "connection reset",
-            "server disconnected",
-            "remote end closed connection",
-            "remote disconnected",
-            "temporary failure in name resolution",
-            "name or service not known",
-            "nodename nor servname provided",
-        )
-    )
+    return is_transient_http_error(exc)
 
 
 def _version_unmappable_historical_values(
@@ -3859,9 +3832,9 @@ def _version_unmappable_historical_values(
             + ", ".join(missing_combos[:10])
         )
 
-    # Some legacy instances contain pseudo-combinations such as ``Nombre``
-    # attached to the system default CategoryCombo, sometimes without any
-    # CategoryOptions.  They cannot be recreated on another DHIS2 instance:
+    # Some legacy instances contain invalid pseudo-combinations attached to
+    # the system default CategoryCombo, sometimes without any CategoryOptions.
+    # They cannot be recreated on another DHIS2 instance:
     # default metadata belongs to the target and CREATE fails with E1110/E1122.
     # Do not block every otherwise valid value in the window.  Quarantine only
     # the affected value keys, with their complete payload for later recovery.
@@ -5817,19 +5790,7 @@ def _data_value_chunk_hash(payload: dict[str, Any]) -> str:
 
 
 def _is_adaptive_chunk_error(exc: HttpRequestError) -> bool:
-    text = f"{exc.body} {exc}".lower()
-    return exc.status_code in {429, 502, 503, 504, 520, 522, 524} or any(
-        marker in text
-        for marker in (
-            "timed out",
-            "timeout",
-            "cloudflare",
-            "connection reset",
-            "server disconnected",
-            "remote end closed connection",
-            "remote disconnected",
-        )
-    )
+    return exc.status_code == 429 or is_timeout_or_gateway_error(exc)
 
 
 def _exclusive_e8031_indexes(body: str, *, value_count: int) -> list[int] | None:

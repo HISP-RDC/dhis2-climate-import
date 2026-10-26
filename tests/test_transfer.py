@@ -1476,7 +1476,7 @@ class TransferTests(unittest.TestCase):
                 objects = [
                     {
                         "id": "BrokenDef01",
-                        "name": "Nombre",
+                        "name": "Count",
                         "categoryCombo": {
                             "id": "OtherDefCmb",
                             "code": "default",
@@ -1578,7 +1578,7 @@ class TransferTests(unittest.TestCase):
                     "CurrentCC01": [
                         {
                             "id": "CurrentC001",
-                            "name": ">=5 ans",
+                            "name": ">=5 years",
                             "categoryCombo": {"id": "CurrentCC01"},
                             "categoryOptions": [{"id": "SharedOpt01"}],
                         }
@@ -1586,7 +1586,7 @@ class TransferTests(unittest.TestCase):
                     "HistoricCC1": [
                         {
                             "id": "HistoricC01",
-                            "name": ">=5 ans",
+                            "name": ">=5 years",
                             "categoryCombo": {"id": "HistoricCC1"},
                             "categoryOptions": [{"id": "SharedOpt01"}],
                         }
@@ -1616,7 +1616,7 @@ class TransferTests(unittest.TestCase):
                         {
                             "id": "HistoricCC1",
                             "code": "HIST_CC",
-                            "name": "Ancien âge",
+                            "name": "Historical age",
                             "dataDimensionType": "DISAGGREGATION",
                             "categories": [{"id": "HistoricCat"}],
                         }
@@ -1625,8 +1625,8 @@ class TransferTests(unittest.TestCase):
                         {
                             "id": "HistoricCat",
                             "code": "HIST_CAT",
-                            "name": "Ancien âge",
-                            "shortName": "Ancien âge",
+                            "name": "Historical age",
+                            "shortName": "Historical age",
                             "dataDimensionType": "DISAGGREGATION",
                             "categoryOptions": [{"id": "SharedOpt01"}],
                         }
@@ -1635,8 +1635,8 @@ class TransferTests(unittest.TestCase):
                         {
                             "id": "SharedOpt01",
                             "code": "AGE_5_PLUS",
-                            "name": ">=5 ans",
-                            "shortName": ">=5 ans",
+                            "name": ">=5 years",
+                            "shortName": ">=5 years",
                         }
                     ],
                     "dataElements": [
@@ -2537,7 +2537,7 @@ class TransferTests(unittest.TestCase):
             "categoryOptionCombos": [
                 {
                     "id": "BrokenDef01",
-                    "name": "Nombre",
+                    "name": "Count",
                     "categoryCombo": {"id": "OtherDefCmb"},
                     "categoryOptions": [],
                 },
@@ -2593,11 +2593,11 @@ class TransferTests(unittest.TestCase):
     def test_repairs_invalid_category_option_combo_from_unique_generated_name(self) -> None:
         source_package = {
             "categoryOptions": [
-                {"id": "AgeOption001", "name": "0 et 11 mois"},
-                {"id": "AgeOption002", "name": "12 et 23 mois"},
-                {"id": "Strategy001", "name": "Fixe"},
-                {"id": "Strategy002", "name": "Avancé"},
-                {"id": "ForeignOpt01", "name": "> 59 mois"},
+                {"id": "AgeOption001", "name": "0 to 11 months"},
+                {"id": "AgeOption002", "name": "12 to 23 months"},
+                {"id": "Strategy001", "name": "Fixed"},
+                {"id": "Strategy002", "name": "Advanced"},
+                {"id": "ForeignOpt01", "name": "> 59 months"},
             ],
             "categories": [
                 {
@@ -2610,7 +2610,7 @@ class TransferTests(unittest.TestCase):
                 },
                 {
                     "id": "StrategyCat",
-                    "name": "Stratégie",
+                    "name": "Strategy",
                     "categoryOptions": [
                         {"id": "Strategy001"},
                         {"id": "Strategy002"},
@@ -2620,7 +2620,7 @@ class TransferTests(unittest.TestCase):
             "categoryCombos": [
                 {
                     "id": "CategoryCC1",
-                    "name": "Age et stratégie",
+                    "name": "Age and strategy",
                     "categories": [
                         {"id": "AgeCategory1"},
                         {"id": "StrategyCat"},
@@ -2630,7 +2630,7 @@ class TransferTests(unittest.TestCase):
             "categoryOptionCombos": [
                 {
                     "id": "OptionCombo1",
-                    "name": "0 et 11 mois, Fixe",
+                    "name": "0 to 11 months, Fixed",
                     "categoryCombo": {"id": "CategoryCC1"},
                     "categoryOptions": [
                         {"id": "AgeOption001"},
@@ -2639,7 +2639,7 @@ class TransferTests(unittest.TestCase):
                 },
                 {
                     "id": "OptionCombo2",
-                    "name": "0 et 11 mois, Avancé",
+                    "name": "0 to 11 months, Advanced",
                     "categoryCombo": {"id": "CategoryCC1"},
                     "categoryOptions": [
                         {"id": "AgeOption001"},
@@ -2648,7 +2648,7 @@ class TransferTests(unittest.TestCase):
                 },
                 {
                     "id": "OptionCombo3",
-                    "name": "12 et 23 mois, Fixe",
+                    "name": "12 to 23 months, Fixed",
                     "categoryCombo": {"id": "CategoryCC1"},
                     "categoryOptions": [
                         {"id": "ForeignOpt01"},
@@ -2657,7 +2657,7 @@ class TransferTests(unittest.TestCase):
                 },
                 {
                     "id": "OptionCombo4",
-                    "name": "12 et 23 mois, Avancé",
+                    "name": "12 to 23 months, Advanced",
                     "categoryCombo": {"id": "CategoryCC1"},
                     "categoryOptions": [
                         {"id": "AgeOption002"},
@@ -2689,10 +2689,10 @@ class TransferTests(unittest.TestCase):
     def test_blocks_ambiguous_invalid_category_option_combo_repair(self) -> None:
         source_package = {
             "categoryOptions": [
-                {"id": "AgeOption001", "name": "Enfant"},
-                {"id": "AgeOption002", "name": "Adulte"},
-                {"id": "Strategy001", "name": "Fixe"},
-                {"id": "ForeignOpt01", "name": "Inconnue"},
+                {"id": "AgeOption001", "name": "Child"},
+                {"id": "AgeOption002", "name": "Adult"},
+                {"id": "Strategy001", "name": "Fixed"},
+                {"id": "ForeignOpt01", "name": "Unknown"},
             ],
             "categories": [
                 {
@@ -2719,7 +2719,7 @@ class TransferTests(unittest.TestCase):
             "categoryOptionCombos": [
                 {
                     "id": "OptionCombo1",
-                    "name": "Enfant, Fixe",
+                    "name": "Child, Fixed",
                     "categoryCombo": {"id": "CategoryCC1"},
                     "categoryOptions": [
                         {"id": "AgeOption001"},
@@ -2728,7 +2728,7 @@ class TransferTests(unittest.TestCase):
                 },
                 {
                     "id": "OptionCombo2",
-                    "name": "Libellé impossible",
+                    "name": "Unmappable label",
                     "categoryCombo": {"id": "CategoryCC1"},
                     "categoryOptions": [
                         {"id": "ForeignOpt01"},
@@ -2810,8 +2810,8 @@ class TransferTests(unittest.TestCase):
                     "categoryOptions": [
                         {
                             "id": "Option00001",
-                            "name": "Féminin",
-                            "shortName": "Féminin",
+                            "name": "Female",
+                            "shortName": "Female",
                         }
                     ],
                     "categoryCombos": [
@@ -2824,7 +2824,7 @@ class TransferTests(unittest.TestCase):
                     "categoryOptionCombos": [
                         {
                             "id": "OptCombo001",
-                            "name": "Féminin",
+                            "name": "Female",
                             "categoryCombo": {"id": "Combo000001"},
                             "categoryOptions": [{"id": "Option00001"}],
                         }
@@ -2883,8 +2883,8 @@ class TransferTests(unittest.TestCase):
                     "categoryOptions": [
                         {
                             "id": "Option00001",
-                            "name": "Féminin",
-                            "shortName": "Féminin",
+                            "name": "Female",
+                            "shortName": "Female",
                         }
                     ],
                 }

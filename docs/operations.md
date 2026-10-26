@@ -1,571 +1,182 @@
-# Operations Runbook
+# Operations runbook
 
-## 1. Prepare Local Configuration
+## Pre-flight checks
 
-Create local files that are never committed:
+```bash
+cd /opt/dhis2-climate-import
 
-```sh
-cp .env.example .env
-cp climate-service.yaml.example climate-service.yaml
+test -r .env
+test -x .venv/bin/dhis2-climate-import
+.venv/bin/dhis2-climate-import list-jobs --ids-only
+.venv/bin/dhis2-climate-import check-dhis2
 ```
 
-Fill `.env` with `DHIS2_BASE_URL`, `DHIS2_PAT`, and `CLIMATE_SERVICE_BASE_URL`.
-Use a personal access token or a dedicated technical account.
+For a transfer job:
 
-The default DHIS2 transport is the official `dhis2-python-client` package:
-
-```sh
-DHIS2_TRANSPORT=dhis2-client
-DHIS2_CLIENT_LOG_LEVEL=CRITICAL
-```
-
-Use `DHIS2_TRANSPORT=stdlib` only as an emergency fallback while diagnosing dependency issues.
-
-If the target instance rejects PAT requests, set:
-
-```sh
-DHIS2_AUTH_METHOD=basic
-DHIS2_USERNAME=...
-DHIS2_PASSWORD=...
-```
-
-On DHIS2 versions before 2.38, PAT authentication can be disabled by server configuration. In
-that case, either enable PAT authentication on the server or use Basic Auth for the technical
-account on the test instance.
-
-## 2. Start Open Climate Service Locally
-
-Open Climate Service is a separate service from DHIS2. Our pipeline expects it at:
-
-```sh
-CLIMATE_SERVICE_BASE_URL=http://127.0.0.1:9000
-CLIMATE_SERVICE_HTTP_TIMEOUT_SECONDS=60
-CLIMATE_SERVICE_POLL_SECONDS=5
-CLIMATE_SERVICE_JOB_TIMEOUT_SECONDS=86400
-```
-
-Dataset ingestion is submitted with `Prefer: respond-async`. The command then polls the
-native OCS job and displays persisted progress, so a long CDS request does not depend on a
-single long-lived HTTP connection.
-
-Fast local setup from the official OCS repository:
-
-```sh
-git clone https://github.com/dhis2/open-climate-service.git
-cd open-climate-service
-make sync
-cp climate-service.yaml.example climate-service.yaml
-cp .env.example .env
-make run
-```
-
-For the DRC, edit `climate-service.yaml` before `make run` and use a DRC extent, for example:
-
-```yaml
-id: cod-climate-service
-name: Democratic Republic of the Congo Climate Service
-
-extent:
-  name: Democratic Republic of the Congo
-  bbox: [12.0, -13.5, 31.5, 5.4]
-  country_code: COD
-
-data_dir: ./data
-```
-
-When the service is running, verify:
-
-```sh
-curl http://127.0.0.1:9000/extent
-```
-
-The web interface is available at:
-
-- `http://127.0.0.1:9000/` landing page
-- `http://127.0.0.1:9000/manage` ingestion and sync
-- `http://127.0.0.1:9000/map` map viewer
-- `http://127.0.0.1:9000/docs` API docs
-
-Start with CHIRPS3 daily precipitation if you only want to test OCS quickly. ERA5-Land can require
-additional data-source credentials depending on the configured source.
-
-For a production server, use the single-worker OCS service and the sequential weekly pipeline in
-`deploy/systemd/`. The complete installation, historical backfill and timer procedure is documented
-in [weekly-climate-ocs.md](weekly-climate-ocs.md#déploiement-systemd-sur-le-serveur). Do not combine
-the OCS internal scheduler with `dhis2-climate-pipeline.timer` for the same datasets.
-
-## 3. Check DHIS2
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import check-dhis2
-```
-
-This checks `/api/system/info` and `/api/me`, then validates that the instance version is at
-least 2.37.
-
-## 4. Cache Organisation Units Level 3
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 3
-```
-
-The command fetches only DHIS2 organisation units at level 3 with `id`, `code`, `name`, `path`,
-`level`, and `geometry`. It writes:
-
-- `cache/org-units-level-3.geojson`
-- `cache/org-units-level-3.manifest.json`
-
-Imports do not refresh this cache implicitly. To refresh deliberately:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 3 --refresh
-```
-
-For the Climate App weekly Province/DPS example, cache the Province/DPS level as well. In the DRC
-test hierarchy this is expected to be level 2:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 2 --refresh
-```
-
-## 5. Cache Data Elements
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-data-elements --data-set CCH_CLIMATE_WEATHER
-```
-
-Use the climate data set UID or code from the target instance. If `dhis2.climate_data_set` is
-set in `config/import-pipeline.yaml`, `--data-set` can be omitted.
-For weekly Climate App imports, use the weekly data set code or UID, for example `CCH_WEEKLY`,
-when that is the configured data set in the target instance.
-
-The command resolves the DHIS2 data set first, then caches only data elements linked through
-`dataSetElements`. The pipeline resolves configured climate mappings against
-`cache/data-elements.json`.
-If a code or UID is missing, the import stops with a clear metadata error.
-
-The code first resolves the data set, then reads its `dataSetElements`. This is more reliable
-than scanning every data element in the instance.
-
-If nginx returns `403 Forbidden` instead of a DHIS2 JSON error, verify:
-
-- `DHIS2_BASE_URL` includes the correct DHIS2 context path, for example `/dhis` if the instance
-  is not mounted at the domain root.
-- The reverse proxy allows scripted API calls.
-- PAT authentication is enabled on the DHIS2 server, or `.env` uses `DHIS2_AUTH_METHOD=basic`.
-- The technical account can read metadata for data sets and data elements.
-
-Run the local diagnostic before changing import logic:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import diagnose-dhis2 --try-common-contexts
-```
-
-If one candidate returns DHIS2 JSON with status `200`, set `DHIS2_BASE_URL` to that candidate.
-If all candidates return nginx HTML `403`, the block is at the reverse proxy, VPN/IP allow-list,
-or API route policy before DHIS2 can evaluate the user authorities.
-
-## 6. Review Before Import
-
-Use `review-import` to reproduce the Climate App "Review and import" summary before hitting OCS
-or DHIS2 imports:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import review-import temperature_max_weekly_era5_land --org-unit-level 2 --data-set CCH_WEEKLY
-```
-
-For rolling historical windows, use `--years-back`:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import review-import temperature_max_weekly_era5_land --years-back 10 --org-unit-level 2 --data-set CCH_WEEKLY
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import import-dhis2 temperature_max_weekly_era5_land --years-back 7 --org-unit-level 2 --data-set CCH_WEEKLY --dry-run
-```
-
-`--years-back` computes whole DHIS2 periods. For a weekly job, the default end is the latest
-completed ISO week; for monthly, the previous completed month; for yearly, the previous completed
-year. Add `--as-of YYYY-MM-DD` to make a scheduled run reproducible, or pass `--end-period` to
-anchor the window on a specific DHIS2 period.
-
-For the weekly max-temperature DRC example, the expected control is:
-
-- `2026-W09` to `2026-W31`, resolved to `2026-02-23` through `2026-08-02`
-- `26` Province/DPS org units with geometry
-- `598` data values, computed as `26 x 23 weekly periods`
-
-To enforce that exact control, run:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import review-import temperature_max_weekly_era5_land --org-unit-level 2 --data-set CCH_WEEKLY --expected-org-units 26 --expected-data-values 598
-```
-
-The configured weekly job currently uses `data_set: CCH_CLIMATE_WEATHER`, matching the local
-configuration. If the real weekly data set in the instance has another UID/code, pass `--data-set`
-or update that single field before refreshing `cache/data-elements.json`. The pipeline validates
-the cached data set `periodType`; a weekly job requires a DHIS2 `Weekly` data set.
-
-For the screenshot-style Zone de Sante weekly precipitation review, use level 3:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-org-units --level 3 --refresh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import cache-data-elements --data-set CCH_CLIMATE_WEATHER --refresh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import review-import precipitation_weekly_era5_land --start 2026-03-21 --end 2026-08-21 --org-unit-level 3 --data-set CCH_CLIMATE_WEATHER --expected-org-units 519 --expected-data-values 11937
-```
-
-The user-entered weekly date range is expanded to full DHIS2 calendar weeks, so
-`2026-03-21` through `2026-08-21` becomes `2026-W12` through `2026-W34`
-(`2026-03-16` through `2026-08-23`).
-
-## 7. Validate an Import
-
-Start with dry-run:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import import-dhis2 precipitation_daily --dry-run
-```
-
-Then run a small real import in non-production:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import import-dhis2 precipitation_daily --apply
-```
-
-Reports are written to `reports/`. Run history is stored in `cache/import-runs.sqlite3`.
-
-## 8. Verify Analytics
-
-After a real import and analytics table generation:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import verify-analytics precipitation_daily --period 20240101
-```
-
-If `trigger_analytics` is true in `config/import-pipeline.yaml`, the pipeline attempts to call
-the analytics maintenance endpoint after successful imports. Otherwise, keep this as an explicit
-operations step handled by the DHIS2 administrator.
-
-## 9. Transfer a Data Set Between DHIS2 Instances
-
-Copy the examples and configure `.env` with the referenced variables:
-
-```sh
-cp config/instances.yaml.example config/instances.yaml
-cp config/scenarios/dhis2-x-to-y.yaml.example config/scenarios/dhis2-x-to-y.yaml
-```
-
-The source account needs metadata/data read access. The target account needs data import access and,
-when `create_if_missing` is enabled, permission to import the Data Set metadata package.
-
-The review also verifies that every source organisation unit involved in the transfer exists on the
-target using `organisation_units.mapping_strategy` (`uid` or `code`). A missing or ambiguous match
-blocks the transfer before metadata or data mutation. Extra organisation units on the target do not
-block it.
-
-Always review first:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+```bash
+.venv/bin/dhis2-climate-import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
-  review weekly_climate
+  review hospital_service
 ```
 
-If the review reports `missing on target`, use the dedicated hierarchy reconciliation. It requires
-`mapping_strategy: uid` and `organisation_units.synchronization.enabled: true`:
+## systemd operations
 
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
-  --instances config/instances.yaml \
-  --scenario config/scenarios/dhis2-x-to-y.yaml \
-  reconcile-org-units relevant_epidemiological_data --dry-run
-```
+### Individual transfer
 
-Inspect `planArtifact` and `packageArtifact`. The package contains only missing units, ordered from
-parent to child, plus an additive target Data Set assignment when the Data Set already exists. It
-never removes existing assignments. Apply the exact validated plan, then rerun `review`:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
-  --instances config/instances.yaml \
-  --scenario config/scenarios/dhis2-x-to-y.yaml \
-  reconcile-org-units relevant_epidemiological_data --apply
-
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
-  --instances config/instances.yaml \
-  --scenario config/scenarios/dhis2-x-to-y.yaml \
-  review relevant_epidemiological_data
-```
-
-The operation blocks on UID/code collisions, identity differences, or a different existing parent.
-Root creation is disabled by default because a DHIS2 instance must keep a single organisation-unit
-root. If the target is completely empty, root creation therefore requires an explicit, separately
-reviewed `allow_root_creation: true` decision.
-
-After the first plan is approved, set `run_before_transfer: true` to perform this reconciliation
-automatically before each parent transfer. `require_same_name` and `require_same_code` control the
-two identity fields independently; UID collisions and parent differences always remain blocking.
-For a target that intentionally prefixes OU codes, keep `require_same_name: true` and set
-`require_same_code: false`. The value import also performs a final DataSet assignment audit and
-stops before DHIS2 can return `E8022`.
-
-To continue with all safe OUs while dynamically quarantining conflicting subtrees for every job,
-configure the inherited synchronization policy:
-
-```yaml
-target:
-  organisation_units:
-    mapping_strategy: uid
-    synchronization:
-      enabled: true
-      run_before_transfer: true
-      conflict_policy: exclude
-```
-
-The default remains `block`. Dynamic exclusion handles required identity differences, parent
-differences, and code collisions. It refreshes the quarantine before every parent transfer and
-makes isolated windows consume the same manifest. Structural hierarchy errors and a quarantine
-that would remove the complete source selection remain blocking.
-
-The same `exclude` policy also handles data-value conflict `E8031`. DHIS2 returns this code when an
-organisation unit is not active for one or more supplied periods because of its opening or closing
-date. The pipeline uses the exact indexes returned by DHIS2, quarantines only those `OU + period`
-values, revalidates the remainder, and never changes the organisation-unit dates on Y. Mixed
-conflicts still block the transfer so another metadata error cannot be hidden. Each affected window
-writes `runs/<transfer-run>/data-value-quarantine/e8031.json`; the child and parent reports expose
-`timelinessQuarantine` and finish with `success_with_quarantine`.
-If E8031 would remove every value in an execution window, that window remains blocked instead of
-being checkpointed as a successful empty transfer.
-
-An explicit per-job quarantine can complement automatic detection:
-
-```yaml
-jobs:
-  - id: hospital_service
-    organisation_units:
-      exclude:
-        - uid: cKCv828onjo
-          reason: "Temporary review: source and target parents differ"
-```
-
-The UID may be a directly selected OU or one of its ancestors. Ancestor exclusion removes every
-selected descendant from source requests, target matching, reconciliation, new DataSet assignments,
-and value payloads; it never deletes existing target assignments. Verify
-`detectedOrganisationUnitConflicts`, `excludedSourceOrganisationUnitCount` and
-`excludedSourceOrganisationUnits` in `review` and run reports before applying. An unknown manual
-UID is a configuration error. A completed run with dynamic exclusions reports
-`success_with_quarantine`. Remove a manual rule only after the X/Y discrepancy has been resolved.
-
-Validate without mutation:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
-  --instances config/instances.yaml \
-  --scenario config/scenarios/dhis2-x-to-y.yaml \
-  run weekly_climate --dry-run
-```
-
-If this reports `metadata_changes_required`, inspect and apply the dedicated metadata plan before
-exporting the large value range:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
-  --instances config/instances.yaml \
-  --scenario config/scenarios/dhis2-x-to-y.yaml \
-  reconcile-metadata hospital_service --dry-run
-
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
-  --instances config/instances.yaml \
-  --scenario config/scenarios/dhis2-x-to-y.yaml \
-  reconcile-metadata hospital_service --apply
-```
-
-If the target Data Set is missing, this validates the metadata package but reports that data-value
-validation is pending the metadata commit. Apply only after reviewing the generated report:
-
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
-  --instances config/instances.yaml \
-  --scenario config/scenarios/dhis2-x-to-y.yaml \
-  run weekly_climate --apply
-```
-
-The apply workflow creates missing metadata atomically, refreshes the target cache, dry-runs every
-data-value chunk, and writes the values only if no conflicts were reported. Generated state is kept
-in `state/<target-profile>/<scenario>/jobs/<job>/` and is ignored by Git.
-
-For large Data Sets, source export is two-dimensional: organisation-unit batches and DHIS2-period
-batches. A monthly job defaults to one month per request. You can make the setting explicit per job:
-
-```yaml
-jobs:
-  - id: hospital_service
-    # ...
-    transfer:
-      source_period_batch_size: 1
-      execution:
-        period_batch_size: 3
-        process_isolation: true
-        resume: true
-        stop_on_error: true
-```
-
-`source_period_batch_size` limits one HTTP request. `execution.period_batch_size` limits the whole
-in-memory export/validation/import unit. The parent starts a new process for each execution window,
-records its result in `state/<target>/<scenario>/jobs/<job>/journal.sqlite3`, then releases all of
-that child's memory. On restart, successful windows are skipped automatically.
-
-Transient failures (timeouts, resets, 429, 502/503/504 and common Cloudflare gateway errors) use
-the configured retry policy and exit as `75` after exhaustion. Configuration, permissions and
-metadata incompatibilities exit as `2` without blind retries.
-
-Target value POSTs use adaptive chunking before a whole execution window is retried. A failing
-chunk is retried locally, then halved down to `transfer.adaptive_chunking.minimum_chunk_size`.
-Confirmed apply chunks are recorded under `checkpoints/data-values/` and skipped when an identical
-window is resumed. A timed-out `dryRun=false` request remains deliberately unconfirmed and is
-replayed with the idempotent `CREATE_AND_UPDATE` strategy. The systemd template additionally caps
-restart storms at three starts per six hours.
-
-Every source request is logged to stderr with its date window, organisation-unit count, duration,
-and cumulative value count. If DHIS2, nginx, or Cloudflare returns a timeout/gateway error, the
-pipeline automatically halves the period range and then the organisation-unit batch. A failure at
-the minimum size (one DHIS2 period and one organisation unit) is reported with a concise diagnostic;
-in that case inspect source performance or increase `DHIS2_TIMEOUT_SECONDS` in `.env`.
-
-For proxied targets, start with `DHIS2_TIMEOUT_SECONDS=120`. This setting is global to the instance
-clients; adaptive chunking remains global to the scenario and does not need a per-job override.
-
-With metadata strategy `CREATE`, dependencies reported by DHIS2 as already existing (`E5000`) are
-removed from the commit package and reused by UID. They are never updated implicitly. The full source
-package is retained as `*.metadata.source.json`; the validated minimal package is retained as
-`*.metadata.json`. Any discarded stale category references are summarized in the run report.
-
-### systemd execution per Data Set
-
-Install the templates after adapting `User`, `Group` and paths when the checkout is not under
-`/opt/dhis2-climate-import`:
-
-```sh
-sudo cp deploy/systemd/dhis2-transfer@.service /etc/systemd/system/
-sudo cp deploy/systemd/dhis2-transfer@.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now dhis2-transfer@hospital_service.timer
-sudo systemctl enable --now dhis2-transfer@sigl_fosa.timer
-sudo systemctl enable --now dhis2-transfer@weekly_climate.timer
-sudo systemctl enable --now dhis2-transfer@service_base.timer
-sudo systemctl enable --now dhis2-transfer@relevant_epidemiological_data.timer
-systemctl list-timers 'dhis2-transfer@*'
-```
-
-Audit commands:
-
-```sh
+```bash
+sudo systemctl start --no-block dhis2-transfer@hospital_service.service
 sudo systemctl status dhis2-transfer@hospital_service.service
-sudo journalctl -u dhis2-transfer@hospital_service.service --since today
 sudo journalctl -fu dhis2-transfer@hospital_service.service
 ```
 
-The template intentionally omits `--force`. The YAML setting `execution.max_parallel_jobs` limits
-heavy jobs globally, while a per-job lock and one target-metadata lock prevent conflicting runs.
-With `max_parallel_jobs: 2`, all services may be started together: two transfers run and additional
-services wait for a slot instead of failing. Metadata writes wait for the metadata lock and remain
-serialized even while value transfers from different jobs run in parallel.
+Compact state:
 
-### Sequential systemd queue
-
-Do not enable every per-job timer when strict ordering is required: timers are independent and use
-the configured parallel slots. Install the queue controller instead to deliberately serialize all
-jobs:
-
-```sh
-sudo cp deploy/systemd/dhis2-transfer@.service /etc/systemd/system/
-sudo cp deploy/systemd/dhis2-transfer-queue.service /etc/systemd/system/
-sudo cp deploy/systemd/dhis2-transfer-queue.timer /etc/systemd/system/
-sudo cp deploy/systemd/dhis2-transfer-queue.env.example /etc/default/dhis2-transfer-queue
-sudo systemctl daemon-reload
-
-sudo systemctl disable --now 'dhis2-transfer@hospital_service.timer' \
-  'dhis2-transfer@sigl_fosa.timer' \
-  'dhis2-transfer@weekly_climate.timer' \
-  'dhis2-transfer@service_base.timer' \
-  'dhis2-transfer@relevant_epidemiological_data.timer'
-
-sudo systemctl enable dhis2-transfer-queue.timer
-sudo systemctl start --no-block dhis2-transfer-queue.service
-sudo journalctl -fu dhis2-transfer-queue.service
+```bash
+sudo systemctl show dhis2-transfer@hospital_service.service \
+  --property=ActiveState,SubState,Result,ExecMainStatus,MemoryPeak
 ```
 
-The ordered list is configured in `/etc/default/dhis2-transfer-queue`:
+### Climate pipeline
 
-```sh
-DHIS2_TRANSFER_JOBS="hospital_service sigl_fosa weekly_climate service_base relevant_epidemiological_data"
-DHIS2_TRANSFER_CONTINUE_ON_FAILURE=true
-DHIS2_TRANSFER_QUEUE_POLL_SECONDS=15
+```bash
+sudo systemctl start --no-block dhis2-climate-pipeline.service
+sudo systemctl status dhis2-climate-pipeline.service
+sudo journalctl -fu dhis2-climate-pipeline.service
 ```
 
-The first entry is also a gate. If its service is already active, the queue waits for that existing
-execution and starts the second entry only after it stops. A transfer uses its normal internal
-retries and systemd restart limit before being declared failed. With continuation enabled, the
-queue records the failure and proceeds, but exits non-zero at the end to preserve an observable
-failure status. Follow the controller with `journalctl -fu dhis2-transfer-queue.service` and keep
-using `journalctl -fu dhis2-transfer@<job>.service` for detailed transfer progress.
+A `Type=oneshot` service remains in the `activating` state for its entire run. This is expected.
 
-### Repair partial target metadata
+### After correcting a permanent error
 
-Do not bypass a CategoryCombo compatibility error with a global `CREATE_AND_UPDATE`. When the audit
-shows that the target has the same Data Element UIDs and labels but incomplete CategoryCombos, opt
-in explicitly in the scenario:
-
-```yaml
-target:
-  metadata:
-    reconcile_existing: true
+```bash
+sudo systemctl reset-failed dhis2-transfer@hospital_service.service
+sudo systemctl start --no-block dhis2-transfer@hospital_service.service
 ```
 
-Validate the repair plan without mutation:
+## Reading transfer logs
 
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+Important messages:
+
+| Message | Meaning |
+| --- | --- |
+| `Target chunk validated` | the DHIS2 dry-run accepted the chunk |
+| `Target chunk checkpoint recorded` | an import response was confirmed and persisted |
+| `Target chunk imported` | the real import completed without a blocking conflict |
+| `Target chunk already imported; resumed from checkpoint` | no new POST was sent for that chunk |
+| `Target chunk split after timeout` | only the failing chunk was subdivided |
+| `Values quarantined` | excluded values were recorded in an audit artifact |
+| `Window completed` | the complete period window was checkpointed |
+
+A `Target chunk import started` message without a checkpoint or completion message does not prove
+that the client received a response.
+
+## Reports and checkpoints
+
+```bash
+JOB_ROOT=/opt/dhis2-climate-import/state/y/dhis2-x-to-y/jobs/hospital_service
+
+find "$JOB_ROOT/reports" -type f -name '*.json' -print | sort
+find "$JOB_ROOT/runs" -type f -name 'run-summary.json' -print | sort
+find "$JOB_ROOT/checkpoints" -type f -name '*.json' -print | sort
+```
+
+Inspect the latest parent summary as the service account:
+
+```bash
+SUMMARY=$(find "$JOB_ROOT/runs" -type f -name 'run-summary.json' -print | sort | tail -1)
+sudo -u dhis2-import jq . "$SUMMARY"
+```
+
+Do not delete a checkpoint to force recovery. Use `--force` only after understanding the impact
+and only during a controlled manual run.
+
+## OCS jobs
+
+The pipeline logs the UUID of every ingestion. Inspect a known job:
+
+```bash
+curl -sS http://127.0.0.1:9000/ingestions/jobs/<job-id> |
+  jq '{jobID, status, request, progress, error}'
+```
+
+List published datasets:
+
+```bash
+curl -sS http://127.0.0.1:9000/datasets |
+  jq -r '.items[]? | [.dataset_id, .extent.temporal.start, .extent.temporal.end] | @tsv'
+```
+
+`409 An ingest or sync is already running` means another OCS job for the same dataset is active.
+Do not start a concurrent ingestion. Find its UUID in the OCS journal or persistent job registry.
+
+## Common incidents
+
+### DHIS2 disconnect or timeout
+
+Examples: `connection reset`, `server disconnected`, `502`, `504`, or `524`.
+
+The pipeline classifies these as temporary. Transfers retry and then subdivide only the failing
+chunk. If the minimum chunk still fails, exit code `75` enables a bounded systemd restart.
+
+Keep the proxy enabled. If small chunks still fail, inspect the reverse proxy, Cloudflare,
+PostgreSQL locks, and DHIS2 resource usage.
+
+### Metadata conflict 409
+
+Read the `E....` codes and the JSON plan shown in the journal. Do not bypass a structural conflict
+by deleting target objects. Run:
+
+```bash
+.venv/bin/dhis2-climate-import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
-  repair-metadata hospital_service --dry-run
+  reconcile-metadata <job> --dry-run
 ```
 
-The command blocks unless all affected Data Elements have matching identity fields, have no target
-Data Set memberships, and have no raw or deleted values in the 1900–2100 audit window under the
-target account's organisation-unit roots. It also requires Categories and CategoryOptions to match
-by UID, label, and membership. Review the generated report and rollback-evidence artifact before
-applying:
+### Organisation unit mismatch
 
-```sh
-PYTHONPATH=src .venv/bin/python -m dhis2_climate_import transfer \
+```bash
+.venv/bin/dhis2-climate-import transfer \
   --instances config/instances.yaml \
   --scenario config/scenarios/dhis2-x-to-y.yaml \
-  repair-metadata hospital_service --apply
+  reconcile-org-units <job> --dry-run
 ```
 
-DHIS2 validates CategoryOptionCombos against the committed CategoryCombo structure, so apply runs
-two atomic stages. If the second-stage validation fails, no Data Element assignment is changed; the
-first-stage CategoryCombo repair remains recorded in the report. After a successful repair, rerun
-the ordinary transfer with `--dry-run`, then review its report before using `--apply`.
+A different parent for an existing UID is never repaired automatically. The `exclude` policy can
+quarantine that branch; `block` requires a human decision.
 
-### Historical UID collisions
+### Missing climate service variables
 
-An old source CategoryOptionCombo can reference a CategoryCombo UID that already exists on Y with
-a different structure. Do not overwrite that target object. Enable isolated cloning instead:
+The service reads job and window settings from:
 
-```yaml
-target:
-  metadata:
-    synchronization:
-      historical_data_elements:
-        enabled: true
-        strategy: versioned
-        uid_collision_strategy: clone
-        name_suffix: " — Historique"
+```bash
+sudo grep '^DHIS2_CLIMATE_' /etc/default/dhis2-climate-pipeline
 ```
 
-The pipeline clones the complete historical category graph under deterministic UIDs, validates it
-with `importMode=VALIDATE`, and commits it only during `--apply`. It then creates or reuses the
-versioned historical Data Element and rewrites both `dataElement` and `categoryOptionCombo` in the
-affected values. The incompatible object that was already on Y remains untouched. The source and
-target UID mappings, detected conflicts, validation response and commit response are retained in
-the window's `historical-metadata` artifacts.
+Do not place these settings only in `.env`.
+
+### Invalid period
+
+A value such as `NaNWNaN` comes from a malformed payload. Correlate the request in the DHIS2 log
+and reverse-proxy access log. Disabling the proxy does not correct malformed data.
+
+## Concurrency
+
+- the climate pipeline processes jobs sequentially to protect writable OCS storage;
+- multiple `dhis2-transfer@...` services may be requested simultaneously;
+- `execution.max_parallel_jobs` limits active value transfers;
+- a separate lock serializes metadata changes;
+- do not enable individual timers and the sequential queue for the same jobs.
+
+## Operational backups
+
+Back up:
+
+- `/opt/dhis2-climate-import/.env` in a secure secret store;
+- `/opt/dhis2-climate-import/state/`;
+- `/opt/dhis2-climate-import/reports/`;
+- the OCS configuration and data directory;
+- `/etc/default/dhis2-climate-pipeline` and `/etc/default/dhis2-transfer-queue`.
+
+Never include credentials in a public archive or an unprotected incident report.

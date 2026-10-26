@@ -9,6 +9,24 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
+_GATEWAY_STATUS_CODES = frozenset({502, 503, 504, 520, 522, 524})
+_TRANSIENT_STATUS_CODES = frozenset({429, *_GATEWAY_STATUS_CODES})
+_INTERRUPTED_RESPONSE_MARKERS = (
+    "timed out",
+    "timeout",
+    "cloudflare",
+    "connection reset",
+    "server disconnected",
+    "remote end closed connection",
+    "remote disconnected",
+)
+_DNS_FAILURE_MARKERS = (
+    "temporary failure",
+    "name or service not known",
+    "nodename nor servname",
+)
+
+
 @dataclass
 class HttpRequestError(RuntimeError):
     method: str
@@ -20,6 +38,29 @@ class HttpRequestError(RuntimeError):
         status = self.status_code if self.status_code is not None else "network"
         body = f": {_short_body(self.body)}" if self.body else ""
         return f"{self.method} {self.url} failed with {status}{body}"
+
+
+def is_timeout_or_gateway_error(exc: HttpRequestError) -> bool:
+    """Return whether retrying or subdividing the same request is appropriate."""
+
+    text = f"{exc.body} {exc}".lower()
+    return exc.status_code in _GATEWAY_STATUS_CODES or any(
+        marker in text for marker in _INTERRUPTED_RESPONSE_MARKERS
+    )
+
+
+def is_transient_http_error(exc: HttpRequestError) -> bool:
+    """Classify transport failures that may succeed without configuration changes."""
+
+    if exc.status_code in _TRANSIENT_STATUS_CODES:
+        return True
+    if exc.status_code is not None:
+        return False
+    text = f"{exc.body} {exc}".lower()
+    return any(
+        marker in text
+        for marker in (*_INTERRUPTED_RESPONSE_MARKERS, *_DNS_FAILURE_MARKERS)
+    )
 
 
 class JsonHttpClient:

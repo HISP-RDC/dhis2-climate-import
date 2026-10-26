@@ -48,7 +48,7 @@ dependencies = [
 [[package]]
 name = "dhis2-climate-import"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "dhis2-client" },
 ]

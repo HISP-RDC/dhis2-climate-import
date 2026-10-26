@@ -127,7 +127,7 @@ class SystemdClimatePipelineTests(unittest.TestCase):
         self.assertEqual(len(new_calls), 3)
         self.assertTrue(any("check-dhis2" in call for call in new_calls))
         self.assertFalse(any("ingest-dataset" in call for call in new_calls))
-        self.assertIn("checkpoint réutilisé", second.stdout)
+        self.assertIn("checkpoint reused", second.stdout)
 
     def test_splits_historical_period_for_ocs_and_dhis2_apply(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -193,7 +193,7 @@ class SystemdClimatePipelineTests(unittest.TestCase):
         self.assertEqual(len(checkpoints), 1)
         self.assertTrue(any("--apply" in call for call in calls))
         self.assertNotIn("--force", "\n".join(calls))
-        self.assertIn("déjà confirmé par le journal local", result.stdout)
+        self.assertIn("already confirmed by the local journal", result.stdout)
 
     def test_rolling_window_uses_latest_complete_week_and_lag(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

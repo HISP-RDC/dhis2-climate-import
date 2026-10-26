@@ -1,5 +1,5 @@
 [Unit]
-Description=Transfert DHIS2 X vers Y — job %i
+Description=DHIS2 X-to-Y transfer — job %i
 Wants=network-online.target
 After=network-online.target
 # Prevent a permanently slow target from creating an endless restart storm.
@@ -9,8 +9,8 @@ StartLimitBurst=3
 
 [Service]
 Type=oneshot
-User=meleck
-Group=meleck
+User=dhis2-import
+Group=dhis2-import
 WorkingDirectory=/opt/dhis2-climate-import
 Environment=PYTHONPATH=/opt/dhis2-climate-import/src
 Environment=PYTHONUNBUFFERED=1

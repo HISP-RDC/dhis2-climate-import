@@ -7,18 +7,18 @@ class DiagnosticsTests(unittest.TestCase):
     def test_candidate_base_urls_adds_requested_contexts(self) -> None:
         self.assertEqual(
             candidate_base_urls(
-                "https://test.snisrdc.com/api/",
+                "https://test.example.org/api/",
                 contexts=["dhis"],
                 include_common_contexts=False,
             ),
-            ["https://test.snisrdc.com", "https://test.snisrdc.com/dhis"],
+            ["https://test.example.org", "https://test.example.org/dhis"],
         )
 
     def test_summarise_nginx_html_points_to_proxy_or_base_url(self) -> None:
         summary = summarise_probes(
             [
                 {
-                    "url": "https://test.snisrdc.com/api/system/info",
+                    "url": "https://test.example.org/api/system/info",
                     "statusCode": 403,
                     "looksLikeDhis2Json": False,
                     "looksLikeNginxHtml": True,

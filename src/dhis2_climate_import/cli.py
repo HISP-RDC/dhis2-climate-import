@@ -23,7 +23,7 @@ from .diagnostics import diagnose_dhis2_access
 from .dhis2 import DHIS2Client
 from .env import load_env_file
 from .errors import PipelineError, TransientPipelineError
-from .http import HttpRequestError
+from .http import HttpRequestError, is_transient_http_error
 from .journal import TransferRunJournal
 from .ocs import OCSClient
 from .periods import date_window_period_bounds, period_range_bounds, relative_year_window
@@ -78,6 +78,17 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose.add_argument("--try-common-contexts", action="store_true")
     diagnose.add_argument("--timeout", type=float, default=15)
     diagnose.set_defaults(func=cmd_diagnose_dhis2)
+
+    list_jobs = subparsers.add_parser(
+        "list-jobs",
+        help="List climate import jobs declared in the pipeline configuration.",
+    )
+    list_jobs.add_argument(
+        "--ids-only",
+        action="store_true",
+        help="Print one job identifier per line instead of JSON.",
+    )
+    list_jobs.set_defaults(func=cmd_list_jobs)
 
     org_units = subparsers.add_parser("cache-org-units", help="Cache DHIS2 org units as GeoJSON.")
     org_units.add_argument("--level", type=int, default=None)
@@ -283,6 +294,33 @@ def cmd_check_dhis2(args: argparse.Namespace) -> None:
     min_version = _parse_min_version(args.min_version)
     result = dhis2.check(min_version=min_version)
     _print_json(result.__dict__)
+
+
+def cmd_list_jobs(args: argparse.Namespace) -> None:
+    config = load_pipeline_config(args.config)
+    if args.ids_only:
+        for job in config.imports:
+            print(job.id)
+        return
+    _print_json(
+        {
+            "config": str(config.path),
+            "count": len(config.imports),
+            "jobs": [
+                {
+                    "id": job.id,
+                    "label": job.label,
+                    "datasetId": job.dataset_id,
+                    "dataSet": job.data_set,
+                    "dataElement": job.data_element,
+                    "periodType": job.period_type,
+                    "defaultStartPeriod": job.default_start_period,
+                    "defaultEndPeriod": job.default_end_period,
+                }
+                for job in config.imports
+            ],
+        }
+    )
 
 
 def cmd_diagnose_dhis2(args: argparse.Namespace) -> None:
@@ -1143,133 +1181,133 @@ def _window_phase(event: str) -> str | None:
 
 def _transfer_progress(event: str, details: dict[str, Any]) -> None:
     labels = {
-        "ocs.ingestion.queued": "Ingestion OCS mise en file",
-        "ocs.ingestion.progress": "Progression de l’ingestion OCS",
-        "ocs.ingestion.done": "Ingestion OCS terminée",
-        "instances.check.start": "Vérification des connexions X et Y",
-        "instances.source.done": "Connexion source X validée",
-        "instances.target.done": "Connexion cible Y validée",
-        "instances.check.done": "Connexions X et Y validées",
-        "instances.check.retry": "Connexion temporairement indisponible, nouvelle tentative",
-        "transfer.start": "Démarrage du transfert",
-        "context.resolve.start": "Lecture et comparaison des métadonnées",
-        "context.resolve.done": "Métadonnées compatibles",
-        "cache.metadata.written": "Cache local actualisé",
-        "metadata.source_export.start": "Export des métadonnées source",
-        "metadata.source_export.done": "Métadonnées source exportées",
-        "metadata.validation.start": "Validation des métadonnées cible",
-        "metadata.validation.done": "Métadonnées cible validées",
-        "metadata.commit.start": "Création des métadonnées cible",
-        "metadata.commit.done": "Métadonnées cible créées",
-        "metadata.reconcile.lock.wait": "Attente du verrou des métadonnées cible",
-        "metadata.reconcile.start": "Synchronisation des métadonnées démarrée",
-        "metadata.reconcile.done": "Synchronisation des métadonnées terminée",
+        "ocs.ingestion.queued": "OCS ingestion queued",
+        "ocs.ingestion.progress": "OCS ingestion progress",
+        "ocs.ingestion.done": "OCS ingestion completed",
+        "instances.check.start": "Checking source and target connections",
+        "instances.source.done": "Source connection validated",
+        "instances.target.done": "Target connection validated",
+        "instances.check.done": "Source and target connections validated",
+        "instances.check.retry": "Connection temporarily unavailable; retrying",
+        "transfer.start": "Transfer started",
+        "context.resolve.start": "Reading and comparing metadata",
+        "context.resolve.done": "Metadata is compatible",
+        "cache.metadata.written": "Local cache refreshed",
+        "metadata.source_export.start": "Exporting source metadata",
+        "metadata.source_export.done": "Source metadata exported",
+        "metadata.validation.start": "Validating target metadata",
+        "metadata.validation.done": "Target metadata validated",
+        "metadata.commit.start": "Creating target metadata",
+        "metadata.commit.done": "Target metadata created",
+        "metadata.reconcile.lock.wait": "Waiting for the target metadata lock",
+        "metadata.reconcile.start": "Metadata synchronization started",
+        "metadata.reconcile.done": "Metadata synchronization completed",
         "organisation_units.reconcile.lock.wait": (
-            "Attente du verrou des unités d’organisation cible"
+            "Waiting for the target organisation-unit lock"
         ),
         "organisation_units.reconcile.start": (
-            "Audit de la hiérarchie des unités d’organisation"
+            "Auditing the organisation-unit hierarchy"
         ),
         "organisation_units.reconcile.plan": (
-            "Plan de synchronisation des unités d’organisation préparé"
+            "Organisation-unit synchronization plan prepared"
         ),
         "organisation_units.validation.start": (
-            "Validation de la hiérarchie cible"
+            "Validating the target hierarchy"
         ),
-        "organisation_units.validation.done": "Hiérarchie cible validée",
+        "organisation_units.validation.done": "Target hierarchy validated",
         "organisation_units.commit.start": (
-            "Création des unités d’organisation manquantes"
+            "Creating missing organisation units"
         ),
         "organisation_units.commit.done": (
-            "Unités d’organisation manquantes créées"
+            "Missing organisation units created"
         ),
         "organisation_units.verify.done": (
-            "Hiérarchie et affectations vérifiées après création"
+            "Hierarchy and assignments verified after creation"
         ),
         "organisation_units.reconcile.done": (
-            "Synchronisation des unités d’organisation terminée"
+            "Organisation-unit synchronization completed"
         ),
         "target.organisation_units.audit.start": (
-            "Vérification des affectations DataSet–unités d’organisation"
+            "Checking Data Set organisation-unit assignments"
         ),
         "target.organisation_units.audit.done": (
-            "Affectations DataSet–unités d’organisation compatibles"
+            "Data Set organisation-unit assignments are compatible"
         ),
         "historical_data_elements.audit.start": (
-            "Audit des Data Elements historiques"
+            "Auditing historical Data Elements"
         ),
         "historical_data_elements.metadata.validate.start": (
-            "Validation des métadonnées historiques"
+            "Validating historical metadata"
         ),
         "historical_data_elements.uid_collision.clone": (
-            "Collision d’UID historique isolée par clonage"
+            "Historical UID collision isolated through cloning"
         ),
         "historical_data_elements.quarantine": (
-            "Valeurs liées à des catégories historiques invalides mises en quarantaine"
+            "Values linked to invalid historical categories quarantined"
         ),
         "historical_data_elements.audit.done": (
-            "Traitement des Data Elements historiques terminé"
+            "Historical Data Element processing completed"
         ),
-        "source.export.start": "Début de l’export des valeurs source",
-        "source.export.request.start": "Requête source en cours",
-        "source.export.request.done": "Requête source terminée",
-        "source.export.request.split": "Timeout détecté, subdivision automatique",
-        "source.export.done": "Export des valeurs source terminé",
+        "source.export.start": "Source value export started",
+        "source.export.request.start": "Source request started",
+        "source.export.request.done": "Source request completed",
+        "source.export.request.split": "Timeout detected; splitting request",
+        "source.export.done": "Source value export completed",
         "source.category_option_combos.audit.start": (
-            "Audit des combinaisons de catégories des valeurs source"
+            "Auditing source value category option combinations"
         ),
         "source.category_option_combos.audit.done": (
-            "Combinaisons de catégories source normalisées"
+            "Source category option combinations normalized"
         ),
         "target.category_option_combos.audit.start": (
-            "Vérification des combinaisons de catégories sur la cible"
+            "Checking category option combinations on the target"
         ),
         "target.category_option_combos.audit.done": (
-            "Combinaisons de catégories cible compatibles"
+            "Target category option combinations are compatible"
         ),
-        "target.dry_run.start": "Début de la validation des valeurs cible",
-        "target.dry_run.chunk.start": "Validation d’un lot cible",
+        "target.dry_run.start": "Target value validation started",
+        "target.dry_run.chunk.start": "Validating target chunk",
         "target.dry_run.chunk.retry": (
-            "Nouvelle tentative du lot de validation cible"
+            "Retrying target validation chunk"
         ),
         "target.dry_run.chunk.split": (
-            "Lot de validation cible subdivisé après timeout"
+            "Target validation chunk split after timeout"
         ),
         "target.dry_run.chunk.minimum_failed": (
-            "Lot minimal de validation cible toujours en échec"
+            "Minimum target validation chunk still failing"
         ),
-        "target.dry_run.chunk.done": "Lot cible validé",
+        "target.dry_run.chunk.done": "Target chunk validated",
         "target.timeliness.quarantine": (
-            "Valeurs hors période d’activité mises en quarantaine"
+            "Values outside the organisation-unit active period quarantined"
         ),
-        "target.dry_run.done": "Validation des valeurs cible terminée",
-        "target.import.start": "Début de l’import réel des valeurs",
-        "target.import.chunk.start": "Import d’un lot cible",
-        "target.import.chunk.retry": "Nouvelle tentative du lot d’import cible",
-        "target.import.chunk.split": "Lot d’import cible subdivisé après timeout",
+        "target.dry_run.done": "Target value validation completed",
+        "target.import.start": "Target value import started",
+        "target.import.chunk.start": "Importing target chunk",
+        "target.import.chunk.retry": "Retrying target import chunk",
+        "target.import.chunk.split": "Target import chunk split after timeout",
         "target.import.chunk.minimum_failed": (
-            "Lot minimal d’import cible toujours en échec"
+            "Minimum target import chunk still failing"
         ),
-        "target.import.chunk.resume": "Lot cible déjà importé, reprise au checkpoint",
-        "target.import.chunk.checkpoint": "Checkpoint du lot cible enregistré",
-        "target.import.chunk.done": "Lot cible importé",
-        "target.import.done": "Import réel terminé",
-        "orchestrator.slot.wait": "Attente d’un créneau d’exécution",
-        "orchestrator.slot.acquired": "Créneau d’exécution acquis",
+        "target.import.chunk.resume": "Target chunk already imported; resumed from checkpoint",
+        "target.import.chunk.checkpoint": "Target chunk checkpoint recorded",
+        "target.import.chunk.done": "Target chunk imported",
+        "target.import.done": "Target value import completed",
+        "orchestrator.slot.wait": "Waiting for an execution slot",
+        "orchestrator.slot.acquired": "Execution slot acquired",
         "orchestrator.interrupted.recovered": (
-            "Anciennes tranches interrompues reclassées"
+            "Previously interrupted windows reclassified"
         ),
-        "orchestrator.start": "Exécution globale démarrée",
-        "orchestrator.window.start": "Tranche démarrée",
-        "orchestrator.window.done": "Tranche terminée",
-        "orchestrator.window.skipped": "Tranche déjà réussie ignorée",
+        "orchestrator.start": "Parent execution started",
+        "orchestrator.window.start": "Window started",
+        "orchestrator.window.done": "Window completed",
+        "orchestrator.window.skipped": "Previously successful window skipped",
         "orchestrator.window.metadata_pending": (
-            "Tranche en attente du commit des métadonnées historiques"
+            "Window waiting for historical metadata commit"
         ),
-        "orchestrator.window.retry": "Nouvelle tentative de tranche planifiée",
-        "orchestrator.done": "Exécution globale terminée",
-        "transfer.done": "Transfert terminé",
-        "transfer.failed": "Transfert interrompu",
+        "orchestrator.window.retry": "Window retry scheduled",
+        "orchestrator.done": "Parent execution completed",
+        "transfer.done": "Transfer completed",
+        "transfer.failed": "Transfer interrupted",
     }
     rendered_details = " | ".join(
         f"{key}={value}" for key, value in details.items()
@@ -1316,25 +1354,7 @@ def _format_http_error(exc: HttpRequestError) -> str:
 
 
 def _is_transient_http_error(exc: HttpRequestError) -> bool:
-    if exc.status_code in {429, 502, 503, 504, 520, 522, 524}:
-        return True
-    if exc.status_code is not None:
-        return False
-    body = exc.body.lower()
-    return any(
-        marker in body
-        for marker in (
-            "timed out",
-            "timeout",
-            "connection reset",
-            "server disconnected",
-            "remote end closed connection",
-            "remote disconnected",
-            "temporary failure",
-            "name or service not known",
-            "nodename nor servname",
-        )
-    )
+    return is_transient_http_error(exc)
 
 
 def _dhis2_error_details(body: str) -> list[str]:
