@@ -9,6 +9,7 @@ import smtplib
 import socket
 import ssl
 from typing import Mapping
+from urllib.parse import urlsplit
 
 from .email_templates import (
     EmailBrand,
@@ -196,7 +197,7 @@ def send_climate_pipeline_notification(
     context = PipelineEmailContext(
         outcome=outcome,
         exit_status=exit_status,
-        host_name=socket.getfqdn() or socket.gethostname() or "unknown-host",
+        host_name=_notification_host_name(env),
         started_at=started_at,
         finished_at=finished_at,
         start_period=start_period,
@@ -227,6 +228,21 @@ def send_climate_pipeline_notification(
             for item in deliveries
         ],
     }
+
+
+def _notification_host_name(env: Mapping[str, str]) -> str:
+    configured_name = env.get("DHIS2_CLIMATE_EMAIL_HOST_NAME", "").strip()
+    if configured_name:
+        _reject_header_injection("DHIS2_CLIMATE_EMAIL_HOST_NAME", configured_name)
+        return configured_name
+
+    dhis2_base_url = env.get("DHIS2_BASE_URL", "").strip()
+    if dhis2_base_url:
+        instance_host = urlsplit(dhis2_base_url).hostname
+        if instance_host:
+            return instance_host
+
+    return socket.getfqdn() or socket.gethostname() or "unknown-host"
 
 
 def _build_deliveries(

@@ -100,6 +100,66 @@ class ClimateEmailNotificationTests(unittest.TestCase):
 
         self.assertNotIn("secret", str(raised.exception))
 
+    def test_admin_host_defaults_to_dhis2_instance_instead_of_vps(self) -> None:
+        env = _smtp_env()
+        env["DHIS2_BASE_URL"] = "https://sante-climate.hispdrc.org/dhis2"
+        client = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = client
+        context.__exit__.return_value = False
+        client.send_message.return_value = {}
+
+        with (
+            patch(
+                "dhis2_climate_import.notifications.smtplib.SMTP",
+                return_value=context,
+            ),
+            patch(
+                "dhis2_climate_import.notifications.socket.getfqdn",
+                return_value="vmi3662353.contaboserver.net",
+            ),
+        ):
+            result = send_climate_pipeline_notification(
+                env,
+                outcome="test",
+                exit_status=0,
+                started_at="",
+                finished_at="",
+                audience="admins",
+                force=True,
+            )
+
+        message = client.send_message.call_args.args[0]
+        self.assertEqual(result["host"], "sante-climate.hispdrc.org")
+        self.assertIn("sante-climate.hispdrc.org", message["Subject"])
+        self.assertNotIn("vmi3662353", str(message))
+
+    def test_explicit_admin_host_name_overrides_dhis2_base_url(self) -> None:
+        env = _smtp_env()
+        env["DHIS2_BASE_URL"] = "https://internal-dhis2.example.org"
+        env["DHIS2_CLIMATE_EMAIL_HOST_NAME"] = "sante-climate.hispdrc.org"
+        client = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = client
+        context.__exit__.return_value = False
+        client.send_message.return_value = {}
+
+        with patch(
+            "dhis2_climate_import.notifications.smtplib.SMTP",
+            return_value=context,
+        ):
+            result = send_climate_pipeline_notification(
+                env,
+                outcome="test",
+                exit_status=0,
+                started_at="",
+                finished_at="",
+                audience="admins",
+                force=True,
+            )
+
+        self.assertEqual(result["host"], "sante-climate.hispdrc.org")
+
     def test_ssl_delivery_uses_smtp_ssl(self) -> None:
         env = _smtp_env()
         env["DHIS2_CLIMATE_SMTP_SECURITY"] = "ssl"

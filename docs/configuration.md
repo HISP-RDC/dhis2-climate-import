@@ -84,6 +84,7 @@ DHIS2_CLIMATE_ADMIN_EMAIL_TO=operations@example.org,manager@example.org
 DHIS2_CLIMATE_USER_EMAIL_ON_SUCCESS=true
 DHIS2_CLIMATE_USER_EMAIL_TO=user1@example.org,user2@example.org
 DHIS2_CLIMATE_EMAIL_FROM=dhis2-climate@example.org
+DHIS2_CLIMATE_EMAIL_HOST_NAME=
 DHIS2_CLIMATE_EMAIL_BRAND_NAME=HISP RDC
 DHIS2_CLIMATE_EMAIL_LOCALE=fr
 DHIS2_CLIMATE_EMAIL_LOGO_PATH=
@@ -106,6 +107,11 @@ Username and password may both be empty when the relay authenticates the server 
 The administrator message includes technical diagnostics. End users receive only a successful
 completion notice; a failed or partially completed pipeline never sends the user message. All user
 addresses are passed as SMTP envelope recipients and are hidden from the message headers.
+
+`DHIS2_CLIMATE_EMAIL_HOST_NAME` controls the host label displayed in administrator email subjects
+and technical details. When it is empty, the pipeline uses the hostname from `DHIS2_BASE_URL`; it
+uses the operating-system hostname only when neither value is available. Set it explicitly when the
+public DHIS2 name differs from the URL used by the importer.
 
 The HISP RDC logo is bundled in the Python package and used when
 `DHIS2_CLIMATE_EMAIL_LOGO_PATH` is empty. A deployment may override it with a different PNG, JPEG,
