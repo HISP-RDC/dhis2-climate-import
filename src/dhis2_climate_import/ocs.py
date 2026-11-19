@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from .errors import PipelineError
+from .errors import PipelineError, TransientPipelineError
 from .http import JsonHttpClient
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
@@ -117,6 +117,45 @@ class OCSClient:
                     f"{self.job_timeout_seconds:g} seconds; the background job was not cancelled"
                 )
             time.sleep(self.poll_seconds)
+
+    def ingestion_job(self, job_id: str) -> dict[str, Any]:
+        return self.http.request_json("GET", f"/ingestions/jobs/{job_id}")
+
+    def cancel_ingestion_job(
+        self,
+        job_id: str,
+        *,
+        wait_seconds: float = 120.0,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        """Request cooperative cancellation and wait for a terminal job state."""
+        record = self.http.request_json("DELETE", f"/ingestions/jobs/{job_id}")
+        _emit(
+            progress,
+            "ocs.cleanup.cancel.requested",
+            job=job_id,
+            status=record.get("status"),
+        )
+        deadline = time.monotonic() + wait_seconds
+        while str(record.get("status", "")).lower() in {
+            "accepted",
+            "running",
+            "retrying",
+        }:
+            if time.monotonic() >= deadline:
+                raise TransientPipelineError(
+                    f"OCS job {job_id} did not reach a terminal state within "
+                    f"{wait_seconds:g} seconds after cancellation was requested."
+                )
+            time.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
+            record = self.ingestion_job(job_id)
+        _emit(
+            progress,
+            "ocs.cleanup.cancel.done",
+            job=job_id,
+            status=record.get("status"),
+        )
+        return record
 
     def sync_plan(self, dataset_id: str, *, end: str | None = None) -> dict[str, Any]:
         return self.http.request_json("GET", f"/sync/{dataset_id}/plan", params={"end": end})

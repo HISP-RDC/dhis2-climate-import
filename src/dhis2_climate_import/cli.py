@@ -25,7 +25,9 @@ from .env import load_env_file
 from .errors import PipelineError, TransientPipelineError
 from .http import HttpRequestError, is_transient_http_error
 from .journal import TransferRunJournal
+from .notifications import send_climate_pipeline_notification
 from .ocs import OCSClient
+from .ocs_cleanup import cleanup_stale_ocs_jobs
 from .periods import date_window_period_bounds, period_range_bounds, relative_year_window
 from .pipeline import aggregate_job, import_job, review_import, run_monthly_imports
 from .reports import run_id, write_report
@@ -121,6 +123,24 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--publish", action=argparse.BooleanOptionalAction, default=None)
     ingest.set_defaults(func=cmd_ingest_dataset)
 
+    cleanup_ocs = subparsers.add_parser(
+        "cleanup-ocs-jobs",
+        help="Plan or cancel stale active OCS ingestion jobs for configured datasets.",
+    )
+    cleanup_ocs.add_argument(
+        "--job",
+        action="append",
+        default=[],
+        help="Climate import job to inspect. Repeat for multiple jobs; defaults to all.",
+    )
+    cleanup_ocs.add_argument("--job-store")
+    cleanup_ocs.add_argument("--older-than-hours", type=float, default=48.0)
+    cleanup_ocs.add_argument("--wait-seconds", type=float, default=120.0)
+    cleanup_mode = cleanup_ocs.add_mutually_exclusive_group(required=True)
+    cleanup_mode.add_argument("--dry-run", action="store_true")
+    cleanup_mode.add_argument("--apply", action="store_true")
+    cleanup_ocs.set_defaults(func=cmd_cleanup_ocs_jobs)
+
     sync = subparsers.add_parser("sync-dataset", help="Plan or apply an OCS dataset sync.")
     sync.add_argument("job_id")
     sync.add_argument("--end")
@@ -169,6 +189,35 @@ def build_parser() -> argparse.ArgumentParser:
     monthly_mode.add_argument("--apply", action="store_true")
     monthly.add_argument("--force", action="store_true")
     monthly.set_defaults(func=cmd_run_monthly)
+
+    notify = subparsers.add_parser(
+        "notify-climate-pipeline",
+        help="Send or test the configured climate pipeline email notification.",
+    )
+    notify.add_argument(
+        "--outcome",
+        choices=("success", "failure", "test"),
+        required=True,
+    )
+    notify.add_argument("--exit-status", type=int, default=0)
+    notify.add_argument("--started-at", default="")
+    notify.add_argument("--finished-at", default="")
+    notify.add_argument("--start-period", default="")
+    notify.add_argument("--end-period", default="")
+    notify.add_argument("--jobs", default="")
+    notify.add_argument("--failures", default="")
+    notify.add_argument(
+        "--audience",
+        choices=("all", "admins", "users"),
+        default="all",
+        help="Target administrators, end users, or both configured audiences.",
+    )
+    notify.add_argument(
+        "--force",
+        action="store_true",
+        help="Send even when email notifications are disabled (intended for SMTP tests).",
+    )
+    notify.set_defaults(func=cmd_notify_climate_pipeline)
 
     transfer = subparsers.add_parser(
         "transfer", help="Transfer aggregate Data Set values between two DHIS2 instances."
@@ -294,6 +343,25 @@ def cmd_check_dhis2(args: argparse.Namespace) -> None:
     min_version = _parse_min_version(args.min_version)
     result = dhis2.check(min_version=min_version)
     _print_json(result.__dict__)
+
+
+def cmd_notify_climate_pipeline(args: argparse.Namespace) -> None:
+    file_env = load_env_file(args.env_file)
+    env = {**file_env, **os.environ}
+    result = send_climate_pipeline_notification(
+        env,
+        outcome=args.outcome,
+        exit_status=args.exit_status,
+        started_at=args.started_at,
+        finished_at=args.finished_at,
+        start_period=args.start_period,
+        end_period=args.end_period,
+        jobs=args.jobs,
+        failures=args.failures,
+        audience=args.audience,
+        force=args.force,
+    )
+    _print_json(result)
 
 
 def cmd_list_jobs(args: argparse.Namespace) -> None:
@@ -438,6 +506,26 @@ def cmd_ingest_dataset(args: argparse.Namespace) -> None:
         progress=_transfer_progress,
     )
     _print_json(response)
+
+
+def cmd_cleanup_ocs_jobs(args: argparse.Namespace) -> None:
+    env, config = _runtime(args)
+    selected_jobs = args.job or [job.id for job in config.imports]
+    dataset_ids = {config.get_job(job_id).dataset_id for job_id in selected_jobs}
+    store_value = args.job_store or env.get(
+        "DHIS2_CLIMATE_OCS_JOB_STORE_PATH",
+        "/var/lib/open-climate-service/jobs/jobs.json",
+    )
+    result = cleanup_stale_ocs_jobs(
+        OCSClient.from_env(env),
+        job_store=Path(store_value),
+        dataset_ids=dataset_ids,
+        older_than_hours=args.older_than_hours,
+        wait_seconds=args.wait_seconds,
+        apply=args.apply,
+        progress=_transfer_progress,
+    )
+    _print_json(result)
 
 
 def cmd_sync_dataset(args: argparse.Namespace) -> None:
@@ -1184,6 +1272,8 @@ def _transfer_progress(event: str, details: dict[str, Any]) -> None:
         "ocs.ingestion.queued": "OCS ingestion queued",
         "ocs.ingestion.progress": "OCS ingestion progress",
         "ocs.ingestion.done": "OCS ingestion completed",
+        "ocs.cleanup.cancel.requested": "Stale OCS job cancellation requested",
+        "ocs.cleanup.cancel.done": "Stale OCS job cancelled",
         "instances.check.start": "Checking source and target connections",
         "instances.source.done": "Source connection validated",
         "instances.target.done": "Target connection validated",

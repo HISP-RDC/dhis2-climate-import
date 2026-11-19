@@ -23,6 +23,7 @@ $CLI --config config/import-pipeline.yaml --env-file .env check-dhis2
 | `cache-org-units` | refresh organisation-unit geometries |
 | `cache-data-elements` | refresh Data Elements for the configured climate Data Sets |
 | `ingest-dataset` | submit an asynchronous OCS ingestion and poll its state |
+| `cleanup-ocs-jobs` | plan or cancel stale active OCS jobs for configured datasets |
 | `sync-dataset` | plan or apply an OCS synchronization |
 | `aggregate` | generate a DHIS2 payload without importing it |
 | `review-import` | show the period, organisation units, and expected value count |
@@ -30,6 +31,7 @@ $CLI --config config/import-pipeline.yaml --env-file .env check-dhis2
 | `import-dhis2 --apply` | import values after explicit validation |
 | `verify-analytics` | verify a sample through the Analytics API |
 | `run-monthly` | run all configured monthly imports |
+| `notify-climate-pipeline` | send or test the configured SMTP pipeline summary |
 
 Weekly example:
 
@@ -46,6 +48,26 @@ $CLI import-dhis2 precipitation_weekly_chirps \
 $CLI import-dhis2 precipitation_weekly_chirps \
   --start-period 2026-W39 --end-period 2026-W39 --apply
 ```
+
+SMTP test (does not run OCS or import DHIS2 values):
+
+```bash
+$CLI --env-file .env notify-climate-pipeline \
+  --outcome test --audience all --force
+```
+
+Audit stale OCS jobs before enabling automatic cleanup:
+
+```bash
+$CLI --env-file .env cleanup-ocs-jobs \
+  --job vegetation_ndvi_weekly \
+  --older-than-hours 48 \
+  --dry-run
+```
+
+The command never deletes successful, failed, or cancelled history. With `--apply`, it rechecks
+every candidate through the OCS API, requests cooperative cancellation, and waits for a terminal
+state.
 
 ## Time windows
 

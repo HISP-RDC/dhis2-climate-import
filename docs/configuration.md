@@ -71,6 +71,70 @@ CLIMATE_SERVICE_JOB_TIMEOUT_SECONDS=86400
 
 The HTTP timeout covers submission and polling requests, not the total provider download time.
 
+### Climate pipeline email notifications
+
+SMTP credentials and recipients belong in `.env`, not in the public YAML configuration or
+`/etc/default`:
+
+```env
+DHIS2_CLIMATE_EMAIL_ENABLED=true
+DHIS2_CLIMATE_ADMIN_EMAIL_ON_SUCCESS=true
+DHIS2_CLIMATE_ADMIN_EMAIL_ON_FAILURE=true
+DHIS2_CLIMATE_ADMIN_EMAIL_TO=operations@example.org,manager@example.org
+DHIS2_CLIMATE_USER_EMAIL_ON_SUCCESS=true
+DHIS2_CLIMATE_USER_EMAIL_TO=user1@example.org,user2@example.org
+DHIS2_CLIMATE_EMAIL_FROM=dhis2-climate@example.org
+DHIS2_CLIMATE_EMAIL_BRAND_NAME=HISP RDC
+DHIS2_CLIMATE_EMAIL_LOCALE=fr
+DHIS2_CLIMATE_EMAIL_LOGO_PATH=
+DHIS2_CLIMATE_EMAIL_PRIMARY_COLOR=#1477E5
+DHIS2_CLIMATE_EMAIL_NAVY_COLOR=#091B67
+DHIS2_CLIMATE_EMAIL_ACCENT_COLOR=#F02B16
+DHIS2_CLIMATE_EMAIL_GOLD_COLOR=#FFD500
+DHIS2_CLIMATE_EMAIL_PORTAL_URL=https://dhis2.example.org
+DHIS2_CLIMATE_EMAIL_SUPPORT_EMAIL=support@example.org
+DHIS2_CLIMATE_SMTP_HOST=smtp.example.org
+DHIS2_CLIMATE_SMTP_PORT=587
+DHIS2_CLIMATE_SMTP_SECURITY=starttls
+DHIS2_CLIMATE_SMTP_USERNAME=dhis2-climate
+DHIS2_CLIMATE_SMTP_PASSWORD=replace-with-a-secret
+DHIS2_CLIMATE_SMTP_TIMEOUT_SECONDS=30
+```
+
+Use `starttls` with port `587`, `ssl` with port `465`, or `none` only for a trusted SMTP relay.
+Username and password may both be empty when the relay authenticates the server by network policy.
+The administrator message includes technical diagnostics. End users receive only a successful
+completion notice; a failed or partially completed pipeline never sends the user message. All user
+addresses are passed as SMTP envelope recipients and are hidden from the message headers.
+
+The HISP RDC logo is bundled in the Python package and used when
+`DHIS2_CLIMATE_EMAIL_LOGO_PATH` is empty. A deployment may override it with a different PNG, JPEG,
+or GIF without changing the repository:
+
+```bash
+sudo install -d -m 0755 /etc/dhis2-climate-import
+sudo install -m 0644 /path/to/hisp-rdc-logo.png \
+  /etc/dhis2-climate-import/hisp-rdc-logo.png
+```
+
+Then set `DHIS2_CLIMATE_EMAIL_LOGO_PATH=/etc/dhis2-climate-import/hisp-rdc-logo.png`. The image must
+be smaller than 2 MiB.
+
+Test both templates without running a climate import:
+
+```bash
+.venv/bin/dhis2-climate-import --env-file .env \
+  notify-climate-pipeline \
+  --outcome test \
+  --audience all \
+  --force
+```
+
+Use `--audience admins` or `--audience users` to test one recipient group independently.
+
+Notification delivery is best effort: an SMTP failure is logged but never replaces the climate
+pipeline's real exit status.
+
 ## `config/import-pipeline.yaml`
 
 The local file, created from `config/import-pipeline.yaml.example`, declares:
@@ -144,7 +208,15 @@ DHIS2_CLIMATE_LOOKBACK_WEEKS=8
 DHIS2_CLIMATE_LAG_WEEKS=3
 DHIS2_CLIMATE_PERIOD_BATCH_SIZE=13
 DHIS2_CLIMATE_CONTINUE_ON_FAILURE=true
+DHIS2_CLIMATE_CLEAN_STALE_OCS_JOBS=true
+DHIS2_CLIMATE_OCS_JOB_STORE_PATH=/var/lib/open-climate-service/jobs/jobs.json
+DHIS2_CLIMATE_OCS_STALE_JOB_HOURS=48
+DHIS2_CLIMATE_OCS_CANCEL_WAIT_SECONDS=120
 ```
+
+Stale-job reconciliation applies only to active native OCS jobs (`accepted`, `running`, or
+`retrying`) for datasets selected by `DHIS2_CLIMATE_JOBS`. The default 48-hour threshold is
+deliberately conservative. Terminal job history remains untouched for audit.
 
 Controlled historical backfill:
 

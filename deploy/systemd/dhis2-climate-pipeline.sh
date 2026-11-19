@@ -17,6 +17,22 @@ readonly AS_OF="${DHIS2_CLIMATE_AS_OF:-}"
 readonly CONTINUE_ON_FAILURE="${DHIS2_CLIMATE_CONTINUE_ON_FAILURE:-true}"
 readonly REFRESH_CACHES="${DHIS2_CLIMATE_REFRESH_CACHES:-true}"
 readonly SKIP_MISSING_GEOMETRY="${DHIS2_CLIMATE_SKIP_MISSING_GEOMETRY:-true}"
+readonly CLEAN_STALE_OCS_JOBS="${DHIS2_CLIMATE_CLEAN_STALE_OCS_JOBS:-true}"
+readonly OCS_JOB_STORE_PATH="${DHIS2_CLIMATE_OCS_JOB_STORE_PATH:-/var/lib/open-climate-service/jobs/jobs.json}"
+readonly OCS_STALE_JOB_HOURS="${DHIS2_CLIMATE_OCS_STALE_JOB_HOURS:-48}"
+readonly OCS_CANCEL_WAIT_SECONDS="${DHIS2_CLIMATE_OCS_CANCEL_WAIT_SECONDS:-120}"
+
+PIPELINE_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+START_PERIOD=
+END_PERIOD=
+TEMPORARY_DIR=
+JOBS=()
+FAILED_JOBS=()
+FAILED_STAGES=()
+HAS_PERMANENT_FAILURE=false
+HAS_TRANSIENT_FAILURE=false
+LAST_FAILURE_STAGE=
+LAST_FAILURE_STATUS=0
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
@@ -50,6 +66,41 @@ run_cli() {
     --env-file "$ENV_FILE" \
     "$@"
 }
+
+cleanup_and_notify() {
+  local pipeline_status=$?
+  local outcome=success
+  local notification_status
+  local finished_at
+
+  trap - EXIT
+  if [[ -n "$TEMPORARY_DIR" && -d "$TEMPORARY_DIR" ]]; then
+    rm -rf -- "$TEMPORARY_DIR"
+  fi
+  if ((pipeline_status != 0)); then
+    outcome=failure
+  fi
+  finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  log "Climate email notification requested | outcome=$outcome | exitStatus=$pipeline_status"
+  run_cli notify-climate-pipeline \
+    --outcome "$outcome" \
+    --exit-status "$pipeline_status" \
+    --started-at "$PIPELINE_STARTED_AT" \
+    --finished-at "$finished_at" \
+    --start-period "$START_PERIOD" \
+    --end-period "$END_PERIOD" \
+    --jobs "${JOBS[*]-}" \
+    --failures "${FAILED_STAGES[*]-}"
+  notification_status=$?
+  if ((notification_status != 0)); then
+    log "WARNING: Climate email notification failed | exitStatus=$notification_status"
+  fi
+
+  exit "$pipeline_status"
+}
+
+trap cleanup_and_notify EXIT
 
 resolve_period_window() {
   case "$WINDOW_MODE" in
@@ -246,6 +297,7 @@ run_job() {
 validate_boolean DHIS2_CLIMATE_CONTINUE_ON_FAILURE "$CONTINUE_ON_FAILURE"
 validate_boolean DHIS2_CLIMATE_REFRESH_CACHES "$REFRESH_CACHES"
 validate_boolean DHIS2_CLIMATE_SKIP_MISSING_GEOMETRY "$SKIP_MISSING_GEOMETRY"
+validate_boolean DHIS2_CLIMATE_CLEAN_STALE_OCS_JOBS "$CLEAN_STALE_OCS_JOBS"
 
 read -r -a JOBS <<< "${DHIS2_CLIMATE_JOBS:-}"
 ((${#JOBS[@]} > 0)) || fail_configuration "DHIS2_CLIMATE_JOBS does not contain any jobs."
@@ -259,16 +311,28 @@ build_period_windows
 mkdir -p "$CHECKPOINT_DIR"
 TEMPORARY_DIR="$(mktemp -d "${STATE_DIR}/run.XXXXXX")" || fail_configuration \
   "could not create a temporary directory in ${STATE_DIR}."
-trap 'rm -rf -- "$TEMPORARY_DIR"' EXIT
-
-FAILED_JOBS=()
-FAILED_STAGES=()
-HAS_PERMANENT_FAILURE=false
-HAS_TRANSIENT_FAILURE=false
-LAST_FAILURE_STAGE=
-LAST_FAILURE_STATUS=0
 
 log "Climate pipeline started | mode=$WINDOW_MODE | start=$START_PERIOD | end=$END_PERIOD | periodBatchSize=$PERIOD_BATCH_SIZE | windows=${#WINDOW_STARTS[@]} | jobs=${JOBS[*]}"
+
+if [[ "$CLEAN_STALE_OCS_JOBS" == "true" ]]; then
+  cleanup_args=(
+    cleanup-ocs-jobs
+    --job-store "$OCS_JOB_STORE_PATH"
+    --older-than-hours "$OCS_STALE_JOB_HOURS"
+    --wait-seconds "$OCS_CANCEL_WAIT_SECONDS"
+    --apply
+  )
+  for job in "${JOBS[@]}"; do
+    cleanup_args+=(--job "$job")
+  done
+  log "Reconciling stale OCS jobs | olderThanHours=$OCS_STALE_JOB_HOURS | store=$OCS_JOB_STORE_PATH"
+  run_cli "${cleanup_args[@]}"
+  status=$?
+  if ((status != 0)); then
+    log "Stale OCS job reconciliation failed | exitStatus=$status"
+    exit "$status"
+  fi
+fi
 
 run_cli check-dhis2
 status=$?

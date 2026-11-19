@@ -47,6 +47,23 @@ sudo journalctl -fu dhis2-climate-pipeline.service
 
 A `Type=oneshot` service remains in the `activating` state for its entire run. This is expected.
 
+Test the configured SMTP notification independently from OCS and DHIS2:
+
+```bash
+sudo -u dhis2-import bash -lc '
+  cd /opt/dhis2-climate-import
+  .venv/bin/dhis2-climate-import --env-file .env \
+    notify-climate-pipeline --outcome test --audience all --force
+'
+```
+
+The command sends two separate messages when both audiences are configured. Administrator messages
+contain operational details. User messages contain only the successful update period and hide all
+recipient addresses. The pipeline attempts its final notification for both exit status `0` and
+failures, but only administrators receive failures. A notification failure is logged as a warning
+and preserves the original pipeline exit status. No process can send mail after a host power loss or
+an uncatchable `SIGKILL`; external infrastructure monitoring should cover those cases.
+
 ### After correcting a permanent error
 
 ```bash
@@ -109,6 +126,22 @@ curl -sS http://127.0.0.1:9000/datasets |
 
 `409 An ingest or sync is already running` means another OCS job for the same dataset is active.
 Do not start a concurrent ingestion. Find its UUID in the OCS journal or persistent job registry.
+
+Audit automatic stale-job candidates:
+
+```bash
+cd /opt/dhis2-climate-import
+.venv/bin/dhis2-climate-import --env-file .env \
+  cleanup-ocs-jobs \
+  --job vegetation_ndvi_weekly \
+  --older-than-hours 48 \
+  --dry-run
+```
+
+The scheduled pipeline performs the same check with `--apply` before submitting new work when
+`DHIS2_CLIMATE_CLEAN_STALE_OCS_JOBS=true`. It retains terminal records and cancels only matching
+active jobs older than the configured threshold. This resolves local OCS `409` reservations; a
+provider-side queue such as CDS remains a separate incident and is never deleted automatically.
 
 ## Common incidents
 

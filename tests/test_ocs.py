@@ -80,6 +80,26 @@ class OCSTests(unittest.TestCase):
         with self.assertRaisesRegex(PipelineError, "CDS rejected request"):
             client.ingest_dataset("era5land_precipitation_weekly")
 
+    def test_cancels_native_ingestion_and_waits_for_terminal_state(self) -> None:
+        http = SequenceHttp(
+            [
+                {"jobID": "stale-1", "status": "running", "cancelRequested": True},
+                {"jobID": "stale-1", "status": "cancelled", "cancelRequested": True},
+            ]
+        )
+        client = OCSClient(
+            "http://ocs.example.org",
+            http=http,
+            poll_seconds=0,
+            job_timeout_seconds=10,
+        )
+
+        result = client.cancel_ingestion_job("stale-1", wait_seconds=10)
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(http.calls[0][0:2], ("DELETE", "/ingestions/jobs/stale-1"))
+        self.assertEqual(http.calls[1][0:2], ("GET", "/ingestions/jobs/stale-1"))
+
     def test_environment_controls_ocs_polling_without_extending_each_http_call(self) -> None:
         client = OCSClient.from_env(
             {

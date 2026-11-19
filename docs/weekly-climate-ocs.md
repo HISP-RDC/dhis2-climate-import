@@ -220,8 +220,35 @@ sudo systemctl daemon-reload
 For every configured job, the service runs:
 
 ```text
-ingest-dataset → review-import → import-dhis2 --dry-run → import-dhis2 --apply → checkpoint
+stale OCS job reconciliation
+→ ingest-dataset
+→ review-import
+→ import-dhis2 --dry-run
+→ import-dhis2 --apply
+→ checkpoint
 ```
+
+The reconciliation reads the local native OCS job registry only for discovery. It filters by the
+configured dataset and age, rechecks each candidate through the OCS API, and uses the official
+DELETE endpoint for cooperative cancellation. It does not rewrite `jobs.json` and does not remove
+terminal history. If a stale worker does not stop within the configured wait, the pipeline exits
+temporarily so systemd can retry without submitting a conflicting ingestion.
+
+At process exit, the pipeline optionally sends an SMTP summary for success or failure. Configure
+the `DHIS2_CLIMATE_EMAIL_*` and `DHIS2_CLIMATE_SMTP_*` variables in the secured project `.env` file,
+then send a test before enabling the timer:
+
+```bash
+sudo -u dhis2-import bash -lc '
+  cd /opt/dhis2-climate-import
+  .venv/bin/dhis2-climate-import --env-file .env \
+    notify-climate-pipeline --outcome test --audience all --force
+'
+```
+
+The administrator message reports the host, period window, configured jobs, exit status, and failed
+stages. The separate user message is sent only after complete success and contains no operational
+diagnostics. SMTP errors remain visible in the journal but do not change the pipeline result.
 
 With `DHIS2_CLIMATE_CONTINUE_ON_FAILURE=true`, the service records a failed job and continues with
 the next one. The unit still exits as failed so the incident remains visible. systemd may retry a

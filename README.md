@@ -19,6 +19,8 @@ targeted quarantine, and auditable operations.
 - checkpoints for confirmed chunks and restart-safe execution;
 - documented quarantine of incompatible values;
 - SQLite journals, JSON reports, and systemd-friendly progress logs;
+- branded HTML SMTP notifications with separate administrator and end-user audiences;
+- conservative reconciliation of stale active OCS jobs before new ingestion submissions;
 - weekly OCS-to-DHIS2 pipelines and multi-job DHIS2 transfers.
 
 ## Functional architecture

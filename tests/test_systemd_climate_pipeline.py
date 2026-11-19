@@ -99,6 +99,7 @@ class SystemdClimatePipelineTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         joined = "\n".join(calls)
+        self.assertLess(joined.index("cleanup-ocs-jobs"), joined.index("check-dhis2"))
         self.assertLess(joined.index("check-dhis2"), joined.index("cache-org-units"))
         self.assertLess(joined.index("cache-org-units"), joined.index("cache-data-elements"))
         self.assertLess(
@@ -106,14 +107,15 @@ class SystemdClimatePipelineTests(unittest.TestCase):
             joined.index("review-import precipitation_weekly_chirps"),
         )
         self.assertLess(
-            joined.index("--dry-run"),
-            joined.index("--apply"),
+            joined.index("import-dhis2 precipitation_weekly_chirps"),
+            joined.index("import-dhis2 precipitation_weekly_chirps", joined.index("--dry-run") + 1),
         )
         self.assertLess(
             joined.index("import-dhis2 precipitation_weekly_chirps"),
             joined.index("ingest-dataset vegetation_ndvi_weekly"),
         )
         self.assertIn("--start-period 2026-W38 --end-period 2026-W39", joined)
+        self.assertIn("notify-climate-pipeline --outcome success", joined)
 
     def test_checkpoint_skips_completed_jobs_on_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -124,9 +126,11 @@ class SystemdClimatePipelineTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         new_calls = second_calls[len(first_calls) :]
-        self.assertEqual(len(new_calls), 3)
+        self.assertEqual(len(new_calls), 5)
+        self.assertTrue(any("cleanup-ocs-jobs" in call for call in new_calls))
         self.assertTrue(any("check-dhis2" in call for call in new_calls))
         self.assertFalse(any("ingest-dataset" in call for call in new_calls))
+        self.assertTrue(any("notify-climate-pipeline" in call for call in new_calls))
         self.assertIn("checkpoint reused", second.stdout)
 
     def test_splits_historical_period_for_ocs_and_dhis2_apply(self) -> None:
@@ -167,6 +171,10 @@ class SystemdClimatePipelineTests(unittest.TestCase):
         self.assertIn("ingest-dataset bad_job", joined)
         self.assertIn("ingest-dataset vegetation_ndvi_weekly", joined)
         self.assertIn("failedJobs=bad_job", result.stdout)
+        self.assertIn(
+            "notify-climate-pipeline --outcome failure --exit-status 2",
+            "\n".join(calls),
+        )
 
     def test_returns_temporary_failure_status_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
